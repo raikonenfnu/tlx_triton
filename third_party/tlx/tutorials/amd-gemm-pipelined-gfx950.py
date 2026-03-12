@@ -101,14 +101,14 @@ def prune_configs(configs, named_args, **kwargs):
 
 full_tune = False
 hip_configs = [
-    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 2, 'NUM_STAGES': 2}
-                  | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'NUM_STAGES': 2}
-                  | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 4}, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
-                  | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 2}, num_warps=4),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
-                  | {'kpack': 1, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8),
+    # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 2, 'NUM_STAGES': 2}
+    #               | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=4),
+    # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1, 'NUM_STAGES': 2}
+    #               | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 4}, num_warps=4),
+    # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
+    #               | {'kpack': 2, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 2}, num_warps=4),
+    # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4, 'NUM_STAGES': 2}
+    #               | {'kpack': 1, 'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8),
     triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 6, 'NUM_STAGES': 2}
                   | {'matrix_instr_nonkdim': 16, 'waves_per_eu': 0}, num_warps=8, num_stages=2)
 ]
@@ -284,7 +284,7 @@ for fp8_inputs in [False, True]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
-            x_vals=[256, 512, 1024, 2048, 4096],  # Different possible values for `x_name`
+            x_vals=[4096],  # Different possible values for `x_name`
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
