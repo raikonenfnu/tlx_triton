@@ -116,7 +116,7 @@ def v3_lds_swizzling(
         a = gl.amd.cdna4.async_copy.load_shared_relaxed(smemA, dotOpLayoutA)
         b = gl.amd.cdna4.async_copy.load_shared_relaxed(smemB, dotOpLayoutB)
 
-        acc = gl.amd.cdna3.mfma(a, b, acc)
+        acc = gl.amd.cdna4.mfma(a, b, acc)
 
         a_base += BLOCK_K * stride_ak
         b_base += BLOCK_K * stride_bk
@@ -130,7 +130,7 @@ def v3_lds_swizzling(
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
     c_offsets = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    gl.amd.cdna3.buffer_store(ptr=c_base, offsets=c_offsets, stored_value=c, mask=c_mask)
+    gl.amd.cdna4.buffer_store(ptr=c_base, offsets=c_offsets, stored_value=c, mask=c_mask)
 
 
 @gluon.jit
@@ -338,7 +338,7 @@ def matmul(a, b):
     # 1D launch kernel where each block gets its own program.
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
-    v3_lds_swizzling[grid](
+    v4_global_prefetch[grid](
         a, b, c,  #
         M, N, K,  #
         a.stride(0), a.stride(1),  #
@@ -408,6 +408,7 @@ for fp8_inputs in [False, True]:
 def benchmark(M, N, K, provider, fp8_inputs):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    b = b.T.contiguous().T
     if TORCH_HAS_FP8 and fp8_inputs:
         a = a.to(torch.float8_e5m2)
         b = b.T
