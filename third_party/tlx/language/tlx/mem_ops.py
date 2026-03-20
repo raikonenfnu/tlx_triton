@@ -6,6 +6,32 @@ from .mma_ops import require_nv_mma_shared_layout
 from typing import Optional, Tuple, overload
 
 
+def _make_amd_swizzled_layout(shape, dtype):
+    """Compute AMD-optimized swizzle parameters for shared memory.
+
+    Uses XOR-based swizzling to minimize LDS bank conflicts. The parameters
+    are derived from the innermost dimension size and element width, targeting
+    128-bit (16-byte) vectorized accesses.
+    """
+    rank = len(shape)
+    inner_dim = shape[-1]
+    elem_bytes = dtype.primitive_bitwidth // 8
+    vec = min(16 // elem_bytes, inner_dim)
+    row_bytes = inner_dim * elem_bytes
+    per_phase = max(1, 128 // row_bytes)
+    max_phase = max(1, inner_dim // vec)
+    return tlx.swizzled_shared_layout_encoding(
+        vectorSize=vec,
+        perPhase=per_phase,
+        maxPhase=max_phase,
+        order=list(reversed(range(rank))),
+        numCTAs=[1] * rank,
+        numCTAsPerCGA=[1] * rank,
+        numCTASplit=[1] * rank,
+        numCTAOrder=[1] * rank,
+    )
+
+
 def _assert_blackwell_for_tmem(arch):
     capability = int(cuda_parse_arch(arch))
     assert capability >= 100, "tmem is only available on Blackwell"
@@ -61,9 +87,15 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     if layout is None:
         if storage == tlx.storage_kind.smem:
             arch = _semantic.builder.options.arch
-            use_nv_mma = not arch.startswith("gfx")
-            if len(shape) == 1 or not use_nv_mma:
+            is_amd = arch.startswith("gfx")
+            if len(shape) == 1:
                 layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+            elif is_amd:
+                layout = _make_amd_swizzled_layout(unwrapped_shape, dtype)
+            else:
+                layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
+
+            if isinstance(layout, tlx.swizzled_shared_layout_encoding):
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
                     layout.perPhase,
@@ -74,7 +106,6 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTAOrder,
                 )
             else:
-                layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
                 layout_handle = _semantic.builder.make_nv_mma_shared_encoding_attr(
                     [int(x) for x in layout.shape],
                     layout.order,
