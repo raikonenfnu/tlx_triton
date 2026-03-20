@@ -6,20 +6,27 @@ from .mma_ops import require_nv_mma_shared_layout
 from typing import Optional, Tuple, overload
 
 
-def _make_amd_swizzled_layout(shape, dtype):
-    """Compute AMD-optimized swizzle parameters for shared memory.
+def _make_amd_swizzled_layout(shape, dtype, arch="gfx950"):
+    """Compute AMD swizzle parameters matching AMDMfmaEncodingAttr::composeSharedLayoutForOperand.
 
-    Uses XOR-based swizzling to minimize LDS bank conflicts. The parameters
-    are derived from the innermost dimension size and element width, targeting
-    128-bit (16-byte) vectorized accesses.
+    Mirrors the bank-conflict-avoidance logic from the AMD MFMA backend:
+      elemsPerBanksRow = (numBanks * bankBitWidth) / elemBitWidth
+      perPhase = max(1, elemsPerBanksRow / innerDim)
+      maxPhase = max(min(simdWidth / perPhase, innerDim / vec), 1)
     """
     rank = len(shape)
     inner_dim = shape[-1]
-    elem_bytes = dtype.primitive_bitwidth // 8
-    vec = min(16 // elem_bytes, inner_dim)
-    row_bytes = inner_dim * elem_bytes
-    per_phase = max(1, 128 // row_bytes)
-    max_phase = max(1, inner_dim // vec)
+    elem_bits = dtype.primitive_bitwidth
+
+    num_banks = 64 if "gfx95" in arch else 32
+    bank_bit_width = 32
+    simd_width = 16
+
+    vec = min(128 // elem_bits, inner_dim)
+    elems_per_banks_row = (num_banks * bank_bit_width) // elem_bits
+    per_phase = max(1, elems_per_banks_row // inner_dim)
+    max_phase = max(min(simd_width // per_phase, inner_dim // vec), 1)
+
     return tlx.swizzled_shared_layout_encoding(
         vectorSize=vec,
         perPhase=per_phase,
@@ -91,7 +98,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             if len(shape) == 1:
                 layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
             elif is_amd:
-                layout = _make_amd_swizzled_layout(unwrapped_shape, dtype)
+                layout = _make_amd_swizzled_layout(unwrapped_shape, dtype, arch)
             else:
                 layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
 
