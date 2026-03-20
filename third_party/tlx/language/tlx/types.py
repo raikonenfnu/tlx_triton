@@ -324,6 +324,25 @@ class mbarrier_type(buffered_tensor_type):
         )
 
 
+class async_token_type(tl.base_type):
+    """Type for async_token values (maps to ttg.async_token in MLIR)."""
+
+    def __eq__(self, other):
+        return type(self) is type(other)
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def mangle(self) -> str:
+        return "async_token"
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        out.append(builder.get_async_token_type())
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple['async_token', int]:
+        return async_token(handles[cursor]), cursor + 1
+
+
 class async_token(tl.base_value):
     """
     Defines a type of value used to track and synchronize asynchronous operations.
@@ -331,7 +350,10 @@ class async_token(tl.base_value):
 
     def __init__(self, handle):
         self.handle = handle
+        self.type = async_token_type()
 
-    @property
-    def type(self):
-        return None  # Python expects this to exist even if unused
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
+
+    def _set_name(self, builder: ir.builder, name: str) -> None:
+        self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
