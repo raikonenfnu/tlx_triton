@@ -80,42 +80,39 @@ def matmul_kernel_v4_global_prefetch(
     iterMax = tl.cdiv(K, BLOCK_K)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # --- Prologue: global load iteration 0 → regs → buffer 0 ---
+    # --- Prologue: async copy iteration 0 → buffer 0 ---
     smem_a0 = tlx.local_view(buffers_A, 0)
     smem_b0 = tlx.local_view(buffers_B, 0)
-    a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K)
-    b_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K)
-    tlx.local_store(smem_a0, a_reg)
-    tlx.local_store(smem_b0, b_reg)
+    tok_a = tlx.async_load(a_ptrs, smem_a0, mask=offs_k[None, :] < K)
+    tok_b = tlx.async_load(b_ptrs, smem_b0, mask=offs_k[:, None] < K)
+    tlx.async_load_commit_group([tok_a, tok_b])
     a_ptrs += BLOCK_K * stride_ak
     b_ptrs += BLOCK_K * stride_bk
 
-    # --- Main Loop: double-buffered register prefetch + compute ---
+    # --- Main Loop: double-buffered async copy + compute ---
     for k in tl.range(0, iterMax - 1, num_stages=0):
         l_idx = k % 2
         g_idx = 1 - l_idx
 
-        # Prefetch next iteration: global → registers
-        a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - (k + 1) * BLOCK_K)
-        b_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - (k + 1) * BLOCK_K)
+        smem_ag = tlx.local_view(buffers_A, g_idx)
+        smem_bg = tlx.local_view(buffers_B, g_idx)
+        tok_a = tlx.async_load(a_ptrs, smem_ag, mask=offs_k[None, :] < K - (k + 1) * BLOCK_K)
+        tok_b = tlx.async_load(b_ptrs, smem_bg, mask=offs_k[:, None] < K - (k + 1) * BLOCK_K)
+        tlx.async_load_commit_group([tok_a, tok_b])
 
-        # Compute on current buffer: SMEM → registers → dot
+        tlx.async_load_wait_group(2)
+
         smem_al = tlx.local_view(buffers_A, l_idx)
         smem_bl = tlx.local_view(buffers_B, l_idx)
         a = tlx.local_load(smem_al)
         b = tlx.local_load(smem_bl)
         acc = tl.dot(a, b, acc)
 
-        # Store prefetched data: registers → next SMEM buffer
-        smem_ag = tlx.local_view(buffers_A, g_idx)
-        smem_bg = tlx.local_view(buffers_B, g_idx)
-        tlx.local_store(smem_ag, a_reg)
-        tlx.local_store(smem_bg, b_reg)
-
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
     # --- Epilogue: drain last buffer ---
+    tlx.async_load_wait_group(0)
     l_idx = (iterMax - 1) % 2
     smem_al = tlx.local_view(buffers_A, l_idx)
     smem_bl = tlx.local_view(buffers_B, l_idx)
