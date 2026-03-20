@@ -4,7 +4,8 @@ from .types import (layout_encoding, shared_layout_encoding, swizzled_shared_lay
                     buffered_tensor_type, mbarrier, mbarrier_type, async_token)
 from .mem_ops import (local_alloc, local_view, subslice, async_load, async_load_commit_group, async_load_wait_group,
                       local_load, local_store, local_trans, local_reinterpret, async_descriptor_load,
-                      async_descriptor_store, async_descriptor_store_wait, fence_async_shared)
+                      async_descriptor_store, async_descriptor_store_wait, fence_async_shared,
+                      make_amd_swizzled_layout)
 from .barrier import (
     alloc_barriers,
     barrier_expect_bytes,

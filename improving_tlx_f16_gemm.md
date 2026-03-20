@@ -4,10 +4,11 @@
 
 | Kernel | TFLOPS | % of rocBLAS |
 |---|---|---|
-| rocBLAS | ~945 | 100% |
-| Gluon v4_global_prefetch | 804 | ~85% |
-| **TLX amd_gemm_v4 (current)** | **~785** | **~83%** |
-| TLX amd_gemm_v4 (initial) | 626 | ~66% |
+| rocBLAS | ~1101 | 100% |
+| Gluon v4_global_prefetch | 804 | ~73% |
+| **TLX amd_gemm_v4 (current, AB_T)** | **~795** | **~72%** |
+| TLX amd_gemm_v4 (v2) | ~785 | ~71% |
+| TLX amd_gemm_v4 (initial) | 626 | ~57% |
 
 ## Compiler Fixes (Done)
 
@@ -106,7 +107,8 @@ amd_mfma<{v=4, warps=[2,2], instr=[16,16,32], transposed}>              -- same
 
 ### High Impact
 - [ ] Expose DistributedLinearLayout or equivalent in TLX for load coalescing
-- [ ] Allow per-operand shared layout order in TLX (B should use [0,1])
+- [x] Allow per-operand shared layout order in TLX (B should use [0,1])
+  - Solved at compiler level: `adjustEncodingForProducerOrder` in `InsertRequireLayout`
 - [ ] Add PaddedShared with MFMA-matched offset bases as a built-in option
 
 ### Medium Impact
@@ -125,3 +127,10 @@ amd_mfma<{v=4, warps=[2,2], instr=[16,16,32], transposed}>              -- same
   (wait_group(1), 8 warps, matrix_instr_nonkdim=16)
 - **v2**: Pass async wait token to local_load — ~785 TFLOPS (+12% from v1.2)
   The `syncedViaAsyncWait` annotation eliminates redundant LDS barriers.
+- **v3**: AB_T layout support — ~795 TFLOPS with K-contiguous B matrix
+  Added `adjustEncodingForProducerOrder` to `InsertRequireLayout.cpp`: when
+  `async_copy_global_to_local` fills shared memory, the shared encoding's order
+  must match the global source's order (DMA hardware cannot transpose). The pass
+  traces from `local_load` → allocation → `async_copy` producer, compares orders,
+  and recomputes `SwizzledSharedEncodingAttr` via `DotOperandEncodingAttr` if they
+  differ. This is ported from commit c622ce59d (origin).

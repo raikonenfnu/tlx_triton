@@ -7,15 +7,34 @@ from typing import Optional, Tuple, overload
 
 
 def _make_amd_swizzled_layout(shape, dtype, arch="gfx950"):
-    """Compute AMD swizzle parameters matching AMDMfmaEncodingAttr::composeSharedLayoutForOperand.
+    """Same as make_amd_swizzled_layout with default row-major order."""
+    return make_amd_swizzled_layout(shape, dtype, order=None, arch=arch)
 
-    Mirrors the bank-conflict-avoidance logic from the AMD MFMA backend:
-      elemsPerBanksRow = (numBanks * bankBitWidth) / elemBitWidth
-      perPhase = max(1, elemsPerBanksRow / innerDim)
-      maxPhase = max(min(simdWidth / perPhase, innerDim / vec), 1)
+
+def make_amd_swizzled_layout(shape, dtype, order=None, arch="gfx950"):
+    """Compute AMD MFMA-compatible swizzled shared layout.
+
+    Mirrors the bank-conflict-avoidance logic from
+    AMDMfmaEncodingAttr::composeSharedLayoutForOperand:
+      elemsPerBanksRow = (numBanks * bankBitWidth) // elemBitWidth
+      perPhase = max(1, elemsPerBanksRow // innerDim)
+      maxPhase = max(min(simdWidth // perPhase, innerDim // vec), 1)
+
+    Args:
+        shape: tile shape, e.g. (256, 64) for A or (64, 256) for B.
+        dtype: element type (e.g. tl.float16).
+        order: dimension order — first element is the fastest-varying
+               (contiguous) dimension. Defaults to row-major [rank-1, ..., 0].
+               Use [0, 1] for B when K (dim 0) is contiguous in memory.
+        arch: target architecture string (e.g. "gfx950").
     """
     rank = len(shape)
-    inner_dim = shape[-1]
+    if order is None:
+        order = list(reversed(range(rank)))
+    if len(order) != rank or set(order) != set(range(rank)):
+        raise ValueError(f"order must be a permutation of range({rank}), got {order}")
+
+    inner_dim = shape[order[0]]
     elem_bits = dtype.primitive_bitwidth
 
     num_banks = 64 if "gfx95" in arch else 32
@@ -31,7 +50,7 @@ def _make_amd_swizzled_layout(shape, dtype, arch="gfx950"):
         vectorSize=vec,
         perPhase=per_phase,
         maxPhase=max_phase,
-        order=list(reversed(range(rank))),
+        order=list(order),
         numCTAs=[1] * rank,
         numCTAsPerCGA=[1] * rank,
         numCTASplit=[1] * rank,
@@ -138,7 +157,27 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout.CTASplitN,
             )
     else:
-        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+        if storage != tlx.storage_kind.smem:
+            raise ValueError("Explicit layout is only supported for shared memory (storage_kind.smem)")
+        layout = tl._unwrap_if_constexpr(layout)
+        if isinstance(layout, tlx.swizzled_shared_layout_encoding):
+            layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
+                layout.vectorSize,
+                layout.perPhase,
+                layout.maxPhase,
+                layout.order,
+                layout.numCTAsPerCGA,
+                layout.numCTASplit,
+                layout.numCTAOrder,
+            )
+        elif isinstance(layout, tlx.padded_shared_layout_encoding):
+            layout_handle = _semantic.builder.make_padded_shared_encoding_attr(
+                layout.interval_padding_pairs,
+                layout.order,
+                layout.shape,
+            )
+        else:
+            raise ValueError(f"Unsupported layout type: {type(layout)}")
 
     alias_handle = None
     if reuse:
