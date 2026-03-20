@@ -87,6 +87,45 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class padded_shared_layout_encoding(shared_layout_encoding):
+
+    def __init__(self, interval_padding_pairs, order, shape):
+        super().__init__()
+        self.interval_padding_pairs = interval_padding_pairs
+        self.order = order
+        self.shape = shape
+
+    def make_permute(self, dims):
+        permuted_order = tuple(self.order[d] for d in dims)
+        permuted_shape = [self.shape[d] for d in dims]
+        return padded_shared_layout_encoding(
+            self.interval_padding_pairs, permuted_order, permuted_shape)
+
+    @staticmethod
+    def for_amd_mfma(tile_shape, dtype, arch="gfx950"):
+        """Compute padding params that avoid LDS bank conflicts for MFMA access patterns.
+
+        On gfx950 (64 banks, 32-bit per bank), inserts padding after every
+        <inner_dim * num_banks_rows> elements to break bank-conflict strides.
+        """
+        rank = len(tile_shape)
+        order = list(reversed(range(rank)))
+        inner_dim = tile_shape[order[0]]
+        elem_bits = dtype.primitive_bitwidth
+
+        num_banks = 64 if "gfx95" in arch else 32
+        bank_bit_width = 32
+        elems_per_banks_row = (num_banks * bank_bit_width) // elem_bits
+
+        interval = elems_per_banks_row
+        padding = elems_per_banks_row // inner_dim if inner_dim < elems_per_banks_row else 16
+        return padded_shared_layout_encoding(
+            interval_padding_pairs=[(interval, padding)],
+            order=order,
+            shape=list(tile_shape),
+        )
+
+
 class tensor_memory_layout_encoding(shared_layout_encoding):
 
     def __init__(self, blockM, blockN, unpacked, CTASplitM, CTASplitN):

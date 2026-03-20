@@ -100,7 +100,7 @@ def matmul_kernel_v4_global_prefetch(
         tok_b = tlx.async_load(b_ptrs, smem_bg, mask=offs_k[:, None] < K - (k + 1) * BLOCK_K)
         tlx.async_load_commit_group([tok_a, tok_b])
 
-        tlx.async_load_wait_group(2)
+        tlx.async_load_wait_group(1)
 
         smem_al = tlx.local_view(buffers_A, l_idx)
         smem_bl = tlx.local_view(buffers_B, l_idx)
@@ -136,7 +136,7 @@ def matmul(a, b):
     K, N = b.shape
 
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
-    num_warps = 4
+    num_warps = 8
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
@@ -153,6 +153,8 @@ def matmul(a, b):
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=4,
         num_warps=num_warps,
+        waves_per_eu=2,
+        matrix_instr_nonkdim=16,
     )
     return c
 

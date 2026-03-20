@@ -7,6 +7,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
@@ -97,6 +99,35 @@ void init_triton_tlx_ir(py::module &&m) {
              auto CTALayout = ttg::CGAEncodingAttr::get1CTALayout(context, order.size());
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
+           })
+      .def("make_padded_shared_encoding_attr",
+           [](TritonOpBuilder &self,
+              std::vector<std::pair<unsigned, unsigned>> intervalPads,
+              std::vector<unsigned> order, std::vector<int64_t> shape) {
+             auto context = self.getBuilder().getContext();
+             auto cgaLayout =
+                 ttg::CGAEncodingAttr::get1CTALayout(context, order.size());
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervalPads, order, shape, cgaLayout));
+           })
+      .def("make_padded_shared_encoding_attr_with_bases",
+           [](TritonOpBuilder &self,
+              std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int>> offsetBases,
+              std::vector<std::vector<int>> blockBases,
+              std::vector<int64_t> shape) {
+             auto context = self.getBuilder().getContext();
+             auto rank = shape.size();
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             auto outDims =
+                 mlir::triton::standardOutDimNames(context, rank);
+             auto ll =
+                 triton::LinearLayout({{kOffset, offsetBases}}, outDims) *
+                 triton::LinearLayout({{kBlock, blockBases}}, outDims);
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervals, paddings, std::move(ll)));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,

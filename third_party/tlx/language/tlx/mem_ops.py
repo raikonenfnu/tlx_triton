@@ -102,7 +102,13 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             else:
                 layout = tlx.nv_mma_shared_layout_encoding.make_default(shape, dtype)
 
-            if isinstance(layout, tlx.swizzled_shared_layout_encoding):
+            if isinstance(layout, tlx.padded_shared_layout_encoding):
+                layout_handle = _semantic.builder.make_padded_shared_encoding_attr(
+                    layout.interval_padding_pairs,
+                    layout.order,
+                    layout.shape,
+                )
+            elif isinstance(layout, tlx.swizzled_shared_layout_encoding):
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
                     layout.perPhase,
