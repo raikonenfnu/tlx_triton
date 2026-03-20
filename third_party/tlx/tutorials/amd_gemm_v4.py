@@ -100,24 +100,24 @@ def matmul_kernel_v4_global_prefetch(
         tok_b = tlx.async_load(b_ptrs, smem_bg, mask=offs_k[:, None] < K - (k + 1) * BLOCK_K)
         tlx.async_load_commit_group([tok_a, tok_b])
 
-        tlx.async_load_wait_group(1)
+        tok_wait = tlx.async_load_wait_group(1)
 
         smem_al = tlx.local_view(buffers_A, l_idx)
         smem_bl = tlx.local_view(buffers_B, l_idx)
-        a = tlx.local_load(smem_al)
-        b = tlx.local_load(smem_bl)
+        a = tlx.local_load(smem_al, token=tok_wait)
+        b = tlx.local_load(smem_bl, token=tok_wait)
         acc = tl.dot(a, b, acc)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
     # --- Epilogue: drain last buffer ---
-    tlx.async_load_wait_group(0)
+    tok_wait = tlx.async_load_wait_group(0)
     l_idx = (iterMax - 1) % 2
     smem_al = tlx.local_view(buffers_A, l_idx)
     smem_bl = tlx.local_view(buffers_B, l_idx)
-    a = tlx.local_load(smem_al)
-    b = tlx.local_load(smem_bl)
+    a = tlx.local_load(smem_al, token=tok_wait)
+    b = tlx.local_load(smem_bl, token=tok_wait)
     acc = tl.dot(a, b, acc)
 
     c = acc.to(tlx.dtype_of(c_ptr))

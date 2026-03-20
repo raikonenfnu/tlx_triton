@@ -6,7 +6,7 @@
 |---|---|---|
 | rocBLAS | ~945 | 100% |
 | Gluon v4_global_prefetch | 804 | ~85% |
-| **TLX amd_gemm_v4 (current)** | **~700** | **~74%** |
+| **TLX amd_gemm_v4 (current)** | **~785** | **~83%** |
 | TLX amd_gemm_v4 (initial) | 626 | ~66% |
 
 ## Compiler Fixes (Done)
@@ -91,6 +91,17 @@ amd_mfma<{v=4, warps=[2,2], instr=[16,16,32], transposed}>              -- same
 | Shared encoding | PaddedShared + row permute | SwizzledShared | See analysis above |
 | Store | buffer_store via MFMA layout | buffer_store via MFMA layout | Same |
 
+## AMDGCN Assembly Comparison (TLX 8w vs Gluon 4w)
+
+| Metric | TLX (8w) | Gluon (4w) | Notes |
+|---|---|---|---|
+| VGPRs | 252 | 448 | TLX lower → 2 waves/EU |
+| AGPRs | 0 | 256 | Gluon accumulates in AGPRs |
+| MFMAs | 128 | 256 | TLX: smaller sub-tile per warp |
+| s_waitcnt | 25 | 19 | TLX still has more waits |
+| s_barrier | 3 | 3 | Same |
+| Scratch | 0 | 0 | No spilling in either |
+
 ## Remaining Optimization Ideas
 
 ### High Impact
@@ -104,7 +115,6 @@ amd_mfma<{v=4, warps=[2,2], instr=[16,16,32], transposed}>              -- same
 
 ### Low Impact
 - [ ] Remove redundant masks when K % BLOCK_K == 0
-- [ ] Evaluate ds_read_b128 relaxed loads (no waitcnt dependency)
 
 ## Changelog
 
@@ -113,3 +123,5 @@ amd_mfma<{v=4, warps=[2,2], instr=[16,16,32], transposed}>              -- same
 - **v1.1**: Tested PaddedShared with identity mapping — 657 TFLOPS (reverted, swizzled better)
 - **v1.2**: Added PaddedSharedEncoding bindings for future use; tuned pipeline
   (wait_group(1), 8 warps, matrix_instr_nonkdim=16)
+- **v2**: Pass async wait token to local_load — ~785 TFLOPS (+12% from v1.2)
+  The `syncedViaAsyncWait` annotation eliminates redundant LDS barriers.
