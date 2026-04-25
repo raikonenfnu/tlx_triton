@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -787,22 +788,84 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
   return false;
 }
 
-bool isChainDotTail(tt::DotOpInterface dotOp) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
+// For a block argument of a RegionBranchOpInterface (e.g. scf.for), return
+// the yield operand that feeds it on the back-edge.  Returns {} for
+// non-loop args (e.g. the induction variable) or unsupported parent ops.
+static Value resolveLoopCarriedValue(BlockArgument bbArg) {
+  Block *block = bbArg.getOwner();
+  if (!isa<RegionBranchOpInterface>(block->getParentOp()))
+    return {};
+  Operation *terminator = block->getTerminator();
+  unsigned numYield = terminator->getNumOperands();
+  unsigned numArgs = block->getNumArguments();
+  unsigned argIdx = bbArg.getArgNumber();
+  // block args = [non-yield args (e.g. iv), yield-fed args ...]
+  if (argIdx < numArgs - numYield)
+    return {};
+  return terminator->getOperand(argIdx - (numArgs - numYield));
+}
+
+// Collect all block arguments at the frontier of op's backward slice
+// (i.e. operands that are block args rather than op results).
+static void collectBlockArgFrontier(Operation *op, Region *region,
+                                    SmallVectorImpl<BlockArgument> &frontier) {
+  BackwardSliceOptions opts;
+  opts.omitBlockArguments = true;
+  opts.filter = [region](Operation *o) {
+    return o->getParentRegion() == region;
   };
-  BackwardSliceOptions bwdOpt;
-  bwdOpt.omitBlockArguments = true;
-  bwdOpt.filter = isInSameRegion;
-  SetVector<Operation *> bwdSlices;
-  Operation *opA = dotOp.getA().getDefiningOp();
-  if (!opA)
-    return false;
-  (void)getBackwardSlice(opA, &bwdSlices, bwdOpt);
-  if (llvm::find_if(bwdSlices, [](Operation *op) {
-        return isa<tt::DotOpInterface>(op);
-      }) != bwdSlices.end())
-    return true;
+  SetVector<Operation *> slice;
+  (void)getBackwardSlice(op, &slice, opts);
+  slice.insert(op);
+  for (Operation *sliceOp : slice)
+    for (Value operand : sliceOp->getOperands())
+      if (auto bbArg = dyn_cast<BlockArgument>(operand))
+        frontier.push_back(bbArg);
+}
+
+static bool sliceContainsDot(Operation *root, Region *region) {
+  BackwardSliceOptions opts;
+  opts.omitBlockArguments = true;
+  opts.filter = [region](Operation *o) {
+    return o->getParentRegion() == region;
+  };
+  SetVector<Operation *> slice;
+  (void)getBackwardSlice(root, &slice, opts);
+  slice.insert(root);
+  return llvm::any_of(
+      slice, [](Operation *op) { return isa<tt::DotOpInterface>(op); });
+}
+
+bool isChainDotTail(tt::DotOpInterface dotOp) {
+  Region *region = dotOp->getParentRegion();
+  Value opA = dotOp.getA();
+
+  // Phase 1: check the intra-iteration backward slice for a dot.
+  if (Operation *defOp = opA.getDefiningOp()) {
+    if (sliceContainsDot(defOp, region))
+      return true;
+  }
+
+  // Phase 2: if operand A (or a value in its backward slice) originates from
+  // a loop-carried block argument, trace through the yield back-edge one
+  // level deep.  This detects cross-iteration chains like:
+  //   QK dot → softmax → p → yield → block_arg → cast → PV dot
+  SmallVector<BlockArgument> frontier;
+  if (auto bbArg = dyn_cast<BlockArgument>(opA)) {
+    frontier.push_back(bbArg);
+  } else if (Operation *defOp = opA.getDefiningOp()) {
+    collectBlockArgFrontier(defOp, region, frontier);
+  }
+
+  for (BlockArgument bbArg : frontier) {
+    Value yieldVal = resolveLoopCarriedValue(bbArg);
+    if (!yieldVal)
+      continue;
+    if (Operation *yieldDef = yieldVal.getDefiningOp())
+      if (sliceContainsDot(yieldDef, region))
+        return true;
+  }
+
   return false;
 }
 
