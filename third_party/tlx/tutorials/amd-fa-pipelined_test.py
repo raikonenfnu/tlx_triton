@@ -114,7 +114,8 @@ def _attn_fwd_async_simple(
 
         qk = tl.dot(q, k_cur.T)
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+            if start_n + BLOCK_N > pid_m * BLOCK_M:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
         if start_n + BLOCK_N > N_CTX:
             qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
 
@@ -230,39 +231,69 @@ def _attn_fwd_async_prefetch(
     t = i               t = i+1
     [QK, SM0, SM1, PV]  [GLDS_KV],         
                         [LR_KV]
+
+    Split into unmasked + masked phases for causal early-exit.
     """
-    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+    if IS_CAUSAL:
+        hi_unmasked = tl.minimum(pid_m * BLOCK_M, n_main * BLOCK_N)
+    else:
+        hi_unmasked = n_main * BLOCK_N
+
+    # Unmasked phase: all keys < all queries, no causal mask needed
+    for block_id in tl.range(0, hi_unmasked, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
-        kn = block_id + offs_n
         next_mask = (next_off + offs_n[:, None]) < N_CTX
 
-        # QK_ti
         qk = tl.dot(q, k_cur.T)
-        if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
-        # SM0_ti
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
         l_ij = tl.sum(p, 1)
 
-        # GLDS after SM0: overlaps with SM1 + PV
         tok_k = tlx.async_load(k_ptrs + next_off * stride_kn,
                                tlx.local_view(k_buf, 0), mask=next_mask)
         tok_v = tlx.async_load(v_ptrs + next_off * stride_vn,
                                tlx.local_view(v_buf, 0), mask=next_mask)
         tlx.async_load_commit_group([tok_k, tok_v])
 
-        # SM1_ti
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        # PV_ti
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
-        # LR_KV_t(i+1)
+        wait_tok = tlx.async_load_wait_group(0)
+        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+
+    # Masked phase: tiles on/near diagonal need causal masking
+    for block_id in tl.range(hi_unmasked, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+        next_off = block_id + BLOCK_N
+        kn = block_id + offs_n
+        next_mask = (next_off + offs_n[:, None]) < N_CTX
+
+        qk = tl.dot(q, k_cur.T)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+
+        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn,
+                               tlx.local_view(k_buf, 0), mask=next_mask)
+        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn,
+                               tlx.local_view(v_buf, 0), mask=next_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
         wait_tok = tlx.async_load_wait_group(0)
         k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
         v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
