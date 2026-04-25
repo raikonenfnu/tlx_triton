@@ -512,6 +512,8 @@ def _attn_fwd_async_pipelined(
     epi_base = n_main * BLOCK_N
     t_epi_1 = epi_base + BLOCK_N
     t_epi_2 = epi_base + 2 * BLOCK_N
+    buf_a = n_main % NUM_BUFFERS
+    buf_b = (n_main + 1) % NUM_BUFFERS
 
     # --- drain iteration for t = epi (i) ---
 
@@ -522,7 +524,7 @@ def _attn_fwd_async_pipelined(
 
     # LR_V_ti
     wait_tok = tlx.async_load_wait_group(2)
-    v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, buf_a), token=wait_tok, relaxed=True)
 
     # PV_ti
     acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
@@ -542,11 +544,11 @@ def _attn_fwd_async_pipelined(
 
     # LR_K_t(i+2)
     wait_tok = tlx.async_load_wait_group(1)
-    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
+    k_cur = tlx.local_load(tlx.local_view(k_buf, buf_a), token=wait_tok, relaxed=True)
 
-    # GLDS_V_t(i+2) -> buf 0
+    # GLDS_V_t(i+2) -> buf_a
     tok = tlx.async_load(v_ptrs + t_epi_2 * stride_vn,
-                         tlx.local_view(v_buf, 0),
+                         tlx.local_view(v_buf, buf_a),
                          mask=(t_epi_2 + offs_n[:, None]) < N_CTX)
     tlx.async_load_commit_group([tok])
 
@@ -559,7 +561,7 @@ def _attn_fwd_async_pipelined(
 
     # LR_V_t(i+1)
     wait_tok = tlx.async_load_wait_group(1)
-    v_cur = tlx.local_load(tlx.local_view(v_buf, 1), token=wait_tok, relaxed=True)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, buf_b), token=wait_tok, relaxed=True)
 
     # PV_t(i+1)
     acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
@@ -586,7 +588,7 @@ def _attn_fwd_async_pipelined(
 
     # LR_V_t(i+2)
     wait_tok = tlx.async_load_wait_group(0)
-    v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, buf_a), token=wait_tok, relaxed=True)
 
     # PV_t(i+2)
     acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
