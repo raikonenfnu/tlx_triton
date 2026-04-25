@@ -1,5 +1,5 @@
 """
-AMD Flash Attention Forward — Async DMA Kernel (CDNA3/CDNA4)
+AMD Flash Attention Forward — Async DMA Kernel (CDNA4)
 ============================================================
 
 Usage:
@@ -124,7 +124,7 @@ def _attn_fwd_async_simple(
         l_ij  = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]; l_i = l_i * alpha + l_ij; m_i = m_ij
-        acc += tl.dot(p.to(v_cur.dtype), v_cur)
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     acc = acc / l_i[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
@@ -269,7 +269,7 @@ def _attn_fwd_async_prefetch(
         m_i = m_ij
 
         # PV_ti
-        acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
         # LR_KV_t(i+1)
         wait_tok = tlx.async_load_wait_group(0)
@@ -301,7 +301,7 @@ def _attn_fwd_async_prefetch(
     m_i = m_ij
 
     # PV_t(i+1)
-    acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     # Store output
     acc = acc / l_i[:, None]
@@ -477,7 +477,7 @@ def _attn_fwd_async_pipelined(
         tlx.async_load_commit_group([tok])
 
         # PV_ti
-        acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
         # SM0_t(i+1)
         m_ij = tl.maximum(m_i, tl.max(qk_next, 1) * QK_SCALE)
@@ -523,7 +523,7 @@ def _attn_fwd_async_pipelined(
     v_cur = tlx.local_load(tlx.local_view(v_buf, buf_a), token=wait_tok, relaxed=True)
 
     # PV_ti
-    acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     # QK_t(i+1) — with masking
     qk = tl.dot(q, k_cur.T)
@@ -560,7 +560,7 @@ def _attn_fwd_async_pipelined(
     v_cur = tlx.local_load(tlx.local_view(v_buf, buf_b), token=wait_tok, relaxed=True)
 
     # PV_t(i+1)
-    acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     # QK_t(i+2) — with masking
     qk_next = tl.dot(q, k_cur.T)
@@ -587,7 +587,7 @@ def _attn_fwd_async_pipelined(
     v_cur = tlx.local_load(tlx.local_view(v_buf, buf_a), token=wait_tok, relaxed=True)
 
     # PV_t(i+2)
-    acc = acc + tl.dot(p.to(v_cur.dtype), v_cur)
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     # ================================================================
     # Store output
