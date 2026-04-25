@@ -40,6 +40,14 @@ public:
   mlir::LogicalResult
   matchAndRewrite(RequireLayoutOp requireLayoutOp,
                   mlir::PatternRewriter &rewriter) const override {
+    // For memdesc types: layout propagation may leave unresolved require_layout
+    // ops when conflicting swizzle requirements meet at the same allocation.
+    // Drop the constraint and let the local_load use the actual encoding on
+    // the memdesc; any register-layout mismatch is handled by convert_layout.
+    if (isa<ttg::MemDescType>(requireLayoutOp.getSrc().getType())) {
+      rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
+      return success();
+    }
     if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
       return failure();
     if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
