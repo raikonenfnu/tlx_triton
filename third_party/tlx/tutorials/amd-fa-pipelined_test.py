@@ -699,34 +699,29 @@ def print_summary_table(results, kernel_names):
     """Print a markdown-style summary table of benchmark results."""
     providers = ["Torch SDPA"] + list(kernel_names)
 
-    # Header
-    config_hdr = "Config"
-    col_w = max(14, *(len(p) for p in providers))
-    hdr = f"| {config_hdr:<30} |"
-    sep = f"|{'-'*32}|"
-    for p in providers:
-        hdr += f" {p:>{col_w}} |"
-        sep += f"{'-'*(col_w+2)}|"
+    rows = []
+    for key in sorted(results.keys()):
+        B, H, D, N, causal = key
+        rows.append((f"B={B}, H={H}, D={D}, N={N}, causal={causal}", results[key]))
 
-    print(f"\n{'='*len(sep)}")
+    cfg_w = max(len("Config"), *(len(lbl) for lbl, _ in rows)) if rows else len("Config")
+    col_w = max(14, *(len(p) for p in providers))
+
+    hdr = f"| {'Config':<{cfg_w}} |" + "".join(f" {p:>{col_w}} |" for p in providers)
+    sep = f"|{'-' * (cfg_w + 2)}|" + "".join(f"{'-' * (col_w + 2)}|" for _ in providers)
+
+    print(f"\n{'=' * len(sep)}")
     print("Summary (TFLOPS)")
-    print(f"{'='*len(sep)}")
+    print(f"{'=' * len(sep)}")
     print(hdr)
     print(sep)
 
-    for (D, N, causal), provider_results in sorted(results.items()):
-        causal_str = "causal" if causal else "non-causal"
-        label = f"D={D}, N={N}, {causal_str}"
-        row = f"| {label:<30} |"
-        for p in providers:
-            if p in provider_results:
-                tflops = provider_results[p]["tflops"]
-                row += f" {tflops:>{col_w}.1f} |"
-            else:
-                row += f" {'—':>{col_w}} |"
-        print(row)
+    for label, prov in rows:
+        vals = (f"{prov[p]['tflops']:>{col_w}.1f}" if p in prov else f"{'—':>{col_w}}"
+                for p in providers)
+        print(f"| {label:<{cfg_w}} |" + "".join(f" {v} |" for v in vals))
 
-    print(f"{'='*len(sep)}\n")
+    print(f"{'=' * len(sep)}\n")
 
 def ref_sdpa(q, k, v, sm_scale, causal=False):
     return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm_scale)
@@ -805,7 +800,7 @@ def run_benchmark(args):
                     print(f"  {kernel_name:20s} D={D} N={N:5d} {causal_str:6s} -> SKIPPED ({e})")
                     continue
 
-                key = (D, N, causal)
+                key = (B, H, D, N, causal)
                 if key not in results:
                     results[key] = {}
 
