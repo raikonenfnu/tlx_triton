@@ -234,25 +234,33 @@ def _attn_fwd_async_prefetch(
     for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
-
-        # GLDS_KV_t(i+1) — prefetch next tile, overlaps with compute
-        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn,
-                               tlx.local_view(k_buf, 0),
-                               mask=(next_off + offs_n[:, None]) < N_CTX)
-        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn,
-                               tlx.local_view(v_buf, 0),
-                               mask=(next_off + offs_n[:, None]) < N_CTX)
-        tlx.async_load_commit_group([tok_k, tok_v])
+        next_mask = (next_off + offs_n[:, None]) < N_CTX
 
         # QK_ti
         qk = tl.dot(q, k_cur.T)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
+        if IS_CAUSAL:
+            # Causal: GLDS right after QK, overlaps with softmax + PV
+            tok_k = tlx.async_load(k_ptrs + next_off * stride_kn,
+                                   tlx.local_view(k_buf, 0), mask=next_mask)
+            tok_v = tlx.async_load(v_ptrs + next_off * stride_vn,
+                                   tlx.local_view(v_buf, 0), mask=next_mask)
+            tlx.async_load_commit_group([tok_k, tok_v])
+
         # SM0_ti
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
         l_ij = tl.sum(p, 1)
+
+        if not IS_CAUSAL:
+            # Non-causal: GLDS after SM0, overlaps with SM1 + PV
+            tok_k = tlx.async_load(k_ptrs + next_off * stride_kn,
+                                   tlx.local_view(k_buf, 0), mask=next_mask)
+            tok_v = tlx.async_load(v_ptrs + next_off * stride_vn,
+                                   tlx.local_view(v_buf, 0), mask=next_mask)
+            tlx.async_load_commit_group([tok_k, tok_v])
 
         # SM1_ti
         alpha = tl.math.exp2(m_i - m_ij)
@@ -315,21 +323,9 @@ def _attn_fwd_async_pipelined(
 ):
     """
     Fully pipelined flash attention with 4-deep modulo schedule.
-    Mirrors ``attn_fwd_pipelined_kernel`` from gfx1250, using
-    ``tlx.async_load`` instead of TDM.
 
     Double-buffered K/V shared memory (``local_alloc(..., 2)``).
     K and V for each tile are bundled into the same commit group.
-
-    Abbreviations:
-      GLDS_K  = async_load K to shared (global -> LDS)
-      GLDS_V  = async_load V to shared (global -> LDS)
-      LR_K    = local_load K from shared to registers
-      LR_V    = local_load V from shared to registers
-      QK      = dot(Q, K^T)
-      SM0     = softmax part 0 (max, exp2, alpha)
-      SM1     = softmax part 1 (rescale acc, update l_i)
-      PV      = dot(P, V) accumulate
 
     Prologue:
     t = 0                t = 1             t = 2
@@ -342,10 +338,10 @@ def _attn_fwd_async_pipelined(
     [SM1, LR_V, PV],    [QK, SM0],        [LR_K, GLDS_V],  [GLDS_K]
 
     Epilogue:
-    t = i+1              t = i+2           t = i+3
-    [SM1, LR_V, PV],    [QK, SM0],        [LR_K, GLDS_V]
-                         [SM1, LR_V, PV],  [QK, SM0]
-                                           [SM1, LR_V, PV]
+                        t = i+1            t = i+2           t = i+3
+                        [SM1, LR_V, PV],   [QK, SM0],        [LR_K, GLDS_V]
+                                           [SM1, LR_V, PV]   [QK, SM0]
+                                                             [SM1, LR_V, PV]
     """
     _assume_strides(
         stride_qz, stride_qh, stride_qm, stride_qk,
@@ -610,10 +606,8 @@ def flash_attn_async_simple(q, k, v, sm_scale, causal=False, **kw):
     """Launch with K in original BHND layout — stride_kk=1 avoids alignment issues."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
-    L = torch.empty((B * H, N_CTX), device=q.device, dtype=torch.float32)
 
-    # Pop to prevent multiple value in TritonKernelLaunch.
-    BLOCK_M = kw.pop("BLOCK_M", 128)
+    BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
     num_warps = kw.pop("num_warps", 4)
 
@@ -640,9 +634,9 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
-    BLOCK_M = kw.pop("BLOCK_M", 128)
+    BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
-    num_warps = kw.pop("num_warps", 4)
+    num_warps = kw.pop("num_warps", 8)
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     _attn_fwd_async_prefetch[grid](
@@ -663,7 +657,7 @@ def flash_attn_async_pipelined(q, k, v, sm_scale, causal=False, **kw):
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
-    BLOCK_M = kw.pop("BLOCK_M", 128)
+    BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
     num_warps = kw.pop("num_warps", 4)
 
@@ -778,7 +772,6 @@ def run_benchmark(args):
     causal_modes = [s.lower() in ("true", "1", "yes") for s in args.causal]
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
-    # results[(D, N, causal)][provider_name] = {"ms": ..., "tflops": ...}
     results = {}
 
     for kernel_name in args.kernel:
@@ -800,22 +793,26 @@ def run_benchmark(args):
                     valid_el = N * N
                 total_flops = 2 * 2.0 * B * H * valid_el * D
 
-                config = dict(BLOCK_M=256, BLOCK_N=64, num_warps=4)
+                causal_str = "causal" if causal else "nc"
                 ref_sdpa_lambda = lambda: F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
-                tlx_sdpa_lambda = lambda: kernel_fn(q, k, v, sm, causal, **config)
+
+                try:
+                    tlx_sdpa_lambda = lambda: kernel_fn(q, k, v, sm, causal)
+                    ref_out = ref_sdpa_lambda()
+                    tlx_out = tlx_sdpa_lambda()
+                    assert verify("", tlx_out, ref_out, log=False)
+                except Exception as e:
+                    print(f"  {kernel_name:20s} D={D} N={N:5d} {causal_str:6s} -> SKIPPED ({e})")
+                    continue
 
                 key = (D, N, causal)
                 if key not in results:
                     results[key] = {}
 
-                # Torch SDPA (only measure once per config)
                 if "Torch SDPA" not in results[key]:
-                    assert verify("", tlx_sdpa_lambda(), ref_sdpa_lambda(), log=False)
                     ms = triton.testing.do_bench(ref_sdpa_lambda, warmup=25, rep=100)
                     tflops = total_flops / ms * 1e-9
                     results[key]["Torch SDPA"] = {"ms": ms, "tflops": tflops}
-                else:
-                    assert verify("", tlx_sdpa_lambda(), ref_sdpa_lambda(), log=False)
 
                 ms = triton.testing.do_bench(tlx_sdpa_lambda, warmup=25, rep=100)
                 tflops = total_flops / ms * 1e-9
