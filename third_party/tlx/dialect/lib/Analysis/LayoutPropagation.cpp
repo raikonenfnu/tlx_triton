@@ -2,6 +2,7 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -417,6 +418,41 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
+// True if `value` traces back through scf.for iter_args to a token-bearing
+// local_load (async DMA buffer).  See PropagateLayout.cpp for the rewrite-side
+// counterpart.  Only follows scf.for; depth 4 covers double-buffered patterns.
+static bool tracesToAsyncLocalLoad(Value value, unsigned depth = 4) {
+  if (depth == 0)
+    return false;
+  if (auto localLoadOp = value.getDefiningOp<ttg::LocalLoadOp>())
+    return localLoadOp.getToken() != nullptr;
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return false;
+  auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+  if (!forOp)
+    return false;
+  if (blockArg.getArgNumber() < forOp.getNumInductionVars())
+    return false;
+  unsigned argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+  Value initVal = forOp.getInitArgs()[argIdx];
+  if (tracesToAsyncLocalLoad(initVal, depth - 1))
+    return true;
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  return tracesToAsyncLocalLoad(yieldOp.getOperand(argIdx), depth - 1);
+}
+
+// Returns false for alloc sources that must keep their LDS round-trip:
+//  - tt.trans: shared memory carries an intentional reordering that
+//              convert_layout cannot reproduce.
+//  - async DMA origin: the LDS path (ds_read_tr16.b64) is ~2x faster than
+//              warp-shuffle convert_layout on AMDGPU.
+static bool isFoldableAllocSource(Value src) {
+  if (src.getDefiningOp<::mlir::triton::TransOp>())
+    return false;
+  return !tracesToAsyncLocalLoad(src);
+}
+
 // Later layout cleanup may express a dot-operand conversion as
 // tensor -> local_alloc -> local_load(dot). Treat that fallback as another dot
 // layout constraint on the source tensor so propagation can retag the original
@@ -427,7 +463,7 @@ static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
     return false;
   if (allocOp->use_empty())
     return false;
-  if (allocOp.getSrc().getDefiningOp<::mlir::triton::TransOp>())
+  if (!isFoldableAllocSource(allocOp.getSrc()))
     return false;
 
   for (Operation *user : allocOp->getUsers()) {

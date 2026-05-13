@@ -1,8 +1,8 @@
 #include "IR/Dialect.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
@@ -71,9 +71,13 @@ public:
 };
 
 // True if `value` traces back through scf.for iter_args to a token-bearing
-// local_load (async DMA buffer). For such values, a convert_layout uses
-// warp shuffles (ALU-heavy) while a local_alloc+local_load uses
-// ds_read_tr16.b64 (LDS-pipeline), which is ~2x faster on AMDGPU.
+// local_load (async DMA buffer).  For such values a convert_layout lowers to
+// warp shuffles (ALU-heavy), while the local_alloc+local_load path uses
+// ds_read_tr16.b64 (LDS-pipeline) which is ~2x faster on AMDGPU.
+//
+// Only follows scf.for iter_args; scf.while / scf.if are not expected in the
+// current AMD FA pipeline.  Depth 4 covers double-buffered patterns
+// (init → for_arg → yield → for_arg).
 static bool tracesToAsyncLocalLoad(Value value, unsigned depth = 4) {
   if (depth == 0)
     return false;
@@ -85,6 +89,8 @@ static bool tracesToAsyncLocalLoad(Value value, unsigned depth = 4) {
   auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
   if (!forOp)
     return false;
+  if (blockArg.getArgNumber() < forOp.getNumInductionVars())
+    return false;
   unsigned argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
   Value initVal = forOp.getInitArgs()[argIdx];
   if (tracesToAsyncLocalLoad(initVal, depth - 1))
@@ -93,20 +99,23 @@ static bool tracesToAsyncLocalLoad(Value value, unsigned depth = 4) {
   return tracesToAsyncLocalLoad(yieldOp.getOperand(argIdx), depth - 1);
 }
 
+// Returns false for alloc sources that must keep their LDS round-trip:
+//  - tt.trans: shared memory carries an intentional reordering
+//              (e.g. order=[0,1] for K^T in FA) that convert_layout loses.
+//  - async DMA origin: the LDS path uses ds_read_tr16.b64, which is ~2x
+//              faster than the warp-shuffle convert_layout on AMDGPU.
+static bool isFoldableAllocSource(Value src) {
+  if (src.getDefiningOp<tt::TransOp>())
+    return false;
+  return !tracesToAsyncLocalLoad(src);
+}
+
 // Late AMD passes can express a tensor layout conversion as a spill through
 // immutable local memory:
 //   tensor -> ttg.local_alloc -> ttg.local_load(dot)
 // Fold it back to either an identity or an explicit convert_layout so the
 // fallback does not survive to LLVM as LDS traffic.
-//
-// Guard: when the alloc source is a tt.trans, the shared memory intermediate
-// carries an intentional reordering (e.g. order=[0,1] for K^T in flash
-// attention).  A direct convert_layout from the transposed blocked encoding
-// does not reproduce this, so we must keep the LDS round-trip.
-//
-// Guard: when the alloc source traces back to a token-bearing local_load
-// (async DMA), the LDS round-trip uses ds_read_tr16.b64 which is faster
-// than the warp-shuffle-based convert_layout for blocked→dot_op conversion.
+// See isFoldableAllocSource for the guard conditions.
 class FoldRetaggedLocalAllocLoad
     : public mlir::OpRewritePattern<ttg::LocalLoadOp> {
 public:
@@ -120,9 +129,7 @@ public:
       return failure();
     if (localLoadOp.getToken())
       return failure();
-    if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
-      return failure();
-    if (tracesToAsyncLocalLoad(allocOp.getSrc()))
+    if (!isFoldableAllocSource(allocOp.getSrc()))
       return failure();
     auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
     if (!resultType ||
@@ -151,9 +158,7 @@ public:
     Value src = allocOp.getSrc();
     if (!src || !isa<RankedTensorType>(src.getType()))
       return failure();
-    if (src.getDefiningOp<tt::TransOp>())
-      return failure();
-    if (tracesToAsyncLocalLoad(src))
+    if (!isFoldableAllocSource(src))
       return failure();
     SmallVector<ttg::LocalLoadOp> loads;
     for (Operation *user : allocOp->getUsers()) {
@@ -218,9 +223,7 @@ static bool isRetaggableLocalAllocLoadFallback(ttg::LocalAllocOp allocOp) {
     return false;
   if (allocOp->use_empty())
     return false;
-  if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
-    return false;
-  if (tracesToAsyncLocalLoad(allocOp.getSrc()))
+  if (!isFoldableAllocSource(allocOp.getSrc()))
     return false;
 
   for (Operation *user : allocOp->getUsers()) {
