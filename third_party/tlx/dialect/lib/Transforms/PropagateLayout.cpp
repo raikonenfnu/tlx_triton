@@ -74,6 +74,11 @@ public:
 //   tensor -> ttg.local_alloc -> ttg.local_load(dot)
 // Fold it back to either an identity or an explicit convert_layout so the
 // fallback does not survive to LLVM as LDS traffic.
+//
+// Guard: when the alloc source is a tt.trans, the shared memory intermediate
+// carries an intentional reordering (e.g. order=[0,1] for K^T in flash
+// attention).  A direct convert_layout from the transposed blocked encoding
+// does not reproduce this, so we must keep the LDS round-trip.
 class FoldRetaggedLocalAllocLoad
     : public mlir::OpRewritePattern<ttg::LocalLoadOp> {
 public:
@@ -87,6 +92,8 @@ public:
       return failure();
     if (localLoadOp.getToken())
       return failure();
+    if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
+      return failure();
     auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
     if (!resultType ||
         !isSupportedDotConstraintEncoding(resultType.getEncoding()))
@@ -97,10 +104,6 @@ public:
       return success();
     }
 
-    // The matched local_alloc -> local_load pair is always an LDS round-trip.
-    // Replace it with a layout conversion: it lowers to register shuffles for
-    // the common encoding pairs and is no worse than the spill in the few
-    // cases where the conversion itself still goes through LDS.
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         localLoadOp, localLoadOp.getType(), allocOp.getSrc());
     return success();
@@ -117,6 +120,8 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     Value src = allocOp.getSrc();
     if (!src || !isa<RankedTensorType>(src.getType()))
+      return failure();
+    if (src.getDefiningOp<tt::TransOp>())
       return failure();
     SmallVector<ttg::LocalLoadOp> loads;
     for (Operation *user : allocOp->getUsers()) {
@@ -180,6 +185,8 @@ static bool isRetaggableLocalAllocLoadFallback(ttg::LocalAllocOp allocOp) {
   if (!allocOp.getSrc() || !isa<RankedTensorType>(allocOp.getSrc().getType()))
     return false;
   if (allocOp->use_empty())
+    return false;
+  if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
     return false;
 
   for (Operation *user : allocOp->getUsers()) {

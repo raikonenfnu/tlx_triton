@@ -427,6 +427,8 @@ static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
     return false;
   if (allocOp->use_empty())
     return false;
+  if (allocOp.getSrc().getDefiningOp<::mlir::triton::TransOp>())
+    return false;
 
   for (Operation *user : allocOp->getUsers()) {
     auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
