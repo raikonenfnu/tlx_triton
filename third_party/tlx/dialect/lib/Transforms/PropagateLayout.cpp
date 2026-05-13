@@ -1,5 +1,6 @@
 #include "IR/Dialect.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -69,6 +70,29 @@ public:
   }
 };
 
+// True if `value` traces back through scf.for iter_args to a token-bearing
+// local_load (async DMA buffer). For such values, a convert_layout uses
+// warp shuffles (ALU-heavy) while a local_alloc+local_load uses
+// ds_read_tr16.b64 (LDS-pipeline), which is ~2x faster on AMDGPU.
+static bool tracesToAsyncLocalLoad(Value value, unsigned depth = 4) {
+  if (depth == 0)
+    return false;
+  if (auto localLoadOp = value.getDefiningOp<ttg::LocalLoadOp>())
+    return localLoadOp.getToken() != nullptr;
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return false;
+  auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+  if (!forOp)
+    return false;
+  unsigned argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+  Value initVal = forOp.getInitArgs()[argIdx];
+  if (tracesToAsyncLocalLoad(initVal, depth - 1))
+    return true;
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  return tracesToAsyncLocalLoad(yieldOp.getOperand(argIdx), depth - 1);
+}
+
 // Late AMD passes can express a tensor layout conversion as a spill through
 // immutable local memory:
 //   tensor -> ttg.local_alloc -> ttg.local_load(dot)
@@ -79,6 +103,10 @@ public:
 // carries an intentional reordering (e.g. order=[0,1] for K^T in flash
 // attention).  A direct convert_layout from the transposed blocked encoding
 // does not reproduce this, so we must keep the LDS round-trip.
+//
+// Guard: when the alloc source traces back to a token-bearing local_load
+// (async DMA), the LDS round-trip uses ds_read_tr16.b64 which is faster
+// than the warp-shuffle-based convert_layout for blocked→dot_op conversion.
 class FoldRetaggedLocalAllocLoad
     : public mlir::OpRewritePattern<ttg::LocalLoadOp> {
 public:
@@ -93,6 +121,8 @@ public:
     if (localLoadOp.getToken())
       return failure();
     if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
+      return failure();
+    if (tracesToAsyncLocalLoad(allocOp.getSrc()))
       return failure();
     auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
     if (!resultType ||
@@ -122,6 +152,8 @@ public:
     if (!src || !isa<RankedTensorType>(src.getType()))
       return failure();
     if (src.getDefiningOp<tt::TransOp>())
+      return failure();
+    if (tracesToAsyncLocalLoad(src))
       return failure();
     SmallVector<ttg::LocalLoadOp> loads;
     for (Operation *user : allocOp->getUsers()) {
@@ -187,6 +219,8 @@ static bool isRetaggableLocalAllocLoadFallback(ttg::LocalAllocOp allocOp) {
   if (allocOp->use_empty())
     return false;
   if (allocOp.getSrc().getDefiningOp<tt::TransOp>())
+    return false;
+  if (tracesToAsyncLocalLoad(allocOp.getSrc()))
     return false;
 
   for (Operation *user : allocOp->getUsers()) {

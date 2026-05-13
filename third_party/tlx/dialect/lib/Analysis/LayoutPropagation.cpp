@@ -443,7 +443,15 @@ static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
 }
 
 static bool canRewriteTensorResult(Operation *op) {
-  return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
+  // Token-bearing local_loads read from async DMA buffers whose shared
+  // encoding is tuned for coalesced blocked reads. Retagging them to
+  // dot_op forces scattered LDS accesses (up to 4x more reads on AMDGPU).
+  // Keep them as blocked and let a downstream local_alloc+local_load
+  // (which uses ds_read_tr16.b64) handle the conversion to dot_op.
+  if (auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(op))
+    return !localLoadOp.getToken();
+
+  return isa<RegionBranchOpInterface>(op);
 }
 
 //===----------------------------------------------------------------------===//
