@@ -105,15 +105,14 @@ public:
     if (auto loadOp = src.getDefiningOp<amdgpu::BufferLoadOp>()) {
       Value offsets =
           convertTensorEncoding(rewriter, loc, loadOp.getOffsets(), encoding);
-      Value mask = loadOp.getMask()
-                       ? convertTensorEncoding(rewriter, loc, loadOp.getMask(),
-                                               encoding)
-                       : Value();
-      Value other =
-          loadOp.getOther()
-              ? convertTensorEncoding(rewriter, loc, loadOp.getOther(),
-                                      encoding)
+      Value mask =
+          loadOp.getMask()
+              ? convertTensorEncoding(rewriter, loc, loadOp.getMask(), encoding)
               : Value();
+      Value other = loadOp.getOther()
+                        ? convertTensorEncoding(rewriter, loc,
+                                                loadOp.getOther(), encoding)
+                        : Value();
       rewriter.replaceOpWithNewOp<amdgpu::BufferLoadOp>(
           convertOp, resultType, loadOp.getPtr(), offsets, loadOp.getStride(),
           loadOp.getCache(), mask, other, loadOp.getContiguity());
@@ -225,9 +224,9 @@ public:
 
     auto transposedSrc = ttg::MemDescTransOp::create(
         rewriter, transOp.getLoc(), localLoadOp.getSrc(), transOp.getOrder());
-    auto newLoad = ttg::LocalLoadOp::create(
-        rewriter, convertOp.getLoc(), resultType, transposedSrc,
-        localLoadOp.getToken());
+    auto newLoad =
+        ttg::LocalLoadOp::create(rewriter, convertOp.getLoc(), resultType,
+                                 transposedSrc, localLoadOp.getToken());
     newLoad->setAttrs(localLoadOp->getAttrs());
     rewriter.replaceOp(convertOp, newLoad.getResult());
     return success();
@@ -244,9 +243,10 @@ struct TransposedLoopCarrierInfo {
   SmallVector<tt::TransOp> resultTransOps;
 };
 
-static LogicalResult mergeTransposedCarrierTarget(
-    TransposedLoopCarrierInfo &info, ArrayRef<int32_t> order,
-    RankedTensorType targetType) {
+static LogicalResult
+mergeTransposedCarrierTarget(TransposedLoopCarrierInfo &info,
+                             ArrayRef<int32_t> order,
+                             RankedTensorType targetType) {
   if (!isSupportedDotConstraintEncoding(targetType.getEncoding()))
     return failure();
   if (!info.hasOrder) {
@@ -267,11 +267,11 @@ static bool isYieldUseOfLoop(OpOperand &use, scf::ForOp forOp) {
   return yieldOp && yieldOp->getParentOp() == forOp;
 }
 
-static LogicalResult collectTransposedDotUses(
-    Value value, scf::ForOp forOp, bool allowYieldUses,
-    TransposedLoopCarrierInfo &info,
-    SmallVectorImpl<ttg::ConvertLayoutOp> &convertOps,
-    SmallVectorImpl<tt::TransOp> &transOps) {
+static LogicalResult
+collectTransposedDotUses(Value value, scf::ForOp forOp, bool allowYieldUses,
+                         TransposedLoopCarrierInfo &info,
+                         SmallVectorImpl<ttg::ConvertLayoutOp> &convertOps,
+                         SmallVectorImpl<tt::TransOp> &transOps) {
   for (OpOperand &use : value.getUses()) {
     if (allowYieldUses && isYieldUseOfLoop(use, forOp))
       continue;
@@ -286,9 +286,8 @@ static LogicalResult collectTransposedDotUses(
       if (!convertOp)
         return failure();
       auto resultType = dyn_cast<RankedTensorType>(convertOp.getType());
-      if (!resultType ||
-          failed(mergeTransposedCarrierTarget(info, transOp.getOrder(),
-                                              resultType)))
+      if (!resultType || failed(mergeTransposedCarrierTarget(
+                             info, transOp.getOrder(), resultType)))
         return failure();
       convertOps.push_back(convertOp);
       hasConvertUser = true;
@@ -310,8 +309,8 @@ static std::optional<unsigned> getLoopIterArgIndex(Value value,
   return blockArg.getArgNumber() - 1;
 }
 
-static ttg::LocalLoadOp
-getDefiningLocalLoad(Value value, RankedTensorType targetType) {
+static ttg::LocalLoadOp getDefiningLocalLoad(Value value,
+                                             RankedTensorType targetType) {
   auto localLoadOp = value.getDefiningOp<ttg::LocalLoadOp>();
   if (!localLoadOp)
     return {};
@@ -328,13 +327,13 @@ getDefiningLocalLoad(Value value, RankedTensorType targetType) {
   return localLoadOp;
 }
 
-static ttg::LocalLoadOp createTransposedDotLocalLoad(
-    PatternRewriter &rewriter, Location loc, Value src, ArrayRef<int32_t> order,
-    RankedTensorType targetType, Value token = Value(),
-    ArrayRef<NamedAttribute> attrs = {}) {
+static ttg::LocalLoadOp
+createTransposedDotLocalLoad(PatternRewriter &rewriter, Location loc, Value src,
+                             ArrayRef<int32_t> order,
+                             RankedTensorType targetType, Value token = Value(),
+                             ArrayRef<NamedAttribute> attrs = {}) {
   OpBuilder::InsertionGuard guard(rewriter);
-  auto transposedSrc = ttg::MemDescTransOp::create(
-      rewriter, loc, src, order);
+  auto transposedSrc = ttg::MemDescTransOp::create(rewriter, loc, src, order);
   auto newLoad =
       ttg::LocalLoadOp::create(rewriter, loc, targetType, transposedSrc, token);
   if (!attrs.empty())
@@ -343,8 +342,8 @@ static ttg::LocalLoadOp createTransposedDotLocalLoad(
 }
 
 // Pipelined FA can carry K tiles as blocked tensors through scf.for stage
-// slots, hiding the original local_load from the direct transposed-load fold. To
-// match Gluon-style FA, retag the carried value itself to the transposed dot
+// slots, hiding the original local_load from the direct transposed-load fold.
+// To match Gluon-style FA, retag the carried value itself to the transposed dot
 // operand layout, and materialize dot-layout local_loads at loop init/yield.
 class FoldTransposedLoopCarriedLocalLoad
     : public mlir::OpRewritePattern<scf::ForOp> {
@@ -361,8 +360,7 @@ public:
     unsigned numIterArgs = forOp.getInitArgs().size();
     SmallVector<std::optional<TransposedLoopCarrierInfo>, 4> infos(numIterArgs);
 
-    for (auto [index, bodyArg] :
-         llvm::enumerate(forOp.getRegionIterArgs())) {
+    for (auto [index, bodyArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
       if (!isa<RankedTensorType>(bodyArg.getType()))
         continue;
 
@@ -436,18 +434,16 @@ public:
       if (!infos[index])
         continue;
 
-      auto localInit =
-          getDefiningLocalLoad(forOp.getInitArgs()[index],
-                               infos[index]->targetType);
+      auto localInit = getDefiningLocalLoad(forOp.getInitArgs()[index],
+                                            infos[index]->targetType);
       if (!localInit)
         return failure();
       rewriter.setInsertionPoint(forOp);
       newInitValues[index] =
-          createTransposedDotLocalLoad(rewriter, localInit.getLoc(),
-                                       localInit.getSrc(), infos[index]->order,
-                                       infos[index]->targetType,
-                                       localInit.getToken(),
-                                       localInit->getAttrs())
+          createTransposedDotLocalLoad(
+              rewriter, localInit.getLoc(), localInit.getSrc(),
+              infos[index]->order, infos[index]->targetType,
+              localInit.getToken(), localInit->getAttrs())
               .getResult();
       maybeDeadLocalLoads.push_back(localInit);
 
@@ -456,18 +452,17 @@ public:
               getDefiningLocalLoad(yielded, infos[index]->targetType)) {
         rewriter.setInsertionPoint(localYield);
         newYieldValues[index] =
-            createTransposedDotLocalLoad(rewriter, localYield.getLoc(),
-                                         localYield.getSrc(),
-                                         infos[index]->order,
-                                         infos[index]->targetType,
-                                         localYield.getToken(),
-                                         localYield->getAttrs())
+            createTransposedDotLocalLoad(
+                rewriter, localYield.getLoc(), localYield.getSrc(),
+                infos[index]->order, infos[index]->targetType,
+                localYield.getToken(), localYield->getAttrs())
                 .getResult();
         maybeDeadLocalLoads.push_back(localYield);
         continue;
       }
 
-      std::optional<unsigned> yieldedIndex = getLoopIterArgIndex(yielded, forOp);
+      std::optional<unsigned> yieldedIndex =
+          getLoopIterArgIndex(yielded, forOp);
       if (!yieldedIndex || !infos[*yieldedIndex] ||
           infos[*yieldedIndex]->targetType != infos[index]->targetType)
         return failure();
@@ -479,7 +474,8 @@ public:
         if (!infos[index])
           continue;
         forOp.getInitArgsMutable()[index].set(newInitValues[index]);
-        forOp.getRegionIterArgs()[index].setType(newInitValues[index].getType());
+        forOp.getRegionIterArgs()[index].setType(
+            newInitValues[index].getType());
         forOp.getResult(index).setType(newInitValues[index].getType());
       }
     });

@@ -256,7 +256,8 @@ struct CoalesceBufferLoadToLocalWrites
     auto srcTy = cast<RankedTensorType>(
         LLVM::AMD::getPointerTypeWithShape(copyOp.getPtr(), offsets));
 
-    auto blockedEnc = dyn_cast<ttg::BlockedEncodingAttr>(offsetTy.getEncoding());
+    auto blockedEnc =
+        dyn_cast<ttg::BlockedEncodingAttr>(offsetTy.getEncoding());
     if (!blockedEnc)
       return rewriter.notifyMatchFailure(copyOp,
                                          "offset encoding must be #blocked");

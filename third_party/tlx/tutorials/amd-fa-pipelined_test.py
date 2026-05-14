@@ -475,9 +475,9 @@ def _attn_fwd_async_fav3(
 
     q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
                 other=0.0)
-    q_smem = tlx.local_alloc(
-        (BLOCK_M, HEAD_DIM), Q.dtype.element_ty, 1,
-        layout=tlx.swizzled_shared_layout_encoding(8, 1, 16, [1, 0], [1, 1], [1, 1], [1, 1], [1, 1]))
+    q_smem = tlx.local_alloc((BLOCK_M, HEAD_DIM), Q.dtype.element_ty, 1,
+                             layout=tlx.swizzled_shared_layout_encoding(8, 1, 16, [1, 0], [1, 1], [1, 1], [1, 1],
+                                                                        [1, 1]))
     q_smem_view = tlx.local_view(q_smem, 0)
     tlx.local_store(q_smem_view, q)
     q = tlx.local_load(q_smem_view)
@@ -559,8 +559,8 @@ def _attn_fwd_async_fav3(
                 tlx.async_load_wait_group(2 * (NUM_STAGES - tail_i) - 1)
                 k_tail = tlx.local_load(tlx.local_view(k_buf_fast, stage_idx), relaxed=True)
                 qk = tl.dot(q, k_tail)
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, False, False)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     False, False)
 
                 tlx.async_load_wait_group(2 * (NUM_STAGES - tail_i) - 2)
                 v_tail = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
@@ -577,8 +577,8 @@ def _attn_fwd_async_fav3(
                 k_cur = tlx.local_load(tlx.local_view(k_buf_fast, 0), token=wait_tok, relaxed=True)
                 v_cur = tlx.local_load(tlx.local_view(v_buf_fast, 0), token=wait_tok, relaxed=True)
                 qk = tl.dot(q, k_cur)
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, False, False)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     False, False)
                 acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
         if BLOCK_M // BLOCK_N <= NUM_STAGES:
@@ -602,8 +602,8 @@ def _attn_fwd_async_fav3(
                 k_cur = tlx.local_load(tlx.local_view(k_buf_fast, tail_i), relaxed=True)
                 v_cur = tlx.local_load(tlx.local_view(v_buf_fast, tail_i), relaxed=True)
                 qk = tl.dot(q, k_cur)
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, True, True)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     True, True)
                 acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
         else:
             for block_id in tl.range(prefix_blocks, n_blocks, num_stages=0):
@@ -613,15 +613,15 @@ def _attn_fwd_async_fav3(
 
                 tok_k = tlx.async_load(kt_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, 0),
                                        mask=mask_n[None, :])
-                tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, 0),
-                                       mask=mask_n[:, None])
+                tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, 0), mask=mask_n[:,
+                                                                                                                None])
                 tlx.async_load_commit_group([tok_k, tok_v])
                 wait_tok = tlx.async_load_wait_group(0)
                 k_cur = tlx.local_load(tlx.local_view(k_buf_fast, 0), token=wait_tok, relaxed=True)
                 v_cur = tlx.local_load(tlx.local_view(v_buf_fast, 0), token=wait_tok, relaxed=True)
                 qk = tl.dot(q, k_cur)
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, True, True)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     True, True)
                 acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
     elif (not MASK_STEPS) and n_blocks > NUM_STAGES:
         k_buf_fast = tlx.local_alloc(
@@ -660,8 +660,8 @@ def _attn_fwd_async_fav3(
                 tlx.async_load_commit_group()
 
             with tlx.warp_pipeline_stage("dot2a", priority=0):
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, False, False)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     False, False)
                 p = p.to(v_tile.dtype)
 
             with tlx.warp_pipeline_stage("dot2b", priority=0):
@@ -736,8 +736,8 @@ def _attn_fwd_async_fav3(
                 tlx.async_load_commit_group([tok_v])
 
             with tlx.warp_pipeline_stage("dot2a", priority=0):
-                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                     BLOCK_N, IS_CAUSAL, MASK_STEPS)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                     IS_CAUSAL, MASK_STEPS)
                 p = p.to(v_tile.dtype)
 
             with tlx.warp_pipeline_stage("dot2b", priority=0):
@@ -752,8 +752,8 @@ def _attn_fwd_async_fav3(
             k_tail = tlx.local_load(tlx.local_view(k_buf_pipe, stage_idx), relaxed=True)
             v_tail = tlx.local_load(tlx.local_view(v_buf_pipe, stage_idx), relaxed=True)
             qk = tl.dot(q, k_tail.T)
-            acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                 BLOCK_N, IS_CAUSAL, MASK_STEPS)
+            acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                 IS_CAUSAL, MASK_STEPS)
             acc = tl.dot(p.to(v_tail.dtype), v_tail, acc)
     else:
         k_buf_one = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
@@ -775,8 +775,8 @@ def _attn_fwd_async_fav3(
             k_cur = tlx.local_load(tlx.local_view(k_buf_one, 0), token=wait_tok, relaxed=True)
             v_cur = tlx.local_load(tlx.local_view(v_buf_one, 0), token=wait_tok, relaxed=True)
             qk = tl.dot(q, k_cur.T)
-            acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                 BLOCK_N, IS_CAUSAL, MASK_STEPS)
+            acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
+                                                 IS_CAUSAL, MASK_STEPS)
             acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     l_recip = 1.0 / l_i
