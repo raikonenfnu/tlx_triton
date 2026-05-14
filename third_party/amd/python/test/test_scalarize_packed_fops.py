@@ -23,8 +23,12 @@ def get_func_body_asm(amdgcn):
 
 # check there are actually instances of colliding/adjacent fops and mfma without scalarization
 def test_check_not_scalarize():
+    old_scalarize = triton.knobs.amd.scalarize_packed_fops
     triton.knobs.amd.scalarize_packed_fops = False
-    kernel = triton.compile(str(Path(__file__).parent / "attn_fwd.ttir"), target=current_target)
+    try:
+        kernel = triton.compile(str(Path(__file__).parent / "attn_fwd.ttir"), target=current_target)
+    finally:
+        triton.knobs.amd.scalarize_packed_fops = old_scalarize
     llir = kernel.asm["llir"]
     func_body = get_func_body(llir)
 
@@ -63,8 +67,12 @@ def test_check_not_scalarize():
 
 # check scalarization "fixes"
 def test_check_scalarized():
+    old_scalarize = triton.knobs.amd.scalarize_packed_fops
     triton.knobs.amd.scalarize_packed_fops = True
-    kernel = triton.compile(str(Path(__file__).parent / "attn_fwd.ttir"), target=current_target)
+    try:
+        kernel = triton.compile(str(Path(__file__).parent / "attn_fwd.ttir"), target=current_target)
+    finally:
+        triton.knobs.amd.scalarize_packed_fops = old_scalarize
 
     # check the specific IR pattern was rewritten
     llir = kernel.asm["llir"]
@@ -107,3 +115,26 @@ def test_check_scalarized():
 
     checked_packed_fops_ir_bbs()
     checked_packed_fops_asm_bbs()
+
+
+def test_scalarize_packed_fops_compile_option_overrides_knob():
+    old_scalarize = triton.knobs.amd.scalarize_packed_fops
+    triton.knobs.amd.scalarize_packed_fops = False
+    try:
+        kernel = triton.compile(
+            str(Path(__file__).parent / "attn_fwd.ttir"),
+            target=current_target,
+            options={"scalarize_packed_fops": True},
+        )
+    finally:
+        triton.knobs.amd.scalarize_packed_fops = old_scalarize
+
+    func_body = get_func_body(kernel.asm["llir"])
+    bbs = list(re.split(r"^\d+:\s+; preds = %.*?$", func_body, flags=re.MULTILINE))
+    packed_fop = re.compile(r"= f(add|sub|mul) <")
+    found_mfma = False
+    for bb in bbs:
+        if "mfma" in bb or "wmma" in bb:
+            assert not packed_fop.search(bb)
+            found_mfma = True
+    assert found_mfma, "couldn't find packed mfma"

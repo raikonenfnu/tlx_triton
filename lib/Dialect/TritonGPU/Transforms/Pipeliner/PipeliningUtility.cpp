@@ -431,10 +431,14 @@ void mlir::triton::combineRedundantWaitOps(
     SmallVector<Value> depTokens = waitOp.getOperands();
     unsigned minWaitNumber = waitOp.getNum();
     Operation *next = waitOp->getNextNode();
-    // Stop if we reach the end of the block or if there is another commit group
-    // or a branching op (forOp, ifOp, whileOp) in between the waits
-    while (next &&
-           !isa<ttg::AsyncCommitGroupOp, RegionBranchOpInterface>(next)) {
+    // Stop if we reach the end of the block or if there is another commit
+    // group, branching op (forOp, ifOp, whileOp), or local-memory read in
+    // between the waits. A local_load after an async_wait is the consumption
+    // point for data made visible by that wait; merging a later, stricter wait
+    // into the earlier one can turn a staggered software pipeline tail into a
+    // full drain.
+    while (next && !isa<ttg::AsyncCommitGroupOp, ttg::LocalLoadOp,
+                        RegionBranchOpInterface>(next)) {
       if (auto nextWait = dyn_cast<ttg::AsyncWaitOp>(next)) {
         waitGroup.push_back(nextWait);
         minWaitNumber = std::min(minWaitNumber, nextWait.getNum());
