@@ -520,7 +520,7 @@ def _attn_fwd_async_fav3(
             k_tile = tlx.local_load(tlx.local_view(k_buf_fast, 0), relaxed=True)
 
             main_loop_end = prefix_blocks - NUM_STAGES
-            for block_id in tl.range(0, main_loop_end, loop_unroll_factor=1):
+            for block_id in tl.range(0, main_loop_end, loop_unroll_factor=4):
                 stage_idx = block_id % NUM_STAGES
                 next_stage_idx = (block_id + 1) % NUM_STAGES
                 start_n = block_id * BLOCK_N
@@ -664,7 +664,7 @@ def _attn_fwd_async_fav3(
         k_tile = tlx.local_load(tlx.local_view(k_buf_fast, 0), relaxed=True)
 
         main_loop_end = n_blocks - NUM_STAGES
-        for block_id in tl.range(0, main_loop_end, loop_unroll_factor=1):
+        for block_id in tl.range(0, main_loop_end, loop_unroll_factor=4):
             stage_idx = block_id % NUM_STAGES
             next_stage_idx = (block_id + 1) % NUM_STAGES
             start_n = block_id * BLOCK_N
@@ -934,7 +934,7 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     num_warps = kw.pop("num_warps", 8)
     waves_per_eu = kw.pop("waves_per_eu", 0)
     compiler_num_stages = kw.pop("num_stages", 3)
-    schedule_hint = kw.pop("schedule_hint", "none")
+    schedule_hint = kw.pop("schedule_hint", "gluon_wp")
     use_xcd_remap = kw.pop("xcd_remap", False)
     mask_steps = causal or (N_CTX % BLOCK_N != 0)
     xcd_pids_per_xcd = triton.cdiv(H, 8)
@@ -1090,6 +1090,7 @@ def run_benchmark(args):
         kernel_kwargs = {}
         if kernel_name == "async_fav3":
             kernel_kwargs["xcd_remap"] = args.xcd_remap
+            kernel_kwargs["schedule_hint"] = args.schedule_hint
         for B in args.b:
             for H in args.hq:
                 for D in args.d:
@@ -1154,6 +1155,8 @@ def parse_args():
                    help="Kernel variants to benchmark")
     p.add_argument("--xcd-remap", action=argparse.BooleanOptionalAction, default=False,
                    help="Enable Gluon-style XCD head remap for async_fav3")
+    p.add_argument("--schedule-hint", type=str, default="gluon_wp", choices=["none", "gluon_wp"],
+                   help="async_fav3 warp-pipeline schedule hint")
     return p.parse_args()
 
 
