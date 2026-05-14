@@ -168,6 +168,133 @@ def _attn_fwd_async_simple(
 
 
 @triton.jit
+def _remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = GRID_MN % NUM_XCDS
+    tall_xcds = tl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    pid = tl.where(
+        xcd < tall_xcds,
+        xcd * pids_per_xcd + local_pid,
+        tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid,
+    )
+    return pid
+
+
+@triton.jit
+def _attn_fwd_async_split_kv(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    GRID_MN,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    XCD_REMAP: tl.constexpr,
+):
+    """
+    Split K/V commit groups so QK compute can overlap with V DMA.
+    Optional XCD remapping for even workload distribution.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    if XCD_REMAP:
+        pid = _remap_xcd(pid, GRID_MN)
+    NUM_M_BLOCKS = GRID_MN // (Z * H)
+    pid_hz = pid // NUM_M_BLOCKS
+    pid_m = pid % NUM_M_BLOCKS
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 1)
+
+    k_base = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
+        kn = start_n + offs_n
+        mask = kn[:, None] < N_CTX
+
+        tok_k = tlx.async_load(k_base + start_n * stride_kn, tlx.local_view(k_buf, 0), mask=mask)
+        tlx.async_load_commit_group([tok_k])
+        tok_v = tlx.async_load(v_base + start_n * stride_vn, tlx.local_view(v_buf, 0), mask=mask)
+        tlx.async_load_commit_group([tok_v])
+
+        tlx.async_load_wait_group(1)
+        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
+
+        qk = tl.dot(q, k_cur.T)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+        if start_n + BLOCK_N > N_CTX:
+            qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+
+        tlx.async_load_wait_group(0)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
 def _attn_fwd_async_prefetch(
     Q,
     K,
@@ -434,20 +561,18 @@ def _attn_fwd_async_fav3(
         tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
         tlx.async_load_commit_group([tok_v])
 
-    WAIT_INIT: tl.constexpr = 2 * NUM_STAGES - 1
     WAIT_LOOP: tl.constexpr = 2 * NUM_STAGES - 2
 
-    # Wait for K of buffer 0 and load it
-    tlx.async_load_wait_group(WAIT_INIT)
+    WAIT_K0: tl.constexpr = 2 * NUM_STAGES - 1
+    tlx.async_load_wait_group(WAIT_K0)
     k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
 
-    main_end = tl.maximum(n_blocks - NUM_STAGES, 0)
-
-    # --- Main loop: QK dot + softmax + PV dot + prefetch next ---
-    for block_id in tl.range(0, main_end, num_stages=0):
+    # --- Main loop: compute + prefetch with multi-stage buffering ---
+    for block_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
         stage = block_id % NUM_STAGES
+        next_stage = (block_id + 1) % NUM_STAGES
         start_n = block_id * BLOCK_N
-        future_n = (block_id + NUM_STAGES) * BLOCK_N
+        future_n = start_n + NUM_STAGES * BLOCK_N
 
         qk = tl.dot(q, k_cur.T)
         if IS_CAUSAL:
@@ -456,10 +581,6 @@ def _attn_fwd_async_fav3(
 
         tlx.async_load_wait_group(WAIT_LOOP)
         v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
-
-        future_mask = (future_n + offs_n[:, None]) < hi
-        tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
-        tlx.async_load_commit_group([tok_k])
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
@@ -470,16 +591,19 @@ def _attn_fwd_async_fav3(
         m_i = m_ij
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
+        future_mask = (future_n + offs_n[:, None]) < hi
+        tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
+        tlx.async_load_commit_group([tok_k])
         tok_v = tlx.async_load(v_ptrs + future_n * stride_vn, tlx.local_view(v_buf, stage), mask=future_mask)
         tlx.async_load_commit_group([tok_v])
         tlx.async_load_wait_group(WAIT_LOOP)
-        next_stage = (block_id + 1) % NUM_STAGES
         k_cur = tlx.local_load(tlx.local_view(k_buf, next_stage), relaxed=True)
 
     # --- Tail: drain remaining NUM_STAGES blocks ---
+    tail_start = tl.maximum(n_blocks - NUM_STAGES, 0)
     tlx.async_load_wait_group(0)
     for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
-        block_id = main_end + tail_i
+        block_id = tail_start + tail_i
         if block_id < n_blocks:
             stage = block_id % NUM_STAGES
             start_n = block_id * BLOCK_N
@@ -608,14 +732,15 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
-    """Warp-pipelined FA with async DMA, inspired by Gluon 8-warp pingpong."""
+    """Multi-stage pipelined FA with async DMA (NUM_STAGES >= 2)."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
     NUM_STAGES = kw.pop("NUM_STAGES", 4)
-    num_warps = kw.pop("num_warps", 8)
+    num_warps = kw.pop("num_warps", 4)
+    assert NUM_STAGES >= 2, "async_fav3 requires NUM_STAGES >= 2; use async_prefetch for single-stage"
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     _attn_fwd_async_fav3[grid](
@@ -654,10 +779,40 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     return o
 
 
+def flash_attn_async_split_kv(q, k, v, sm_scale, causal=False, **kw):
+    """Split K/V commit groups for better compute-memory overlap."""
+    B, H, N_CTX, D = q.shape
+    o = torch.empty_like(q)
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 64)
+    num_warps = kw.pop("num_warps", 8)
+    xcd_remap = kw.pop("xcd_remap", True)
+    schedule_hint = kw.pop("schedule_hint", "memory-bound-attention")
+
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    GRID_MN = num_m_blocks * B * H
+    grid = (GRID_MN,)
+    _attn_fwd_async_split_kv[grid](
+        q, k, v, o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        B, H, N_CTX, GRID_MN, sm_scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
+        IS_CAUSAL=causal, XCD_REMAP=xcd_remap,
+        num_warps=num_warps, schedule_hint=schedule_hint,
+        **kw,
+    )
+    return o
+
+
 KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
     "async_fav3": flash_attn_async_fav3,
+    "async_split_kv": flash_attn_async_split_kv,
 }
 
 
