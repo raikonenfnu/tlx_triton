@@ -67,6 +67,14 @@ def _assume_strides(
 
 
 @triton.jit
+def _remap_xcd(pid, PIDS_PER_XCD: tl.constexpr, TALL_XCDS: tl.constexpr, NUM_XCDS: tl.constexpr = 8):
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    return tl.where(xcd < TALL_XCDS, xcd * PIDS_PER_XCD + local_pid,
+                    TALL_XCDS * PIDS_PER_XCD + (xcd - TALL_XCDS) * (PIDS_PER_XCD - 1) + local_pid)
+
+
+@triton.jit
 def _attn_fwd_async_simple(
     Q,
     K,
@@ -441,6 +449,9 @@ def _attn_fwd_async_fav3(
     NUM_STAGES: tl.constexpr,
     MASK_STEPS: tl.constexpr,
     USE_GLUON_WP: tl.constexpr,
+    USE_XCD_REMAP: tl.constexpr,
+    XCD_PIDS_PER_XCD: tl.constexpr,
+    XCD_TALL_XCDS: tl.constexpr,
 ):
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -448,7 +459,11 @@ def _attn_fwd_async_fav3(
     pid_m = tl.program_id(0)
     pid_hz = tl.program_id(1)
     off_z = pid_hz // H
-    off_h = pid_hz % H
+    off_h_raw = pid_hz % H
+    if USE_XCD_REMAP:
+        off_h = _remap_xcd(off_h_raw, XCD_PIDS_PER_XCD, XCD_TALL_XCDS)
+    else:
+        off_h = off_h_raw
 
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
@@ -588,21 +603,48 @@ def _attn_fwd_async_fav3(
                                                      BLOCK_N, False, False)
                 acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
-        for block_id in tl.range(prefix_blocks, n_blocks, num_stages=0):
-            start_n = block_id * BLOCK_N
-            kn = start_n + offs_n
-            mask_n = kn < N_CTX
+        if BLOCK_M // BLOCK_N <= NUM_STAGES:
+            tail_blocks = n_blocks - prefix_blocks
+            for tail_i in tl.range(0, tail_blocks, num_stages=0):
+                start_n = (prefix_blocks + tail_i) * BLOCK_N
+                kn = start_n + offs_n
+                mask_n = kn < N_CTX
 
-            tok_k = tlx.async_load(kt_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, 0), mask=mask_n[None, :])
-            tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, 0), mask=mask_n[:, None])
-            tlx.async_load_commit_group([tok_k, tok_v])
-            wait_tok = tlx.async_load_wait_group(0)
-            k_cur = tlx.local_load(tlx.local_view(k_buf_fast, 0), token=wait_tok, relaxed=True)
-            v_cur = tlx.local_load(tlx.local_view(v_buf_fast, 0), token=wait_tok, relaxed=True)
-            qk = tl.dot(q, k_cur)
-            acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                 BLOCK_N, True, True)
-            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+                tlx.async_load(kt_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, tail_i), mask=mask_n[None, :])
+                tlx.async_load_commit_group()
+                tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, tail_i), mask=mask_n[:, None])
+                tlx.async_load_commit_group()
+
+            tlx.async_load_wait_group(0)
+
+            for tail_i in tl.range(0, tail_blocks, num_stages=0):
+                start_n = (prefix_blocks + tail_i) * BLOCK_N
+                kn = start_n + offs_n
+
+                k_cur = tlx.local_load(tlx.local_view(k_buf_fast, tail_i), relaxed=True)
+                v_cur = tlx.local_load(tlx.local_view(v_buf_fast, tail_i), relaxed=True)
+                qk = tl.dot(q, k_cur)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
+                                                     BLOCK_N, True, True)
+                acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+        else:
+            for block_id in tl.range(prefix_blocks, n_blocks, num_stages=0):
+                start_n = block_id * BLOCK_N
+                kn = start_n + offs_n
+                mask_n = kn < N_CTX
+
+                tok_k = tlx.async_load(kt_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, 0),
+                                       mask=mask_n[None, :])
+                tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, 0),
+                                       mask=mask_n[:, None])
+                tlx.async_load_commit_group([tok_k, tok_v])
+                wait_tok = tlx.async_load_wait_group(0)
+                k_cur = tlx.local_load(tlx.local_view(k_buf_fast, 0), token=wait_tok, relaxed=True)
+                v_cur = tlx.local_load(tlx.local_view(v_buf_fast, 0), token=wait_tok, relaxed=True)
+                qk = tl.dot(q, k_cur)
+                acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
+                                                     BLOCK_N, True, True)
+                acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
     elif (not MASK_STEPS) and n_blocks > NUM_STAGES:
         k_buf_fast = tlx.local_alloc(
             (HEAD_DIM, BLOCK_N), K.dtype.element_ty, NUM_STAGES,
@@ -893,7 +935,12 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     waves_per_eu = kw.pop("waves_per_eu", 0)
     compiler_num_stages = kw.pop("num_stages", 3)
     schedule_hint = kw.pop("schedule_hint", "none")
+    use_xcd_remap = kw.pop("xcd_remap", False)
     mask_steps = causal or (N_CTX % BLOCK_N != 0)
+    xcd_pids_per_xcd = triton.cdiv(H, 8)
+    xcd_tall_xcds = H % 8
+    if xcd_tall_xcds == 0:
+        xcd_tall_xcds = 8
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     _attn_fwd_async_fav3[grid](
@@ -928,6 +975,9 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
         NUM_STAGES=4,
         MASK_STEPS=mask_steps,
         USE_GLUON_WP=schedule_hint == "gluon_wp",
+        USE_XCD_REMAP=use_xcd_remap,
+        XCD_PIDS_PER_XCD=xcd_pids_per_xcd,
+        XCD_TALL_XCDS=xcd_tall_xcds,
         num_warps=num_warps,
         num_stages=compiler_num_stages,
         waves_per_eu=waves_per_eu,
@@ -1037,6 +1087,9 @@ def run_benchmark(args):
 
     for kernel_name in args.kernel:
         kernel_fn = get_kernel(kernel_name)
+        kernel_kwargs = {}
+        if kernel_name == "async_fav3":
+            kernel_kwargs["xcd_remap"] = args.xcd_remap
         for B in args.b:
             for H in args.hq:
                 for D in args.d:
@@ -1059,7 +1112,7 @@ def run_benchmark(args):
                                 q, k, v, is_causal=causal, scale=sm)
 
                             try:
-                                tlx_sdpa_lambda = lambda: kernel_fn(q, k, v, sm, causal)
+                                tlx_sdpa_lambda = lambda: kernel_fn(q, k, v, sm, causal, **kernel_kwargs)
                                 ref_out = ref_sdpa_lambda()
                                 tlx_out = tlx_sdpa_lambda()
                                 assert verify("", tlx_out, ref_out, log=False)
@@ -1099,6 +1152,8 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     p.add_argument("--kernel", type=str, nargs="+", default=["async_simple", "async_prefetch"],
                    help="Kernel variants to benchmark")
+    p.add_argument("--xcd-remap", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable Gluon-style XCD head remap for async_fav3")
     return p.parse_args()
 
 
