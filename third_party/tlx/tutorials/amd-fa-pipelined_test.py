@@ -373,6 +373,11 @@ def _fa_softmax_part1(
 
 
 @triton.jit
+def _fa_max_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
 def _fa_apply_softmax(
     acc,
     l_i,
@@ -392,7 +397,8 @@ def _fa_apply_softmax(
     if IS_CAUSAL:
         qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
-    m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+    qk_max = tl.reduce(qk, 1, _fa_max_nan)
+    m_ij = tl.maximum(m_i, qk_max * QK_SCALE, propagate_nan=tl.PropagateNan.ALL)
     p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
     l_ij = tl.sum(p, 1)
     alpha = tl.math.exp2(m_i - m_ij)
