@@ -327,6 +327,8 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
 
   // Respect user-specified order on the source memdesc.
   if (auto srcType = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
+    if (isa<ttg::PaddedSharedEncodingAttr>(srcType.getEncoding()))
+      return;
     if (auto srcEnc =
             dyn_cast<ttg::SwizzledSharedEncodingAttr>(srcType.getEncoding())) {
       if (srcEnc.getOrder() != encoding.getOrder()) {

@@ -328,22 +328,24 @@ getDefiningLocalLoad(Value value, RankedTensorType targetType) {
   return localLoadOp;
 }
 
-static Value createTransposedDotLocalLoad(PatternRewriter &rewriter,
-                                          Location loc, Value src,
-                                          ArrayRef<int32_t> order,
-                                          RankedTensorType targetType) {
+static ttg::LocalLoadOp createTransposedDotLocalLoad(
+    PatternRewriter &rewriter, Location loc, Value src, ArrayRef<int32_t> order,
+    RankedTensorType targetType, Value token = Value(),
+    ArrayRef<NamedAttribute> attrs = {}) {
   OpBuilder::InsertionGuard guard(rewriter);
   auto transposedSrc = ttg::MemDescTransOp::create(
       rewriter, loc, src, order);
   auto newLoad =
-      ttg::LocalLoadOp::create(rewriter, loc, targetType, transposedSrc);
-  return newLoad.getResult();
+      ttg::LocalLoadOp::create(rewriter, loc, targetType, transposedSrc, token);
+  if (!attrs.empty())
+    newLoad->setAttrs(attrs);
+  return newLoad;
 }
 
 // Pipelined FA can carry K tiles as blocked tensors through scf.for stage
-// slots, hiding the original local_load from the direct transposed-load fold.
-// Carry the source memdesc instead and materialize memdesc_trans + dot
-// local_load at each QK use so deeper stage rotations keep the same lowering.
+// slots, hiding the original local_load from the direct transposed-load fold. To
+// match Gluon-style FA, retag the carried value itself to the transposed dot
+// operand layout, and materialize dot-layout local_loads at loop init/yield.
 class FoldTransposedLoopCarriedLocalLoad
     : public mlir::OpRewritePattern<scf::ForOp> {
 public:
@@ -429,6 +431,7 @@ public:
 
     SmallVector<Value> newInitValues(numIterArgs);
     SmallVector<Value> newYieldValues(numIterArgs);
+    SmallVector<ttg::LocalLoadOp, 4> maybeDeadLocalLoads;
     for (unsigned index = 0; index < numIterArgs; ++index) {
       if (!infos[index])
         continue;
@@ -438,12 +441,29 @@ public:
                                infos[index]->targetType);
       if (!localInit)
         return failure();
-      newInitValues[index] = localInit.getSrc();
+      rewriter.setInsertionPoint(forOp);
+      newInitValues[index] =
+          createTransposedDotLocalLoad(rewriter, localInit.getLoc(),
+                                       localInit.getSrc(), infos[index]->order,
+                                       infos[index]->targetType,
+                                       localInit.getToken(),
+                                       localInit->getAttrs())
+              .getResult();
+      maybeDeadLocalLoads.push_back(localInit);
 
       Value yielded = yieldOp.getOperand(index);
       if (auto localYield =
               getDefiningLocalLoad(yielded, infos[index]->targetType)) {
-        newYieldValues[index] = localYield.getSrc();
+        rewriter.setInsertionPoint(localYield);
+        newYieldValues[index] =
+            createTransposedDotLocalLoad(rewriter, localYield.getLoc(),
+                                         localYield.getSrc(),
+                                         infos[index]->order,
+                                         infos[index]->targetType,
+                                         localYield.getToken(),
+                                         localYield->getAttrs())
+                .getResult();
+        maybeDeadLocalLoads.push_back(localYield);
         continue;
       }
 
@@ -476,28 +496,24 @@ public:
         continue;
       Value bodyArg = forOp.getRegionIterArgs()[index];
       for (ttg::ConvertLayoutOp convertOp : infos[index]->argConvertOps) {
-        rewriter.setInsertionPoint(convertOp);
-        Value replacement = createTransposedDotLocalLoad(
-            rewriter, convertOp.getLoc(), bodyArg, infos[index]->order,
-            infos[index]->targetType);
-        rewriter.replaceOp(convertOp, replacement);
+        rewriter.replaceOp(convertOp, bodyArg);
       }
       maybeDeadTransOps.insert(infos[index]->argTransOps.begin(),
                                infos[index]->argTransOps.end());
 
       Value result = forOp.getResult(index);
       for (ttg::ConvertLayoutOp convertOp : infos[index]->resultConvertOps) {
-        rewriter.setInsertionPoint(convertOp);
-        Value replacement = createTransposedDotLocalLoad(
-            rewriter, convertOp.getLoc(), result, infos[index]->order,
-            infos[index]->targetType);
-        rewriter.replaceOp(convertOp, replacement);
+        rewriter.replaceOp(convertOp, result);
       }
       maybeDeadTransOps.insert(infos[index]->resultTransOps.begin(),
                                infos[index]->resultTransOps.end());
     }
 
     for (Operation *op : maybeDeadTransOps) {
+      if (op->use_empty())
+        rewriter.eraseOp(op);
+    }
+    for (ttg::LocalLoadOp op : maybeDeadLocalLoads) {
       if (op->use_empty())
         rewriter.eraseOp(op);
     }
