@@ -207,8 +207,13 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         while basis < int(shape[other_dim]):
             offset_bases.append([basis if dim == other_dim else 0 for dim in range(rank)])
             basis *= 2
+        if int(shape[other_dim]) == 32:
+            offset_bases.append([8 if dim == other_dim else 0 for dim in range(rank)])
         basis = 1
         while basis < 16 and basis < int(shape[other_dim]):
+            if int(shape[other_dim]) == 32 and basis == 8:
+                basis *= 2
+                continue
             offset_bases.append([basis if dim == other_dim else 0 for dim in range(rank)])
             basis *= 2
         return padded_shared_layout_encoding.with_linear_component(interval_padding_pairs, shape, offset_bases)

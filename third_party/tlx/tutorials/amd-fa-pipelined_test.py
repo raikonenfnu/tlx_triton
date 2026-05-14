@@ -885,11 +885,12 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
-    BLOCK_M = kw.pop("BLOCK_M", 256)
-    default_block_n = 32 if D == 128 and N_CTX <= 1024 else 64
+    use_long_causal_d128 = causal and D == 128 and N_CTX >= 8192
+    BLOCK_M = kw.pop("BLOCK_M", 128 if use_long_causal_d128 else 256)
+    default_block_n = 32 if D == 128 and (N_CTX <= 1024 or use_long_causal_d128) else 64
     BLOCK_N = kw.pop("BLOCK_N", default_block_n)
-    num_warps = kw.pop("num_warps", 8)
-    waves_per_eu = kw.pop("waves_per_eu", 0)
+    num_warps = kw.pop("num_warps", 4 if use_long_causal_d128 else 8)
+    waves_per_eu = kw.pop("waves_per_eu", 2 if use_long_causal_d128 else 0)
     compiler_num_stages = kw.pop("num_stages", 3)
     use_xcd_remap = kw.pop("xcd_remap", False)
     mask_steps = causal or (N_CTX % BLOCK_N != 0)
