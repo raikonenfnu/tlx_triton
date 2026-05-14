@@ -4,6 +4,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
@@ -14,8 +15,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
 
 #include "mlir/Analysis/DataFlowFramework.h"
 #define DEBUG_TYPE "tlx-propagate-layout"
@@ -226,6 +230,277 @@ public:
         localLoadOp.getToken());
     newLoad->setAttrs(localLoadOp->getAttrs());
     rewriter.replaceOp(convertOp, newLoad.getResult());
+    return success();
+  }
+};
+
+struct TransposedLoopCarrierInfo {
+  SmallVector<int32_t, 4> order;
+  bool hasOrder = false;
+  RankedTensorType targetType;
+  SmallVector<ttg::ConvertLayoutOp> argConvertOps;
+  SmallVector<tt::TransOp> argTransOps;
+  SmallVector<ttg::ConvertLayoutOp> resultConvertOps;
+  SmallVector<tt::TransOp> resultTransOps;
+};
+
+static LogicalResult mergeTransposedCarrierTarget(
+    TransposedLoopCarrierInfo &info, ArrayRef<int32_t> order,
+    RankedTensorType targetType) {
+  if (!isSupportedDotConstraintEncoding(targetType.getEncoding()))
+    return failure();
+  if (!info.hasOrder) {
+    info.order.assign(order.begin(), order.end());
+    info.hasOrder = true;
+    info.targetType = targetType;
+    return success();
+  }
+  if (info.order.size() != order.size() ||
+      !std::equal(info.order.begin(), info.order.end(), order.begin()) ||
+      info.targetType != targetType)
+    return failure();
+  return success();
+}
+
+static bool isYieldUseOfLoop(OpOperand &use, scf::ForOp forOp) {
+  auto yieldOp = dyn_cast<scf::YieldOp>(use.getOwner());
+  return yieldOp && yieldOp->getParentOp() == forOp;
+}
+
+static LogicalResult collectTransposedDotUses(
+    Value value, scf::ForOp forOp, bool allowYieldUses,
+    TransposedLoopCarrierInfo &info,
+    SmallVectorImpl<ttg::ConvertLayoutOp> &convertOps,
+    SmallVectorImpl<tt::TransOp> &transOps) {
+  for (OpOperand &use : value.getUses()) {
+    if (allowYieldUses && isYieldUseOfLoop(use, forOp))
+      continue;
+
+    auto transOp = dyn_cast<tt::TransOp>(use.getOwner());
+    if (!transOp)
+      return failure();
+
+    bool hasConvertUser = false;
+    for (OpOperand &transUse : transOp.getResult().getUses()) {
+      auto convertOp = dyn_cast<ttg::ConvertLayoutOp>(transUse.getOwner());
+      if (!convertOp)
+        return failure();
+      auto resultType = dyn_cast<RankedTensorType>(convertOp.getType());
+      if (!resultType ||
+          failed(mergeTransposedCarrierTarget(info, transOp.getOrder(),
+                                              resultType)))
+        return failure();
+      convertOps.push_back(convertOp);
+      hasConvertUser = true;
+    }
+    if (!hasConvertUser)
+      return failure();
+    transOps.push_back(transOp);
+  }
+  return success();
+}
+
+static std::optional<unsigned> getLoopIterArgIndex(Value value,
+                                                   scf::ForOp forOp) {
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg || blockArg.getOwner() != forOp.getBody())
+    return std::nullopt;
+  if (blockArg.getArgNumber() == 0)
+    return std::nullopt;
+  return blockArg.getArgNumber() - 1;
+}
+
+static ttg::LocalLoadOp
+getDefiningLocalLoad(Value value, RankedTensorType targetType) {
+  auto localLoadOp = value.getDefiningOp<ttg::LocalLoadOp>();
+  if (!localLoadOp)
+    return {};
+  auto srcType = dyn_cast<ttg::MemDescType>(localLoadOp.getSrc().getType());
+  if (!srcType)
+    return {};
+  SmallVector<int64_t> transposedShape(srcType.getShape().begin(),
+                                       srcType.getShape().end());
+  std::reverse(transposedShape.begin(), transposedShape.end());
+  if (transposedShape.size() != targetType.getShape().size() ||
+      !std::equal(transposedShape.begin(), transposedShape.end(),
+                  targetType.getShape().begin()))
+    return {};
+  return localLoadOp;
+}
+
+static Value createTransposedDotLocalLoad(PatternRewriter &rewriter,
+                                          Location loc, Value src,
+                                          ArrayRef<int32_t> order,
+                                          RankedTensorType targetType) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  auto transposedSrc = ttg::MemDescTransOp::create(
+      rewriter, loc, src, order);
+  auto newLoad =
+      ttg::LocalLoadOp::create(rewriter, loc, targetType, transposedSrc);
+  return newLoad.getResult();
+}
+
+// Pipelined FA can carry K tiles as blocked tensors through scf.for stage
+// slots, hiding the original local_load from the direct transposed-load fold.
+// Carry the source memdesc instead and materialize memdesc_trans + dot
+// local_load at each QK use so deeper stage rotations keep the same lowering.
+class FoldTransposedLoopCarriedLocalLoad
+    : public mlir::OpRewritePattern<scf::ForOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(scf::ForOp forOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto yieldOp = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (!yieldOp)
+      return failure();
+
+    unsigned numIterArgs = forOp.getInitArgs().size();
+    SmallVector<std::optional<TransposedLoopCarrierInfo>, 4> infos(numIterArgs);
+
+    for (auto [index, bodyArg] :
+         llvm::enumerate(forOp.getRegionIterArgs())) {
+      if (!isa<RankedTensorType>(bodyArg.getType()))
+        continue;
+
+      TransposedLoopCarrierInfo info;
+      if (failed(collectTransposedDotUses(bodyArg, forOp,
+                                          /*allowYieldUses=*/true, info,
+                                          info.argConvertOps,
+                                          info.argTransOps)))
+        continue;
+      if (failed(collectTransposedDotUses(forOp.getResult(index), forOp,
+                                          /*allowYieldUses=*/false, info,
+                                          info.resultConvertOps,
+                                          info.resultTransOps)))
+        continue;
+      if (!info.targetType)
+        continue;
+      infos[index] = std::move(info);
+    }
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (unsigned index = 0; index < numIterArgs; ++index) {
+        if (!infos[index])
+          continue;
+
+        Value yielded = yieldOp.getOperand(index);
+        std::optional<unsigned> yieldedIndex =
+            getLoopIterArgIndex(yielded, forOp);
+        if (!yieldedIndex)
+          continue;
+
+        if (*yieldedIndex >= numIterArgs)
+          return failure();
+        if (!infos[*yieldedIndex]) {
+          TransposedLoopCarrierInfo info;
+          info.order = infos[index]->order;
+          info.hasOrder = true;
+          info.targetType = infos[index]->targetType;
+          if (failed(collectTransposedDotUses(
+                  forOp.getRegionIterArgs()[*yieldedIndex], forOp,
+                  /*allowYieldUses=*/true, info, info.argConvertOps,
+                  info.argTransOps)))
+            return failure();
+          if (failed(collectTransposedDotUses(
+                  forOp.getResult(*yieldedIndex), forOp,
+                  /*allowYieldUses=*/false, info, info.resultConvertOps,
+                  info.resultTransOps)))
+            return failure();
+          infos[*yieldedIndex] = std::move(info);
+          changed = true;
+          continue;
+        }
+        if (failed(mergeTransposedCarrierTarget(*infos[*yieldedIndex],
+                                                infos[index]->order,
+                                                infos[index]->targetType)))
+          return failure();
+      }
+    }
+
+    bool hasCandidate = false;
+    for (auto &info : infos)
+      hasCandidate |= info.has_value();
+    if (!hasCandidate)
+      return failure();
+
+    SmallVector<Value> newInitValues(numIterArgs);
+    SmallVector<Value> newYieldValues(numIterArgs);
+    for (unsigned index = 0; index < numIterArgs; ++index) {
+      if (!infos[index])
+        continue;
+
+      auto localInit =
+          getDefiningLocalLoad(forOp.getInitArgs()[index],
+                               infos[index]->targetType);
+      if (!localInit)
+        return failure();
+      newInitValues[index] = localInit.getSrc();
+
+      Value yielded = yieldOp.getOperand(index);
+      if (auto localYield =
+              getDefiningLocalLoad(yielded, infos[index]->targetType)) {
+        newYieldValues[index] = localYield.getSrc();
+        continue;
+      }
+
+      std::optional<unsigned> yieldedIndex = getLoopIterArgIndex(yielded, forOp);
+      if (!yieldedIndex || !infos[*yieldedIndex] ||
+          infos[*yieldedIndex]->targetType != infos[index]->targetType)
+        return failure();
+      newYieldValues[index] = forOp.getRegionIterArgs()[*yieldedIndex];
+    }
+
+    rewriter.modifyOpInPlace(forOp, [&] {
+      for (unsigned index = 0; index < numIterArgs; ++index) {
+        if (!infos[index])
+          continue;
+        forOp.getInitArgsMutable()[index].set(newInitValues[index]);
+        forOp.getRegionIterArgs()[index].setType(newInitValues[index].getType());
+        forOp.getResult(index).setType(newInitValues[index].getType());
+      }
+    });
+    rewriter.modifyOpInPlace(yieldOp, [&] {
+      for (unsigned index = 0; index < numIterArgs; ++index) {
+        if (infos[index])
+          yieldOp->setOperand(index, newYieldValues[index]);
+      }
+    });
+
+    SmallPtrSet<Operation *, 16> maybeDeadTransOps;
+    for (unsigned index = 0; index < numIterArgs; ++index) {
+      if (!infos[index])
+        continue;
+      Value bodyArg = forOp.getRegionIterArgs()[index];
+      for (ttg::ConvertLayoutOp convertOp : infos[index]->argConvertOps) {
+        rewriter.setInsertionPoint(convertOp);
+        Value replacement = createTransposedDotLocalLoad(
+            rewriter, convertOp.getLoc(), bodyArg, infos[index]->order,
+            infos[index]->targetType);
+        rewriter.replaceOp(convertOp, replacement);
+      }
+      maybeDeadTransOps.insert(infos[index]->argTransOps.begin(),
+                               infos[index]->argTransOps.end());
+
+      Value result = forOp.getResult(index);
+      for (ttg::ConvertLayoutOp convertOp : infos[index]->resultConvertOps) {
+        rewriter.setInsertionPoint(convertOp);
+        Value replacement = createTransposedDotLocalLoad(
+            rewriter, convertOp.getLoc(), result, infos[index]->order,
+            infos[index]->targetType);
+        rewriter.replaceOp(convertOp, replacement);
+      }
+      maybeDeadTransOps.insert(infos[index]->resultTransOps.begin(),
+                               infos[index]->resultTransOps.end());
+    }
+
+    for (Operation *op : maybeDeadTransOps) {
+      if (op->use_empty())
+        rewriter.eraseOp(op);
+    }
     return success();
   }
 };
@@ -667,6 +942,7 @@ public:
     patterns.add<FoldLoadConvertLayout>(context);
     patterns.add<FoldIndexConvertLayout>(context);
     patterns.add<FoldTransposedLocalLoadConvertLayout>(context);
+    patterns.add<FoldTransposedLoopCarriedLocalLoad>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
 

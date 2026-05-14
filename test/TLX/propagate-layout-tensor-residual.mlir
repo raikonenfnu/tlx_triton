@@ -226,3 +226,47 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot : tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_local_trans, kWidth = 8}>>
   }
 }
+
+// -----
+// Test that the same transposed K local-load fold works through loop-carried
+// pipelined stages. This models prefetch pipelines where stage N yields stage
+// N+1 and only the oldest stage feeds the QK dot in a given iteration.
+
+#blocked_loop_trans_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked_loop_trans_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+#mma_loop_trans = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared_loop_trans = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_loop_trans = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @fold_transposed_loop_carried_local_loads
+  tt.func public @fold_transposed_loop_carried_local_loads(%src0: !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable>, %src1: !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable>, %src2: !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable>, %q: tensor<256x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_loop_trans, kWidth = 8}>>, %acc: tensor<256x64xf32, #mma_loop_trans>, %lb: i32, %ub: i32, %step: i32) -> (tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_loop_trans, kWidth = 8}>>, tensor<256x64xf32, #mma_loop_trans>) {
+    %token = amdg.async_wait {num_inst = 1 : i32}
+    %k0 = ttg.local_load %src0 token %token : !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable> -> tensor<64x128xf16, #blocked_loop_trans_src>
+    %k1 = ttg.local_load %src1 token %token : !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable> -> tensor<64x128xf16, #blocked_loop_trans_src>
+    // CHECK: scf.for {{.*}} iter_args(%[[STAGE0:.*]] = %{{.*}}, %[[STAGE1:.*]] = %{{.*}}, %[[ACC:.*]] = %{{.*}}) -> (!ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable>, !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable>, tensor<256x64xf32, #{{.*}}>)
+    %result:3 = scf.for %i = %lb to %ub step %step
+        iter_args(%stage0 = %k0, %stage1 = %k1, %acc_iter = %acc)
+        -> (tensor<64x128xf16, #blocked_loop_trans_src>, tensor<64x128xf16, #blocked_loop_trans_src>, tensor<256x64xf32, #mma_loop_trans>) : i32 {
+      %qk_t = tt.trans %stage0 {order = array<i32: 1, 0>} : tensor<64x128xf16, #blocked_loop_trans_src> -> tensor<128x64xf16, #blocked_loop_trans_dst>
+      %qk = ttg.convert_layout %qk_t : tensor<128x64xf16, #blocked_loop_trans_dst> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_loop_trans, kWidth = 8}>>
+      // CHECK: %[[QK_DESC:.*]] = ttg.memdesc_trans %[[STAGE0]] {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable>
+      // CHECK-NEXT: %[[QK:.*]] = ttg.local_load %[[QK_DESC]] : !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>
+      // CHECK-NEXT: tt.dot %{{.*}}, %[[QK]], %[[ACC]]
+      %dot = tt.dot %q, %qk, %acc_iter : tensor<256x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_loop_trans, kWidth = 8}>> * tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_loop_trans, kWidth = 8}>> -> tensor<256x64xf32, #mma_loop_trans>
+      %next = ttg.local_load %src2 token %token : !ttg.memdesc<64x128xf16, #shared_loop_trans, #smem_loop_trans, mutable> -> tensor<64x128xf16, #blocked_loop_trans_src>
+      // CHECK-NOT: tt.trans
+      // CHECK-NOT: ttg.convert_layout
+      // CHECK: scf.yield %[[STAGE1]], %{{.*}}, %{{.*}}
+      scf.yield %stage1, %next, %dot : tensor<64x128xf16, #blocked_loop_trans_src>, tensor<64x128xf16, #blocked_loop_trans_src>, tensor<256x64xf32, #mma_loop_trans>
+    }
+    %last_t = tt.trans %result#0 {order = array<i32: 1, 0>} : tensor<64x128xf16, #blocked_loop_trans_src> -> tensor<128x64xf16, #blocked_loop_trans_dst>
+    %last = ttg.convert_layout %last_t : tensor<128x64xf16, #blocked_loop_trans_dst> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_loop_trans, kWidth = 8}>>
+    // CHECK-NOT: tt.trans
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: %[[LAST_DESC:.*]] = ttg.memdesc_trans %{{.*}}#0 {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable>
+    // CHECK-NEXT: %[[LAST:.*]] = ttg.local_load %[[LAST_DESC]] : !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>
+    // CHECK: tt.return %[[LAST]], %{{.*}}#2
+    tt.return %last, %result#2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_loop_trans, kWidth = 8}>>, tensor<256x64xf32, #mma_loop_trans>
+  }
+}
