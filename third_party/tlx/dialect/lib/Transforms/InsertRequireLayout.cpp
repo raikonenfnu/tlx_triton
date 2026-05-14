@@ -55,8 +55,8 @@ public:
   };
 
   DotRewriteState() = default;
-  explicit DotRewriteState(Attribute enc)
-      : kind(Kind::Required), encoding(enc) {}
+  explicit DotRewriteState(Attribute enc, bool transposed = false)
+      : kind(Kind::Required), encoding(enc), transposed(transposed) {}
 
   static DotRewriteState getConflict() {
     DotRewriteState state;
@@ -71,13 +71,15 @@ public:
   }
 
   bool operator==(const DotRewriteState &rhs) const {
-    return kind == rhs.kind && encoding == rhs.encoding;
+    return kind == rhs.kind && encoding == rhs.encoding &&
+           transposed == rhs.transposed;
   }
 
   bool isUninitialized() const { return kind == Kind::Uninitialized; }
   bool isRequired() const { return kind == Kind::Required; }
   bool isConflict() const { return kind == Kind::Conflict; }
   bool isIllegal() const { return kind == Kind::Illegal; }
+  bool isTransposed() const { return transposed; }
 
   Attribute getEncoding() const {
     assert(isRequired() && "expected required dot encoding state");
@@ -99,6 +101,8 @@ public:
     }
     if (isRequired()) {
       encoding->print(os);
+      if (transposed)
+        os << " (transposed)";
       return;
     }
     llvm_unreachable("unknown dot rewrite state");
@@ -133,6 +137,7 @@ public:
 private:
   Kind kind = Kind::Uninitialized;
   std::optional<Attribute> encoding;
+  bool transposed = false;
 };
 
 class DotRewriteLattice : public Lattice<DotRewriteState> {
@@ -155,7 +160,8 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
-  return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
+  return isa<ttg::ConvertLayoutOp, tt::TransOp>(op) ||
+         isTransparentLayoutCarrierOp(op);
 }
 
 class DotRewriteBackward
@@ -184,6 +190,24 @@ public:
                 dyn_cast<ttg::DotOperandEncodingAttr>(type.getEncoding())) {
           ChangeResult changed = operands[i]->meet(DotRewriteState(dotEnc));
           propagateIfChanged(operands[i], changed);
+        }
+      }
+      return success();
+    }
+
+    // When propagating backward through tt.trans, toggle the transposed
+    // flag so the shared encoding computation knows to use needTrans=true.
+    if (isa<tt::TransOp>(op)) {
+      if (!results.empty() && !operands.empty()) {
+        const auto &resultState = results[0]->getValue();
+        if (resultState.isRequired()) {
+          DotRewriteState transState(resultState.getEncoding(),
+                                     !resultState.isTransposed());
+          ChangeResult changed = operands[0]->meet(transState);
+          propagateIfChanged(operands[0], changed);
+        } else if (!resultState.isUninitialized()) {
+          ChangeResult changed = operands[0]->meet(resultState);
+          propagateIfChanged(operands[0], changed);
         }
       }
       return success();
@@ -251,15 +275,15 @@ private:
 
 static ttg::SwizzledSharedEncodingAttr
 computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
-                           ttg::LocalLoadOp localLoadOp) {
+                           ttg::LocalLoadOp localLoadOp,
+                           bool needTrans = false) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
   auto order = ttg::getOrderForMemory(resultType);
   auto ctaLayout = ttg::getCGALayout(resultType.getEncoding());
   unsigned bitWidth = resultType.getElementType().getIntOrFloatBitWidth();
   return ttg::SwizzledSharedEncodingAttr::get(localLoadOp->getContext(), dotEnc,
                                               resultType.getShape(), order,
-                                              ctaLayout, bitWidth,
-                                              /*needTrans=*/false);
+                                              ctaLayout, bitWidth, needTrans);
 }
 
 // Walk up the memdesc def-chain through subview / reinterpret ops to
@@ -708,10 +732,13 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     if (!dotEnc)
       return;
 
-    LDBG("local_load needs dot encoding: " << dotEnc);
+    bool needTrans = lattice->getValue().isTransposed();
+    LDBG("local_load needs dot encoding: " << dotEnc
+                                           << " needTrans=" << needTrans);
 
     // Insert RequireLayoutOp for memdesc swizzling.
-    auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);
+    auto sharedEnc =
+        computeSharedEncFromDotEnc(dotEnc, localLoadOp, needTrans);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
   });
 
