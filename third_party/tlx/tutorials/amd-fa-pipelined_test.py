@@ -469,6 +469,7 @@ def _attn_fwd_async_fav3(
         hi = N_CTX
 
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    kt_ptrs = K + k_off + offs_d[:, None] * stride_kk + offs_n[None, :] * stride_kn
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
     n_blocks = tl.cdiv(hi, BLOCK_N)
@@ -479,15 +480,15 @@ def _attn_fwd_async_fav3(
 
     if (not MASK_STEPS) and n_blocks > NUM_STAGES:
         k_buf_fast = tlx.local_alloc(
-            (BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_STAGES,
-            layout=tlx.padded_shared_layout_encoding.with_identity_for([(512, 32)], (BLOCK_N, HEAD_DIM)))
+            (HEAD_DIM, BLOCK_N), K.dtype.element_ty, NUM_STAGES,
+            layout=tlx.padded_shared_layout_encoding.with_gfx950_fa_bases([(512, 8)], (HEAD_DIM, BLOCK_N), 0))
         v_buf_fast = tlx.local_alloc(
             (BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_STAGES,
-            layout=tlx.padded_shared_layout_encoding.with_identity_for([(512, 32)], (BLOCK_N, HEAD_DIM)))
+            layout=tlx.padded_shared_layout_encoding.with_gfx950_fa_bases([(512, 32)], (BLOCK_N, HEAD_DIM), 1))
 
         for stage in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
             start_n = stage * BLOCK_N
-            tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, stage))
+            tlx.async_load(kt_ptrs + start_n * stride_kn, tlx.local_view(k_buf_fast, stage))
             tlx.async_load_commit_group()
             tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf_fast, stage))
             tlx.async_load_commit_group()
@@ -505,20 +506,20 @@ def _attn_fwd_async_fav3(
 
             if USE_GLUON_WP:
                 with tlx.warp_pipeline_stage("dot1", priority=0):
-                    qk = tl.dot(q, k_tile.T)
+                    qk = tl.dot(q, k_tile)
             else:
-                qk = tl.dot(q, k_tile.T)
+                qk = tl.dot(q, k_tile)
 
             tlx.async_load_wait_group(2 * NUM_STAGES - 2)
 
             if USE_GLUON_WP:
                 with tlx.warp_pipeline_stage("mem1", priority=1):
                     v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
-                    tlx.async_load(k_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
+                    tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
                     tlx.async_load_commit_group()
             else:
                 v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
-                tlx.async_load(k_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
+                tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
                 tlx.async_load_commit_group()
 
             if USE_GLUON_WP:
@@ -556,7 +557,7 @@ def _attn_fwd_async_fav3(
 
             tlx.async_load_wait_group(2 * (NUM_STAGES - tail_i) - 1)
             k_tail = tlx.local_load(tlx.local_view(k_buf_fast, stage_idx), relaxed=True)
-            qk = tl.dot(q, k_tail.T)
+            qk = tl.dot(q, k_tail)
             acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M, BLOCK_N,
                                                  False, False)
 

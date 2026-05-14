@@ -65,6 +65,7 @@ struct CoalesceAsyncCopyWrites
       return copyOp->emitError()
              << "No contiguity information about the copy op";
     assert(loadContig > 0);
+    unsigned originalLoadContig = loadContig;
 
     // Further restrict the contiguity based on the contiguity of the src to dst
     // layout e.g. if the order of the blocked and shared encoding is different
@@ -80,8 +81,9 @@ struct CoalesceAsyncCopyWrites
       sharedLayout = triton::gpu::toLinearLayout(dstTy);
     }
     auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
-    loadContig = std::min<unsigned>(loadContig,
-                                    regToSharedLayout.getNumConsecutiveInOut());
+    if (!paddedEnc)
+      loadContig = std::min<unsigned>(
+          loadContig, regToSharedLayout.getNumConsecutiveInOut());
 
     // Select the largest supported load width equal or smaller than loadContig
     auto elemBitWidth = dstTy.getElementTypeBitWidth();
@@ -101,8 +103,10 @@ struct CoalesceAsyncCopyWrites
 
     ttg::DistributedEncodingTrait newDistEnc;
 
+    unsigned directVec = loadContig;
     if (LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
-                                      dstTy.getAllocShape(), loadContig)) {
+                                      dstTy.getAllocShape(), directVec) &&
+        loadContig == originalLoadContig && !paddedEnc) {
       return rewriter.notifyMatchFailure(copyOp, "already writes coalesced");
     }
     // Check if we support load contig because canLoadDirectToLds can change it
@@ -231,6 +235,186 @@ private:
   const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> &asyncCopyContiguity;
 };
 
+struct CoalesceBufferLoadToLocalWrites
+    : public OpRewritePattern<triton::amdgpu::BufferLoadToLocalOp> {
+  CoalesceBufferLoadToLocalWrites(
+      const triton::AMD::TargetInfo &targetInfo,
+      const DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned>
+          &bufferLoadContiguity,
+      MLIRContext *ctx)
+      : OpRewritePattern(ctx), targetInfo{targetInfo},
+        bufferLoadContiguity{bufferLoadContiguity} {}
+
+  LogicalResult matchAndRewrite(triton::amdgpu::BufferLoadToLocalOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Value offsets = copyOp.getOffsets();
+    Value mask = copyOp.getMask();
+    Value other = copyOp.getOther();
+
+    auto offsetTy = cast<RankedTensorType>(offsets.getType());
+    auto dstTy = cast<ttg::MemDescType>(copyOp.getDest().getType());
+    auto srcTy = cast<RankedTensorType>(
+        LLVM::AMD::getPointerTypeWithShape(copyOp.getPtr(), offsets));
+
+    auto blockedEnc = dyn_cast<ttg::BlockedEncodingAttr>(offsetTy.getEncoding());
+    if (!blockedEnc)
+      return rewriter.notifyMatchFailure(copyOp,
+                                         "offset encoding must be #blocked");
+
+    if (!isa<ttg::SwizzledSharedEncodingAttr, ttg::PaddedSharedEncodingAttr>(
+            dstTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          copyOp, "dst encoding must be #swizzled or #padded");
+    }
+
+    unsigned loadContig = 0;
+    if (auto it = bufferLoadContiguity.find(copyOp);
+        it != bufferLoadContiguity.end())
+      loadContig = it->second;
+    else
+      return copyOp->emitError()
+             << "No contiguity information about the buffer load op";
+    assert(loadContig > 0);
+    unsigned originalLoadContig = loadContig;
+
+    LinearLayout regLayout = triton::gpu::toLinearLayout(srcTy);
+    LinearLayout sharedLayout;
+    auto paddedEnc =
+        dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstTy.getEncoding());
+    if (paddedEnc) {
+      sharedLayout = paddedEnc.getLinearComponent();
+    } else {
+      sharedLayout = triton::gpu::toLinearLayout(dstTy);
+    }
+    auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
+    if (!paddedEnc)
+      loadContig = std::min<unsigned>(
+          loadContig, regToSharedLayout.getNumConsecutiveInOut());
+
+    auto elemBitWidth = dstTy.getElementTypeBitWidth();
+    loadContig =
+        fitToValidDirectToLdsVecSize(loadContig, elemBitWidth, targetInfo);
+
+    if (loadContig == 0) {
+      return rewriter.notifyMatchFailure(
+          copyOp, "could not find layout config to create coalesced writes");
+    }
+
+    auto mod = copyOp->getParentOfType<ModuleOp>();
+    int numWarps = triton::gpu::lookupNumWarps(copyOp);
+    int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+
+    ttg::DistributedEncodingTrait newDistEnc;
+
+    unsigned directVec = loadContig;
+    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
+                                      dstTy.getAllocShape(), directVec) &&
+        loadContig == originalLoadContig && !paddedEnc) {
+      return rewriter.notifyMatchFailure(copyOp, "already writes coalesced");
+    }
+    if (!targetInfo.supportsDirectToLdsLoadBitWidth(loadContig * elemBitWidth))
+      return rewriter.notifyMatchFailure(copyOp,
+                                         "unable to find supported vector size "
+                                         "based on src and dst encodings");
+
+    if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
+      auto contigPerThread = ttg::getContigPerThread(offsetTy);
+      auto srcElemContig = contigPerThread[blockedEnc.getOrder()[0]];
+      assert(srcElemContig >= loadContig);
+      contigPerThread[blockedEnc.getOrder()[0]] = loadContig;
+      newDistEnc = BlockedEncodingAttr::get(
+          copyOp.getContext(), offsetTy.getShape(), contigPerThread,
+          blockedEnc.getOrder(), numWarps, threadsPerWarp,
+          blockedEnc.getCGALayout());
+    } else if (paddedEnc) {
+      auto *ctx = offsetTy.getContext();
+      StringAttr kOffset = StringAttr::get(ctx, "offset");
+
+      auto rank = offsetTy.getRank();
+      auto offsetBases = sharedLayout.getBases().lookup(kOffset);
+
+      int log2LoadContig = llvm::Log2_32(loadContig);
+      int log2ThreadsPerWarp = llvm::Log2_32(threadsPerWarp);
+      int log2NumWarps = llvm::Log2_32(numWarps);
+
+      if (offsetBases.size() < log2LoadContig + log2ThreadsPerWarp) {
+        return rewriter.notifyMatchFailure(
+            copyOp, "dst shape is too small. We require at least loadContig * "
+                    "threadsPerWarp elements");
+      }
+
+      auto remainingBases = ArrayRef(offsetBases);
+      auto takeN = [&remainingBases](size_t n) {
+        auto take = std::min(remainingBases.size(), n);
+        auto v = remainingBases.take_front(take).vec();
+        remainingBases = remainingBases.drop_front(take);
+        return v;
+      };
+
+      auto regBases = takeN(log2LoadContig);
+      auto laneBases = takeN(log2ThreadsPerWarp);
+      auto warpBases = takeN(log2NumWarps);
+      warpBases.resize(log2NumWarps, std::vector<int32_t>(rank, 0));
+      append_range(regBases, remainingBases);
+
+      triton::LinearLayout newRegLayout(
+          {
+              {StringAttr::get(ctx, "register"), regBases},
+              {StringAttr::get(ctx, "lane"), laneBases},
+              {StringAttr::get(ctx, "warp"), warpBases},
+          },
+          triton::standardOutDimNames(ctx, rank));
+
+      newRegLayout = triton::gpu::combineCtaCgaWithShape(
+          newRegLayout, blockedEnc.getCGALayout(), offsetTy.getShape());
+
+      auto newRegToShared = newRegLayout.invertAndCompose(sharedLayout);
+      if (newRegToShared.getNumConsecutiveInOut() < loadContig) {
+        return rewriter.notifyMatchFailure(
+            copyOp, "could not coalesce global addresses based on the linear "
+                    "component of the padded encoding");
+      }
+
+      newDistEnc = ttg::LinearEncodingAttr::get(ctx, std::move(newRegLayout));
+    } else {
+      assert(false && "Unsupported layout");
+    }
+
+    if (newDistEnc == offsetTy.getEncoding()) {
+      return rewriter.notifyMatchFailure(
+          copyOp, "Unable to find a new source layout to coalesce writes");
+    }
+
+    auto convertLayout = [&rewriter](auto loc, Value old, auto newEnc) {
+      auto oldTy = cast<RankedTensorType>(old.getType());
+      RankedTensorType newTy = oldTy.cloneWithEncoding(newEnc);
+      return ttg::ConvertLayoutOp::create(rewriter, loc, newTy, old);
+    };
+
+    auto loc = copyOp->getLoc();
+    Value cvtOffsets = convertLayout(loc, offsets, newDistEnc);
+    if (mask)
+      mask = convertLayout(loc, mask, newDistEnc);
+    if (other)
+      other = convertLayout(loc, other, newDistEnc);
+
+    rewriter.modifyOpInPlace(copyOp, [&]() {
+      copyOp.getOffsetsMutable().assign(cvtOffsets);
+      if (mask)
+        copyOp.getMaskMutable().assign(mask);
+      if (other)
+        copyOp.getOtherMutable().assign(other);
+      copyOp.setContiguity(loadContig);
+    });
+    return success();
+  }
+
+private:
+  const triton::AMD::TargetInfo &targetInfo;
+  const DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned>
+      &bufferLoadContiguity;
+};
+
 } // anonymous namespace
 
 class TritonAMDGPUCoalesceAsyncCopyPass
@@ -256,6 +440,8 @@ public:
     // after every IR change.
     AMD::ModuleAxisInfoAnalysis axisAnalysis(m);
     DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> asyncCopyContiguity;
+    DenseMap<triton::amdgpu::BufferLoadToLocalOp, unsigned>
+        bufferLoadContiguity;
     m->walk([&](ttg::AsyncCopyGlobalToLocalOp copyOp) {
       unsigned contiguity =
           mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
@@ -265,8 +451,19 @@ public:
       }
       asyncCopyContiguity.insert({copyOp, contiguity});
     });
+    m->walk([&](triton::amdgpu::BufferLoadToLocalOp copyOp) {
+      unsigned contiguity = mlir::LLVM::AMD::getContiguity(
+          copyOp.getPtr(), copyOp.getOffsets(), axisAnalysis);
+      if (auto mask = copyOp.getMask()) {
+        contiguity =
+            std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
+      }
+      bufferLoadContiguity.insert({copyOp, contiguity});
+    });
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
                                           context);
+    patterns.add<CoalesceBufferLoadToLocalWrites>(
+        targetInfo, bufferLoadContiguity, context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();

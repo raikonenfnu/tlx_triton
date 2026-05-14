@@ -129,6 +129,8 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         numCTAsPerCGA,
         numCTASplit,
         numCTAOrder,
+        offset_bases=None,
+        block_bases=None,
     ):
         super().__init__()
         assert len(intervals) == len(paddings), \
@@ -140,6 +142,8 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.numCTAsPerCGA = list(numCTAsPerCGA)
         self.numCTASplit = list(numCTASplit)
         self.numCTAOrder = list(numCTAOrder)
+        self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
+        self.block_bases = [] if block_bases is None else [list(b) for b in block_bases]
 
     @staticmethod
     @constexpr_function
@@ -166,9 +170,56 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAOrder=list(range(rank)),
         )
 
+    @staticmethod
+    @constexpr_function
+    def with_linear_component(interval_padding_pairs, shape, offset_bases, block_bases=None):
+        """Build a padded shared layout with explicit offset bases."""
+        rank = len(shape)
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        if block_bases is None:
+            block_bases = []
+        return padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=offset_bases,
+            block_bases=block_bases,
+        )
+
+    @staticmethod
+    @constexpr_function
+    def with_gfx950_fa_bases(interval_padding_pairs, shape, contiguous_dim):
+        """Build the padded shared basis order used by the gfx950 Gluon FA kernel."""
+        rank = len(shape)
+        assert rank == 2, "gfx950 FA padded layout expects a 2-D tile"
+        other_dim = 1 - contiguous_dim
+        offset_bases = []
+        basis = 1
+        while basis < int(shape[contiguous_dim]):
+            offset_bases.append([basis if dim == contiguous_dim else 0 for dim in range(rank)])
+            basis *= 2
+        basis = 16
+        while basis < int(shape[other_dim]):
+            offset_bases.append([basis if dim == other_dim else 0 for dim in range(rank)])
+            basis *= 2
+        basis = 1
+        while basis < 16 and basis < int(shape[other_dim]):
+            offset_bases.append([basis if dim == other_dim else 0 for dim in range(rank)])
+            basis *= 2
+        return padded_shared_layout_encoding.with_linear_component(interval_padding_pairs, shape, offset_bases)
+
     def make_permute(self, dims):
         permuted_order = [self.order[d] for d in dims]
         permuted_shape = [self.shape[d] for d in dims]
+        permuted_offset_bases = None
+        if self.offset_bases is not None:
+            permuted_offset_bases = [[basis[d] for d in dims] for basis in self.offset_bases]
+        permuted_block_bases = [[basis[d] for d in dims] for basis in self.block_bases]
         return padded_shared_layout_encoding(
             intervals=self.intervals,
             paddings=self.paddings,
@@ -177,9 +228,19 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=self.numCTAsPerCGA,
             numCTASplit=self.numCTASplit,
             numCTAOrder=self.numCTAOrder,
+            offset_bases=permuted_offset_bases,
+            block_bases=permuted_block_bases,
         )
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self.offset_bases is not None:
+            return builder.make_padded_shared_linear_encoding_attr(
+                self.intervals,
+                self.paddings,
+                self.offset_bases,
+                self.block_bases,
+                [int(s) for s in self.shape],
+            )
         return builder.make_padded_shared_encoding_attr(
             self.intervals,
             self.paddings,

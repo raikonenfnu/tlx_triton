@@ -909,7 +909,8 @@ def _layouts_match(actual, expected):
         return False
     if isinstance(actual, tlx.padded_shared_layout_encoding):
         return (actual.intervals == expected.intervals and actual.paddings == expected.paddings
-                and actual.order == expected.order and actual.shape == expected.shape)
+                and actual.order == expected.order and actual.shape == expected.shape
+                and actual.offset_bases == expected.offset_bases and actual.block_bases == expected.block_bases)
     if isinstance(actual, tlx.swizzled_shared_layout_encoding):
         return (actual.vectorSize == expected.vectorSize and actual.perPhase == expected.perPhase
                 and actual.maxPhase == expected.maxPhase and actual.order == expected.order)
