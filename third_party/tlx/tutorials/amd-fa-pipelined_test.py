@@ -448,7 +448,6 @@ def _attn_fwd_async_fav3(
     IS_CAUSAL: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     MASK_STEPS: tl.constexpr,
-    USE_GLUON_WP: tl.constexpr,
     USE_XCD_REMAP: tl.constexpr,
     XCD_PIDS_PER_XCD: tl.constexpr,
     XCD_TALL_XCDS: tl.constexpr,
@@ -527,48 +526,27 @@ def _attn_fwd_async_fav3(
                 future_start_n = (block_id + NUM_STAGES) * BLOCK_N
                 kn = start_n + offs_n
 
-                if USE_GLUON_WP:
-                    with tlx.warp_pipeline_stage("dot1", priority=0):
-                        qk = tl.dot(q, k_tile)
-                else:
+                with tlx.warp_pipeline_stage("dot1", priority=0):
                     qk = tl.dot(q, k_tile)
 
                 tlx.async_load_wait_group(2 * NUM_STAGES - 2)
 
-                if USE_GLUON_WP:
-                    with tlx.warp_pipeline_stage("mem1", priority=1):
-                        v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
-                        tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
-                        tlx.async_load_commit_group()
-                else:
+                with tlx.warp_pipeline_stage("mem1", priority=1):
                     v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
                     tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
                     tlx.async_load_commit_group()
 
-                if USE_GLUON_WP:
-                    with tlx.warp_pipeline_stage("dot2a", priority=0):
-                        acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                             BLOCK_N, False, False)
-                        p = p.to(v_tile.dtype)
-                else:
+                with tlx.warp_pipeline_stage("dot2a", priority=0):
                     acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
                                                          BLOCK_N, False, False)
                     p = p.to(v_tile.dtype)
 
-                if USE_GLUON_WP:
-                    with tlx.warp_pipeline_stage("dot2b", priority=0):
-                        acc = tl.dot(p, v_tile, acc)
-                else:
+                with tlx.warp_pipeline_stage("dot2b", priority=0):
                     acc = tl.dot(p, v_tile, acc)
 
                 tlx.async_load_wait_group(2 * NUM_STAGES - 2)
 
-                if USE_GLUON_WP:
-                    with tlx.warp_pipeline_stage("mem2", priority=1):
-                        k_tile = tlx.local_load(tlx.local_view(k_buf_fast, next_stage_idx), relaxed=True)
-                        tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf_fast, stage_idx))
-                        tlx.async_load_commit_group()
-                else:
+                with tlx.warp_pipeline_stage("mem2", priority=1):
                     k_tile = tlx.local_load(tlx.local_view(k_buf_fast, next_stage_idx), relaxed=True)
                     tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf_fast, stage_idx))
                     tlx.async_load_commit_group()
@@ -671,48 +649,27 @@ def _attn_fwd_async_fav3(
             future_start_n = (block_id + NUM_STAGES) * BLOCK_N
             kn = start_n + offs_n
 
-            if USE_GLUON_WP:
-                with tlx.warp_pipeline_stage("dot1", priority=0):
-                    qk = tl.dot(q, k_tile)
-            else:
+            with tlx.warp_pipeline_stage("dot1", priority=0):
                 qk = tl.dot(q, k_tile)
 
             tlx.async_load_wait_group(2 * NUM_STAGES - 2)
 
-            if USE_GLUON_WP:
-                with tlx.warp_pipeline_stage("mem1", priority=1):
-                    v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
-                    tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
-                    tlx.async_load_commit_group()
-            else:
+            with tlx.warp_pipeline_stage("mem1", priority=1):
                 v_tile = tlx.local_load(tlx.local_view(v_buf_fast, stage_idx), relaxed=True)
                 tlx.async_load(kt_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf_fast, stage_idx))
                 tlx.async_load_commit_group()
 
-            if USE_GLUON_WP:
-                with tlx.warp_pipeline_stage("dot2a", priority=0):
-                    acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
-                                                         BLOCK_N, False, False)
-                    p = p.to(v_tile.dtype)
-            else:
+            with tlx.warp_pipeline_stage("dot2a", priority=0):
                 acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
                                                      BLOCK_N, False, False)
                 p = p.to(v_tile.dtype)
 
-            if USE_GLUON_WP:
-                with tlx.warp_pipeline_stage("dot2b", priority=0):
-                    acc = tl.dot(p, v_tile, acc)
-            else:
+            with tlx.warp_pipeline_stage("dot2b", priority=0):
                 acc = tl.dot(p, v_tile, acc)
 
             tlx.async_load_wait_group(2 * NUM_STAGES - 2)
 
-            if USE_GLUON_WP:
-                with tlx.warp_pipeline_stage("mem2", priority=1):
-                    k_tile = tlx.local_load(tlx.local_view(k_buf_fast, next_stage_idx), relaxed=True)
-                    tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf_fast, stage_idx))
-                    tlx.async_load_commit_group()
-            else:
+            with tlx.warp_pipeline_stage("mem2", priority=1):
                 k_tile = tlx.local_load(tlx.local_view(k_buf_fast, next_stage_idx), relaxed=True)
                 tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf_fast, stage_idx))
                 tlx.async_load_commit_group()
@@ -934,7 +891,6 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     num_warps = kw.pop("num_warps", 8)
     waves_per_eu = kw.pop("waves_per_eu", 0)
     compiler_num_stages = kw.pop("num_stages", 3)
-    schedule_hint = kw.pop("schedule_hint", "gluon_wp")
     use_xcd_remap = kw.pop("xcd_remap", False)
     mask_steps = causal or (N_CTX % BLOCK_N != 0)
     xcd_pids_per_xcd = triton.cdiv(H, 8)
@@ -974,14 +930,12 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
         IS_CAUSAL=causal,
         NUM_STAGES=4,
         MASK_STEPS=mask_steps,
-        USE_GLUON_WP=schedule_hint == "gluon_wp",
         USE_XCD_REMAP=use_xcd_remap,
         XCD_PIDS_PER_XCD=xcd_pids_per_xcd,
         XCD_TALL_XCDS=xcd_tall_xcds,
         num_warps=num_warps,
         num_stages=compiler_num_stages,
         waves_per_eu=waves_per_eu,
-        schedule_hint=schedule_hint,
         **kw,
     )
     return o
@@ -1090,7 +1044,6 @@ def run_benchmark(args):
         kernel_kwargs = {}
         if kernel_name == "async_fav3":
             kernel_kwargs["xcd_remap"] = args.xcd_remap
-            kernel_kwargs["schedule_hint"] = args.schedule_hint
         for B in args.b:
             for H in args.hq:
                 for D in args.d:
@@ -1155,8 +1108,6 @@ def parse_args():
                    help="Kernel variants to benchmark")
     p.add_argument("--xcd-remap", action=argparse.BooleanOptionalAction, default=False,
                    help="Enable Gluon-style XCD head remap for async_fav3")
-    p.add_argument("--schedule-hint", type=str, default="gluon_wp", choices=["none", "gluon_wp"],
-                   help="async_fav3 warp-pipeline schedule hint")
     return p.parse_args()
 
 
