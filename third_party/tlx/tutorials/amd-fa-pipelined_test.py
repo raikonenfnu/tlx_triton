@@ -345,6 +345,146 @@ def _attn_fwd_async_prefetch(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
 
 
+@triton.jit
+def _attn_fwd_async_fav3(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    8-warp pipelined FA inspired by Gluon. Uses async DMA with single-buffer
+    prefetch-by-1 and loop unrolling for ILP.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+                mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 1)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+    n_main = tl.maximum(n_blocks - 1, 0)
+
+    # --- Prologue: load block 0 ---
+    tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < hi)
+    tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < hi)
+    tlx.async_load_commit_group([tok_k, tok_v])
+
+    wait_tok = tlx.async_load_wait_group(0)
+    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+
+    # --- Main loop ---
+    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+        next_off = block_id + BLOCK_N
+        kn = block_id + offs_n
+        next_mask = (next_off + offs_n[:, None]) < hi
+
+        # QK dot
+        qk = tl.dot(q, k_cur.T)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+        # Softmax pass 1: compute m_ij, p
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+
+        # Issue prefetch for next block (overlap with softmax pass 2 + PV)
+        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, 0), mask=next_mask)
+        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, 0), mask=next_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        # Softmax pass 2: rescale
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+        # PV accumulate
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+        # Wait for prefetch and load
+        wait_tok = tlx.async_load_wait_group(0)
+        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+
+    # --- Epilogue ---
+    kn_last = n_main * BLOCK_N + offs_n
+    qk = tl.dot(q, k_cur.T)
+    qk = tl.where(kn_last[None, :] < hi, qk, float("-inf"))
+    if IS_CAUSAL:
+        qk = tl.where(offs_m[:, None] >= kn_last[None, :], qk, float("-inf"))
+    m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+    p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+    l_ij = tl.sum(p, 1)
+    alpha = tl.math.exp2(m_i - m_ij)
+    acc = acc * alpha[:, None]
+    l_i = l_i * alpha + l_ij
+    m_i = m_ij
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Host wrapper
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,9 +584,57 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 # Kernel registry — add new kernel wrappers here
 # ═══════════════════════════════════════════════════════════════════════════
 
+def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
+    """Pipelined FA with async DMA, inspired by Gluon 8-warp pingpong."""
+    B, H, N_CTX, D = q.shape
+    o = torch.empty_like(q)
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 64)
+    NUM_STAGES = kw.pop("NUM_STAGES", 1)
+    num_warps = kw.pop("num_warps", 4)
+
+    grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
+    _attn_fwd_async_fav3[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        IS_CAUSAL=causal,
+        NUM_STAGES=NUM_STAGES,
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
 KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
+    "async_fav3": flash_attn_async_fav3,
 }
 
 
