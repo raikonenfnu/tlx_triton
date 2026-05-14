@@ -378,8 +378,13 @@ def _attn_fwd_async_fav3(
     NUM_STAGES: tl.constexpr,
 ):
     """
-    8-warp pipelined FA inspired by Gluon. Uses async DMA with single-buffer
-    prefetch-by-1 and loop unrolling for ILP.
+    Warp-pipelined FA kernel for CDNA4.
+
+    Ping-pong schedule with multi-stage async DMA:
+      dot1  (prio=0): QK^T MMA using pre-loaded K
+      mem1  (prio=1): LDS load V + issue future K DMA + softmax
+      dot2  (prio=0): PV MMA
+      mem2  (prio=1): issue future V DMA + LDS load K for next dot1
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -408,8 +413,8 @@ def _attn_fwd_async_fav3(
     else:
         hi = N_CTX
 
-    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
-    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 1)
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_STAGES)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_STAGES)
 
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
@@ -419,66 +424,84 @@ def _attn_fwd_async_fav3(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
-    n_main = tl.maximum(n_blocks - 1, 0)
 
-    # --- Prologue: load block 0 ---
-    tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < hi)
-    tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < hi)
-    tlx.async_load_commit_group([tok_k, tok_v])
+    # --- Prologue: issue async loads for first NUM_STAGES blocks ---
+    for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        start_n = i * BLOCK_N
+        mask = (start_n + offs_n[:, None]) < hi
+        tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, i), mask=mask)
+        tlx.async_load_commit_group([tok_k])
+        tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
+        tlx.async_load_commit_group([tok_v])
 
-    wait_tok = tlx.async_load_wait_group(0)
-    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
-    v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+    WAIT_INIT: tl.constexpr = 2 * NUM_STAGES - 1
+    WAIT_LOOP: tl.constexpr = 2 * NUM_STAGES - 2
 
-    # --- Main loop ---
-    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
-        next_off = block_id + BLOCK_N
-        kn = block_id + offs_n
-        next_mask = (next_off + offs_n[:, None]) < hi
+    # Wait for K of buffer 0 and load it
+    tlx.async_load_wait_group(WAIT_INIT)
+    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
 
-        # QK dot
+    main_end = tl.maximum(n_blocks - NUM_STAGES, 0)
+
+    # --- Main loop: QK dot + softmax + PV dot + prefetch next ---
+    for block_id in tl.range(0, main_end, num_stages=0):
+        stage = block_id % NUM_STAGES
+        start_n = block_id * BLOCK_N
+        future_n = (block_id + NUM_STAGES) * BLOCK_N
+
         qk = tl.dot(q, k_cur.T)
         if IS_CAUSAL:
+            kn = start_n + offs_n
             qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
-        # Softmax pass 1: compute m_ij, p
+        tlx.async_load_wait_group(WAIT_LOOP)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+
+        future_mask = (future_n + offs_n[:, None]) < hi
+        tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
+        tlx.async_load_commit_group([tok_k])
+
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
         p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-
-        # Issue prefetch for next block (overlap with softmax pass 2 + PV)
-        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, 0), mask=next_mask)
-        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, 0), mask=next_mask)
-        tlx.async_load_commit_group([tok_k, tok_v])
-
-        # Softmax pass 2: rescale
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-
-        # PV accumulate
         acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
-        # Wait for prefetch and load
-        wait_tok = tlx.async_load_wait_group(0)
-        k_cur = tlx.local_load(tlx.local_view(k_buf, 0), token=wait_tok, relaxed=True)
-        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+        tok_v = tlx.async_load(v_ptrs + future_n * stride_vn, tlx.local_view(v_buf, stage), mask=future_mask)
+        tlx.async_load_commit_group([tok_v])
+        tlx.async_load_wait_group(WAIT_LOOP)
+        next_stage = (block_id + 1) % NUM_STAGES
+        k_cur = tlx.local_load(tlx.local_view(k_buf, next_stage), relaxed=True)
 
-    # --- Epilogue ---
-    kn_last = n_main * BLOCK_N + offs_n
-    qk = tl.dot(q, k_cur.T)
-    qk = tl.where(kn_last[None, :] < hi, qk, float("-inf"))
-    if IS_CAUSAL:
-        qk = tl.where(offs_m[:, None] >= kn_last[None, :], qk, float("-inf"))
-    m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
-    p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
-    l_ij = tl.sum(p, 1)
-    alpha = tl.math.exp2(m_i - m_ij)
-    acc = acc * alpha[:, None]
-    l_i = l_i * alpha + l_ij
-    m_i = m_ij
-    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+    # --- Tail: drain remaining NUM_STAGES blocks ---
+    tlx.async_load_wait_group(0)
+    for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        block_id = main_end + tail_i
+        if block_id < n_blocks:
+            stage = block_id % NUM_STAGES
+            start_n = block_id * BLOCK_N
+            kn = start_n + offs_n
+
+            k_cur = tlx.local_load(tlx.local_view(k_buf, stage), relaxed=True)
+            v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+
+            qk = tl.dot(q, k_cur.T)
+            qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
+            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     acc = acc / l_i[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
@@ -585,14 +608,14 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
-    """Pipelined FA with async DMA, inspired by Gluon 8-warp pingpong."""
+    """Warp-pipelined FA with async DMA, inspired by Gluon 8-warp pingpong."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
-    NUM_STAGES = kw.pop("NUM_STAGES", 1)
-    num_warps = kw.pop("num_warps", 4)
+    NUM_STAGES = kw.pop("NUM_STAGES", 4)
+    num_warps = kw.pop("num_warps", 8)
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     _attn_fwd_async_fav3[grid](

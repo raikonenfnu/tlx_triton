@@ -198,6 +198,15 @@ public:
     // transposed view and load directly into dot_op encoding.
     Value kMemDesc = prevLoad.getSrc();
 
+    // Only apply when kMemDesc dominates the insertion point. For multi-buffer
+    // patterns the memdesc changes each iteration (dynamic local_view index)
+    // and the yielded memdesc won't dominate the loop body top.
+    if (!kMemDesc.getParentRegion()->isProperAncestor(transOp->getParentRegion()) &&
+        !(kMemDesc.getParentBlock() == transOp->getBlock() &&
+          kMemDesc.getDefiningOp() &&
+          kMemDesc.getDefiningOp()->isBeforeInBlock(transOp)))
+      return failure();
+
     rewriter.setInsertionPoint(transOp);
     auto transposedMD = ttg::MemDescTransOp::create(
         rewriter, transOp.getLoc(), kMemDesc, transOrder);
