@@ -329,19 +329,13 @@ def _attn_fwd_async_warp_pipe(
     NUM_STAGES: tl.constexpr,
 ):
     """
-    Warp-pipelined FA with 4-stage pingpong schedule.
+    Warp-pipelined FA with 2-stage schedule (matching GEMM pattern).
 
-    async_load_wait_group is placed BETWEEN stages (not inside) so the
-    WarpPipeliner treats it as an inter-cluster barrier, ensuring all
-    threads (both warp groups) see the wait + barrier.
-
-    Stages per iteration:
-      dot1  (prio=0): QK MMA
-      [wait V]
-      mem1  (prio=1): LDS load V + issue future K + softmax
-      dot2  (prio=0): PV MMA
-      [wait K]
-      mem2  (prio=1): issue future V + LDS load next K
+    Prologue pre-fills NUM_STAGES buffers, hot loop has two pipeline stages:
+      mfma (prio=0): QK dot + softmax + PV dot (all compute)
+      [wait for DMA]
+      mem  (prio=1): prefetch K+V for future tile, LDS load K+V for next iter
+    Epilogue drains last NUM_STAGES tiles with a simple for loop.
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -385,7 +379,7 @@ def _attn_fwd_async_warp_pipe(
 
     n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
 
-    # Prologue: issue async loads for first NUM_STAGES blocks
+    # Prologue: issue K+V DMA for first NUM_STAGES blocks
     for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
         start_n = i * BLOCK_N
         mask = (start_n + offs_n[:, None]) < hi
@@ -394,36 +388,24 @@ def _attn_fwd_async_warp_pipe(
         tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
         tlx.async_load_commit_group([tok_v])
 
-    WAIT_LOOP: tl.constexpr = 2 * NUM_STAGES - 2
+    # Wait for buffer 0 K+V and load into regs
+    tlx.async_load_wait_group((NUM_STAGES - 1) * 2)
+    k_tile = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
+    v_tile = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
 
-    # Wait for K of buffer 0 and load it
-    WAIT_K0: tl.constexpr = 2 * NUM_STAGES - 1
-    tlx.async_load_wait_group(WAIT_K0)
-    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
+    # Hot loop: 2-stage warp pipeline (mfma + mem), matching GEMM pattern.
+    for tile_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
+        prefetch_buf = tile_id % NUM_STAGES
+        next_buf = (tile_id + 1) % NUM_STAGES
+        start_n = tile_id * BLOCK_N
+        k_prefetch = start_n + NUM_STAGES * BLOCK_N
 
-    # Main loop with warp pipeline stages
-    for block_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
-        stage = block_id % NUM_STAGES
-        next_stage = (block_id + 1) % NUM_STAGES
-        start_n = block_id * BLOCK_N
-        future_n = start_n + NUM_STAGES * BLOCK_N
-
-        with tlx.warp_pipeline_stage("dot1", priority=0):
-            qk = tl.dot(q, k_cur.T)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            qk = tl.dot(q, k_tile.T)
             if IS_CAUSAL:
                 kn = start_n + offs_n
                 qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
-        tlx.async_load_wait_group(WAIT_LOOP)
-
-        with tlx.warp_pipeline_stage("mem1", priority=1):
-            v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
-
-            future_mask = (future_n + offs_n[:, None]) < hi
-            tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
-            tlx.async_load_commit_group([tok_k])
-
-        with tlx.warp_pipeline_stage("dot2a", priority=0):
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
             p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
             l_ij = tl.sum(p, 1)
@@ -431,21 +413,25 @@ def _attn_fwd_async_warp_pipe(
             acc = acc * alpha[:, None]
             l_i = l_i * alpha + l_ij
             m_i = m_ij
+            acc = tl.dot(p.to(v_tile.dtype), v_tile, acc)
 
-        with tlx.warp_pipeline_stage("dot2b", priority=0):
-            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+        tlx.async_load_wait_group(2)
 
-        tlx.async_load_wait_group(WAIT_LOOP)
-
-        with tlx.warp_pipeline_stage("mem2", priority=1):
-            tok_v = tlx.async_load(v_ptrs + future_n * stride_vn, tlx.local_view(v_buf, stage), mask=future_mask)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            prefetch_mask = (k_prefetch + offs_n[:, None]) < hi
+            tok_k = tlx.async_load(k_ptrs + k_prefetch * stride_kn, tlx.local_view(k_buf, prefetch_buf),
+                                   mask=prefetch_mask)
+            tlx.async_load_commit_group([tok_k])
+            tok_v = tlx.async_load(v_ptrs + k_prefetch * stride_vn, tlx.local_view(v_buf, prefetch_buf),
+                                   mask=prefetch_mask)
             tlx.async_load_commit_group([tok_v])
-            k_cur = tlx.local_load(tlx.local_view(k_buf, next_stage), relaxed=True)
+            k_tile = tlx.local_load(tlx.local_view(k_buf, next_buf), relaxed=True)
+            v_tile = tlx.local_load(tlx.local_view(v_buf, next_buf), relaxed=True)
 
-    # Tail
+    # Epilogue: drain the last NUM_STAGES tiles
     tail_start = tl.maximum(n_blocks - NUM_STAGES, 0)
     tlx.async_load_wait_group(0)
-    for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+    for tail_i in tl.range(0, NUM_STAGES):
         block_id = tail_start + tail_i
         if block_id < n_blocks:
             stage = block_id % NUM_STAGES
@@ -677,27 +663,37 @@ def _attn_fwd_async_fav3(
     Z,
     H,
     N_CTX,
+    GRID_MN,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    XCD_REMAP: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
     """
-    Warp-pipelined FA kernel for CDNA4.
+    Gluon-style pipelined FA for CDNA4 with software pipelining.
 
-    Ping-pong schedule with multi-stage async DMA:
-      dot1  (prio=0): QK^T MMA using pre-loaded K
-      mem1  (prio=1): LDS load V + issue future K DMA + softmax
-      dot2  (prio=0): PV MMA
-      mem2  (prio=1): issue future V DMA + LDS load K for next dot1
+    Supports two modes based on NUM_STAGES:
+      NUM_STAGES=1: Single-buffer with separate K/V commit groups.
+                    Compatible with schedule_hint for best instruction scheduling.
+      NUM_STAGES>1: Multi-buffer prologue/hot-loop/epilogue.
+                    Better DMA-compute overlap but incompatible with schedule_hint
+                    due to LLVM iota_range bug.
+
+    Pipeline within each tile:
+      issue K → issue V → wait K → QK dot → wait V → softmax → PV dot
     """
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
 
-    pid_m = tl.program_id(0)
-    pid_hz = tl.program_id(1)
+    pid = tl.program_id(0)
+    if XCD_REMAP:
+        pid = _remap_xcd(pid, GRID_MN)
+    NUM_M_BLOCKS = GRID_MN // (Z * H)
+    pid_hz = pid // NUM_M_BLOCKS
+    pid_m = pid % NUM_M_BLOCKS
     off_z = pid_hz // H
     off_h = pid_hz % H
 
@@ -723,79 +719,35 @@ def _attn_fwd_async_fav3(
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_STAGES)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_STAGES)
 
-    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
-    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+    k_base = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
-
-    # --- Prologue: issue async loads for first NUM_STAGES blocks ---
-    for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
-        start_n = i * BLOCK_N
-        mask = (start_n + offs_n[:, None]) < hi
-        tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, i), mask=mask)
-        tlx.async_load_commit_group([tok_k])
-        tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
-        tlx.async_load_commit_group([tok_v])
-
-    WAIT_LOOP: tl.constexpr = 2 * NUM_STAGES - 2
-
-    WAIT_K0: tl.constexpr = 2 * NUM_STAGES - 1
-    tlx.async_load_wait_group(WAIT_K0)
-    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
-
-    # --- Main loop: compute + prefetch with multi-stage buffering ---
-    for block_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
-        stage = block_id % NUM_STAGES
-        next_stage = (block_id + 1) % NUM_STAGES
-        start_n = block_id * BLOCK_N
-        future_n = start_n + NUM_STAGES * BLOCK_N
-
-        qk = tl.dot(q, k_cur.T)
-        if IS_CAUSAL:
+    if NUM_STAGES == 1:
+        # ── Single-buffer path: simple loop, schedule_hint-compatible ──
+        for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
             kn = start_n + offs_n
-            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+            mask = kn[:, None] < N_CTX
 
-        tlx.async_load_wait_group(WAIT_LOOP)
-        v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+            tok_k = tlx.async_load(k_base + start_n * stride_kn, tlx.local_view(k_buf, 0), mask=mask)
+            tlx.async_load_commit_group([tok_k])
+            tok_v = tlx.async_load(v_base + start_n * stride_vn, tlx.local_view(v_buf, 0), mask=mask)
+            tlx.async_load_commit_group([tok_v])
 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
-        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
-        l_ij = tl.sum(p, 1)
-        alpha = tl.math.exp2(m_i - m_ij)
-        acc = acc * alpha[:, None]
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
-
-        future_mask = (future_n + offs_n[:, None]) < hi
-        tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
-        tlx.async_load_commit_group([tok_k])
-        tok_v = tlx.async_load(v_ptrs + future_n * stride_vn, tlx.local_view(v_buf, stage), mask=future_mask)
-        tlx.async_load_commit_group([tok_v])
-        tlx.async_load_wait_group(WAIT_LOOP)
-        k_cur = tlx.local_load(tlx.local_view(k_buf, next_stage), relaxed=True)
-
-    # --- Tail: drain remaining NUM_STAGES blocks ---
-    tail_start = tl.maximum(n_blocks - NUM_STAGES, 0)
-    tlx.async_load_wait_group(0)
-    for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
-        block_id = tail_start + tail_i
-        if block_id < n_blocks:
-            stage = block_id % NUM_STAGES
-            start_n = block_id * BLOCK_N
-            kn = start_n + offs_n
-
-            k_cur = tlx.local_load(tlx.local_view(k_buf, stage), relaxed=True)
-            v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+            tlx.async_load_wait_group(1)
+            k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
 
             qk = tl.dot(q, k_cur.T)
-            qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
             if IS_CAUSAL:
                 qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+            if start_n + BLOCK_N > N_CTX:
+                qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+
+            tlx.async_load_wait_group(0)
+            v_cur = tlx.local_load(tlx.local_view(v_buf, 0), relaxed=True)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
             p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
@@ -804,8 +756,75 @@ def _attn_fwd_async_fav3(
             acc = acc * alpha[:, None]
             l_i = l_i * alpha + l_ij
             m_i = m_ij
-
             acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+    else:
+        # ── Multi-buffer path: prologue / hot-loop / epilogue ──
+        n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+
+        for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+            start_n = i * BLOCK_N
+            mask = (start_n + offs_n[:, None]) < hi
+            tok_k = tlx.async_load(k_base + start_n * stride_kn, tlx.local_view(k_buf, i), mask=mask)
+            tlx.async_load_commit_group([tok_k])
+            tok_v = tlx.async_load(v_base + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
+            tlx.async_load_commit_group([tok_v])
+
+        for tile_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
+            buf = tile_id % NUM_STAGES
+            start_n = tile_id * BLOCK_N
+            kn = start_n + offs_n
+
+            tlx.async_load_wait_group(2 * NUM_STAGES - 1)
+            k_cur = tlx.local_load(tlx.local_view(k_buf, buf), relaxed=True)
+
+            qk = tl.dot(q, k_cur.T)
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+            tlx.async_load_wait_group(2 * NUM_STAGES - 2)
+            v_cur = tlx.local_load(tlx.local_view(v_buf, buf), relaxed=True)
+
+            prefetch_n = (tile_id + NUM_STAGES) * BLOCK_N
+            prefetch_mask = (prefetch_n + offs_n[:, None]) < hi
+            tok_k = tlx.async_load(k_base + prefetch_n * stride_kn, tlx.local_view(k_buf, buf), mask=prefetch_mask)
+            tlx.async_load_commit_group([tok_k])
+            tok_v = tlx.async_load(v_base + prefetch_n * stride_vn, tlx.local_view(v_buf, buf), mask=prefetch_mask)
+            tlx.async_load_commit_group([tok_v])
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+        tail_start = tl.maximum(n_blocks - NUM_STAGES, 0)
+        tlx.async_load_wait_group(0)
+        for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+            block_id = tail_start + tail_i
+            if block_id < n_blocks:
+                buf = block_id % NUM_STAGES
+                start_n = block_id * BLOCK_N
+                kn = start_n + offs_n
+
+                k_cur = tlx.local_load(tlx.local_view(k_buf, buf), relaxed=True)
+                v_cur = tlx.local_load(tlx.local_view(v_buf, buf), relaxed=True)
+
+                qk = tl.dot(q, k_cur.T)
+                qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
+                if IS_CAUSAL:
+                    qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+                m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+                p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+                l_ij = tl.sum(p, 1)
+                alpha = tl.math.exp2(m_i - m_ij)
+                acc = acc * alpha[:, None]
+                l_i = l_i * alpha + l_ij
+                m_i = m_ij
+                acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
     acc = acc / l_i[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
@@ -912,48 +931,35 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
-    """Multi-stage pipelined FA with async DMA (NUM_STAGES >= 2)."""
+    """Gluon-style pipelined FA with split K/V commit groups, XCD remap, schedule hint."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
-    NUM_STAGES = kw.pop("NUM_STAGES", 4)
-    num_warps = kw.pop("num_warps", 4)
-    assert NUM_STAGES >= 2, "async_fav3 requires NUM_STAGES >= 2; use async_prefetch for single-stage"
+    NUM_STAGES = kw.pop("NUM_STAGES", 1)
+    num_warps = kw.pop("num_warps", 8)
+    xcd_remap = kw.pop("xcd_remap", True)
+    waves_per_eu = kw.pop("waves_per_eu", 2)
+    # schedule_hint='memory-bound-attention' triggers LLVM iota_range crash
+    # with multi-buffer prologue/epilogue loops, so only use for single-buffer.
+    default_hint = "memory-bound-attention" if NUM_STAGES == 1 else None
+    schedule_hint = kw.pop("schedule_hint", default_hint)
 
-    grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    GRID_MN = num_m_blocks * B * H
+    grid = (GRID_MN,)
     _attn_fwd_async_fav3[grid](
-        q,
-        k,
-        v,
-        o,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        B,
-        H,
-        N_CTX,
-        sm_scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        HEAD_DIM=D,
-        IS_CAUSAL=causal,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=num_warps,
+        q, k, v, o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        B, H, N_CTX, GRID_MN, sm_scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
+        IS_CAUSAL=causal, XCD_REMAP=xcd_remap, NUM_STAGES=NUM_STAGES,
+        num_warps=num_warps, waves_per_eu=waves_per_eu,
+        schedule_hint=schedule_hint,
         **kw,
     )
     return o
@@ -989,17 +995,16 @@ def flash_attn_async_split_kv(q, k, v, sm_scale, causal=False, **kw):
 
 
 def flash_attn_async_warp_pipe(q, k, v, sm_scale, causal=False, **kw):
-    """Warp-pipelined FA with 4-stage pingpong schedule."""
+    """Warp-pipelined FA with single-loop warp pipeline."""
     B, H, N_CTX, D = q.shape
     o = torch.empty_like(q)
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
-    NUM_STAGES = kw.pop("NUM_STAGES", 4)
+    NUM_STAGES = kw.pop("NUM_STAGES", 2)
     num_warps = kw.pop("num_warps", 8)
     xcd_remap = kw.pop("xcd_remap", True)
     schedule_hint = kw.pop("schedule_hint", "memory-bound-attention")
-    assert NUM_STAGES >= 2, "warp_pipe requires NUM_STAGES >= 2"
 
     num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
     GRID_MN = num_m_blocks * B * H
