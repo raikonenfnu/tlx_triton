@@ -104,6 +104,10 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   auto ttDotOp = cast<tt::DotOpInterface>(dotOp);
   bool isHeadDot = isChainDotHead(ttDotOp);
   bool isTailDot = isChainDotTail(ttDotOp);
+  LDBG("planWarps: shape=[" << shape[0] << "," << shape[1]
+       << "], numWarps=" << numWarps << ", instrShape=["
+       << instrShape.first << "," << instrShape.second
+       << "], isHeadDot=" << isHeadDot << ", isTailDot=" << isTailDot);
   // For the 1st dot in chain-dot, we always set warpsPerCTA={numWarps, 1}
   // because this eliminates
   // 1) inter-warp reduction in the softmax step.
@@ -126,6 +130,7 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
         static_cast<int64_t>(numWarps),
         static_cast<int64_t>(llvm::divideCeil(shape[0], instrShape.first))));
     ret[1] = numWarps / ret[0];
+    LDBG("  tailDot -> warpsPerCTA=[" << ret[0] << "," << ret[1] << "]");
     return ret;
   }
 

@@ -166,82 +166,36 @@ public:
       return success();
     }
 
-    // Case 2: scf.for block arg -> tt.trans -> convert_layout
-    // The block arg comes from a prefetch loop where the yielded value is
-    // a local_load from the same K memdesc. Instead of loading K into a
-    // blocked tensor, transposing, then converting to dot_op, we load
-    // directly from a transposed memdesc view into dot_op encoding.
-    //
-    // We replace the trans->convert chain inside the loop body with a
-    // fresh transposed local_load from the K memdesc. The loop-carried
-    // block arg and the epilogue trans->convert are left alone (DCE +
-    // the greedy pattern driver will handle them or they run only once).
-    auto blockArg = dyn_cast<BlockArgument>(transSrc);
-    if (!blockArg)
-      return failure();
-    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    if (!forOp)
-      return failure();
+    // Case 2/3: The trans source is either an scf.for block arg (in-loop)
+    // or an scf.for result (epilogue). In both cases, trace back to the
+    // yielded local_load to find the K memdesc.
+    scf::ForOp forOp;
+    unsigned argIdx = 0;
 
-    // Find the corresponding yield value — must be a local_load so we
-    // can identify the K memdesc and the sync token.
-    unsigned argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+    if (auto blockArg = dyn_cast<BlockArgument>(transSrc)) {
+      // Case 2: block arg inside the loop body
+      forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+      if (!forOp)
+        return failure();
+      argIdx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+    } else if (auto forResult = dyn_cast<OpResult>(transSrc)) {
+      // Case 3: scf.for result (epilogue path)
+      forOp = dyn_cast<scf::ForOp>(forResult.getOwner());
+      if (!forOp)
+        return failure();
+      argIdx = forResult.getResultNumber();
+    } else {
+      return failure();
+    }
+
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     Value yieldedVal = yieldOp.getOperand(argIdx);
     auto prevLoad = yieldedVal.getDefiningOp<ttg::LocalLoadOp>();
     if (!prevLoad)
       return failure();
 
-    // Find the PREVIOUS iteration's local_load — the one whose result
-    // becomes the block arg via the init value. We need its memdesc and
-    // token to know which buffer and wait to use.
-    // In the prefetch pattern:
-    //   prologue: k_cur = local_load(k_memdesc, wait_tok)
-    //   loop body: uses k_cur (block arg), then prefetches next K,
-    //              then k_next = local_load(k_memdesc, next_wait_tok)
-    //              yield k_next
-    // The trans(block_arg) uses K from the PREVIOUS iteration. The
-    // correct memdesc is the same one the previous iteration loaded
-    // from. Since the prefetch single-buffers K, the memdesc is the
-    // same. The correct token is the one from the previous iteration's
-    // async_wait, which is carried via the block arg's type system.
-    //
-    // But in practice, the block arg's K data was loaded by the INIT
-    // local_load (first iter) or the YIELDED local_load (subsequent).
-    // For the in-loop access, the data is already in the block arg.
-    // We just need to re-read from the memdesc with the right token.
-    //
-    // The PREVIOUS iteration's data is in the block arg. To re-read it
-    // from shared memory, we need the memdesc and token from that
-    // same iteration. The block arg was populated by:
-    //   - iter 0: the init load (with its own memdesc+token)
-    //   - iter i>0: the yielded load from iter i-1
-    //
-    // Since both use the same memdesc (single-buffered K), and the
-    // block arg already has the correct data, we can re-read from
-    // the memdesc using the INIT load's token for iter 0 and the
-    // yielded load's token for iter i>0.
-    //
-    // HOWEVER: this is problematic because the memdesc may have been
-    // overwritten by the current iteration's prefetch BEFORE this
-    // trans->convert chain runs. We need to be careful about ordering.
-    //
-    // Actually — looking at the prefetch pattern structure:
-    //   QK dot using k_cur (block arg) <- uses PREVIOUS iteration's K
-    //   buffer_load_to_local for NEXT iteration's K
-    //   async_wait
-    //   k_next = local_load(memdesc) <- reads NEXT iteration's K
-    //   yield k_next
-    //
-    // The trans(block_arg) happens BEFORE the buffer_load_to_local.
-    // At this point, the memdesc still contains the PREVIOUS K. So we
-    // CAN safely read from it with a transposed local_load!
-    //
-    // Use the init load's token for correctness — the data was synced
-    // by that wait (or the previous iteration's yield-load's wait).
-    // The memdesc still contains the current iteration's K data
-    // (the prefetch for the NEXT iteration hasn't happened yet).
-    // Re-read from shared memory using a transposed view.
+    // The yielded local_load tells us which memdesc holds K. Create a
+    // transposed view and load directly into dot_op encoding.
     Value kMemDesc = prevLoad.getSrc();
 
     rewriter.setInsertionPoint(transOp);

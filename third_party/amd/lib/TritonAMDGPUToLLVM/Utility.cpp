@@ -5,6 +5,7 @@
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -767,16 +768,47 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
 }
 
 bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
+  auto enclosingLoop = dotOp->getParentOfType<scf::ForOp>();
+  auto isInSameLoop = [&](Operation *op) {
+    if (!enclosingLoop)
+      return op->getParentRegion() == dotOp->getParentRegion();
+    return enclosingLoop->isAncestor(op);
   };
   ForwardSliceOptions fwdOpt;
-  fwdOpt.filter = isInSameRegion;
+  fwdOpt.filter = isInSameLoop;
+  fwdOpt.inclusive = true;
   SetVector<mlir::Operation *> fwdSlices;
   getForwardSlice(dotOp, &fwdSlices, fwdOpt);
+
+  // Expand through scf.if: if a value flows into scf.yield inside an
+  // scf.if body, the scf.if result carries it forward. getForwardSlice
+  // doesn't cross this boundary, so we manually add the scf.if op and
+  // continue the forward slice from its results.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 0; i < static_cast<int>(fwdSlices.size()); ++i) {
+      auto yieldOp = dyn_cast<scf::YieldOp>(fwdSlices[i]);
+      if (!yieldOp)
+        continue;
+      auto parentOp = yieldOp->getParentOp();
+      if (!isa<scf::IfOp>(parentOp))
+        continue;
+      if (fwdSlices.insert(parentOp))
+        changed = true;
+      SetVector<mlir::Operation *> extra;
+      getForwardSlice(parentOp, &extra, fwdOpt);
+      for (auto *op : extra) {
+        if (fwdSlices.insert(op))
+          changed = true;
+      }
+    }
+  }
+
   for (Operation *op : fwdSlices) {
     if (auto dOp = dyn_cast<tt::DotOpInterface>(op)) {
-      assert(dOp != dotOp);
+      if (dOp == dotOp)
+        continue;
       Operation *dotOperand = (opIdx == 0) ? dOp.getA().getDefiningOp()
                                            : dOp.getB().getDefiningOp();
       if (dotOperand && fwdSlices.contains(dotOperand)) {
@@ -788,17 +820,51 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
 }
 
 bool isChainDotTail(tt::DotOpInterface dotOp) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
+  auto enclosingLoop = dotOp->getParentOfType<scf::ForOp>();
+  auto isInSameLoop = [&](Operation *op) {
+    if (!enclosingLoop)
+      return op->getParentRegion() == dotOp->getParentRegion();
+    return enclosingLoop->isAncestor(op);
   };
   BackwardSliceOptions bwdOpt;
   bwdOpt.omitBlockArguments = true;
-  bwdOpt.filter = isInSameRegion;
+  bwdOpt.filter = isInSameLoop;
+  bwdOpt.inclusive = true;
   SetVector<Operation *> bwdSlices;
   Operation *opA = dotOp.getA().getDefiningOp();
   if (!opA)
     return false;
   (void)getBackwardSlice(opA, &bwdSlices, bwdOpt);
+
+  // getBackwardSlice doesn't enter scf.if/scf.index_switch bodies
+  // (it only follows operands, not region yield values). Expand the
+  // slice through structured control-flow yield operands so that
+  // chain-dots separated by scf.if (e.g. causal masking) are detected.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 0; i < static_cast<int>(bwdSlices.size()); ++i) {
+      auto ifOp = dyn_cast<scf::IfOp>(bwdSlices[i]);
+      if (!ifOp)
+        continue;
+      for (auto &region : ifOp->getRegions()) {
+        if (region.empty())
+          continue;
+        auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+        for (Value operand : yield->getOperands()) {
+          if (auto *defOp = operand.getDefiningOp()) {
+            SetVector<Operation *> extra;
+            (void)getBackwardSlice(defOp, &extra, bwdOpt);
+            for (auto *op : extra) {
+              if (bwdSlices.insert(op))
+                changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
   if (llvm::find_if(bwdSlices, [](Operation *op) {
         return isa<tt::DotOpInterface>(op);
       }) != bwdSlices.end())
