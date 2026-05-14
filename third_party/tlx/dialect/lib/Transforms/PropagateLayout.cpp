@@ -1,7 +1,9 @@
 #include "IR/Dialect.h"
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
@@ -25,6 +27,7 @@ using namespace mlir::dataflow;
 namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace amdgpu = ::mlir::triton::amdgpu;
 
 namespace mlir {
 namespace triton {
@@ -32,6 +35,16 @@ namespace tlx {
 
 #define GEN_PASS_DEF_TLXPROPAGATELAYOUT
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
+
+static Value convertTensorEncoding(PatternRewriter &rewriter, Location loc,
+                                   Value operand, Attribute encoding) {
+  auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+  if (!operandType || operandType.getEncoding() == encoding)
+    return operand;
+  auto newType = RankedTensorType::get(operandType.getShape(),
+                                       operandType.getElementType(), encoding);
+  return ttg::ConvertLayoutOp::create(rewriter, loc, newType, operand);
+}
 
 class RequireLayoutPattern : public mlir::OpRewritePattern<RequireLayoutOp> {
 public:
@@ -65,6 +78,154 @@ public:
     }
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+    return success();
+  }
+};
+
+class FoldLoadConvertLayout
+    : public mlir::OpRewritePattern<ttg::ConvertLayoutOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::ConvertLayoutOp convertOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(convertOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return failure();
+
+    Attribute encoding = resultType.getEncoding();
+    Location loc = convertOp.getLoc();
+    Value src = convertOp.getSrc();
+    if (auto loadOp = src.getDefiningOp<amdgpu::BufferLoadOp>()) {
+      Value offsets =
+          convertTensorEncoding(rewriter, loc, loadOp.getOffsets(), encoding);
+      Value mask = loadOp.getMask()
+                       ? convertTensorEncoding(rewriter, loc, loadOp.getMask(),
+                                               encoding)
+                       : Value();
+      Value other =
+          loadOp.getOther()
+              ? convertTensorEncoding(rewriter, loc, loadOp.getOther(),
+                                      encoding)
+              : Value();
+      rewriter.replaceOpWithNewOp<amdgpu::BufferLoadOp>(
+          convertOp, resultType, loadOp.getPtr(), offsets, loadOp.getStride(),
+          loadOp.getCache(), mask, other, loadOp.getContiguity());
+      return success();
+    }
+
+    return failure();
+  }
+};
+
+static Value convertTensorToType(PatternRewriter &rewriter, Location loc,
+                                 Value operand, RankedTensorType type) {
+  if (operand.getType() == type)
+    return operand;
+  return ttg::ConvertLayoutOp::create(rewriter, loc, type, operand);
+}
+
+static bool isFoldableIndexLayoutProducer(Operation *op) {
+  return isa<arith::AddIOp, arith::MulIOp, arith::CmpIOp, arith::AndIOp,
+             arith::OrIOp, tt::BroadcastOp, tt::ExpandDimsOp, tt::SplatOp,
+             tt::MakeRangeOp>(op);
+}
+
+static bool isSupportedIndexTargetEncoding(Attribute encoding) {
+  if (isSupportedDotConstraintEncoding(encoding))
+    return true;
+  if (auto sliceEncoding = dyn_cast<ttg::SliceEncodingAttr>(encoding))
+    return isSupportedDotConstraintEncoding(sliceEncoding.getParent());
+  return false;
+}
+
+class FoldIndexConvertLayout
+    : public mlir::OpRewritePattern<ttg::ConvertLayoutOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::ConvertLayoutOp convertOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(convertOp.getType());
+    if (!resultType ||
+        !isSupportedIndexTargetEncoding(resultType.getEncoding()))
+      return failure();
+    Type elementType = resultType.getElementType();
+    if (!elementType.isInteger(1) && !elementType.isInteger(32))
+      return failure();
+
+    Operation *producer = convertOp.getSrc().getDefiningOp();
+    if (!producer || producer->getNumResults() != 1 ||
+        !isFoldableIndexLayoutProducer(producer))
+      return failure();
+
+    Location loc = convertOp.getLoc();
+    Attribute resultEncoding = resultType.getEncoding();
+    SmallVector<Value> operands;
+    operands.reserve(producer->getNumOperands());
+    for (OpOperand &operand : producer->getOpOperands()) {
+      Value operandValue = operand.get();
+      auto operandType = dyn_cast<RankedTensorType>(operandValue.getType());
+      if (!operandType) {
+        operands.push_back(operandValue);
+        continue;
+      }
+
+      Attribute operandEncoding = resultEncoding;
+      if (auto expandDimsOp = dyn_cast<tt::ExpandDimsOp>(producer)) {
+        if (operand.getOperandNumber() == 0)
+          operandEncoding = ttg::SliceEncodingAttr::get(
+              getContext(), expandDimsOp.getAxis(),
+              cast<ttg::DistributedEncodingTrait>(resultEncoding));
+      }
+
+      auto newOperandType =
+          RankedTensorType::get(operandType.getShape(),
+                                operandType.getElementType(), operandEncoding);
+      operands.push_back(
+          convertTensorToType(rewriter, loc, operandValue, newOperandType));
+    }
+
+    OperationState state(loc, producer->getName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttributes(producer->getAttrs());
+    Operation *newOp = rewriter.create(state);
+    rewriter.replaceOp(convertOp, newOp->getResult(0));
+    return success();
+  }
+};
+
+class FoldTransposedLocalLoadConvertLayout
+    : public mlir::OpRewritePattern<ttg::ConvertLayoutOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::ConvertLayoutOp convertOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(convertOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return failure();
+
+    auto transOp = convertOp.getSrc().getDefiningOp<tt::TransOp>();
+    if (!transOp)
+      return failure();
+    auto localLoadOp = transOp.getSrc().getDefiningOp<ttg::LocalLoadOp>();
+    if (!localLoadOp)
+      return failure();
+
+    auto transposedSrc = ttg::MemDescTransOp::create(
+        rewriter, transOp.getLoc(), localLoadOp.getSrc(), transOp.getOrder());
+    auto newLoad = ttg::LocalLoadOp::create(
+        rewriter, convertOp.getLoc(), resultType, transposedSrc,
+        localLoadOp.getToken());
+    newLoad->setAttrs(localLoadOp->getAttrs());
+    rewriter.replaceOp(convertOp, newLoad.getResult());
     return success();
   }
 };
@@ -503,6 +664,9 @@ public:
     RewritePatternSet patterns(context);
     patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
+    patterns.add<FoldLoadConvertLayout>(context);
+    patterns.add<FoldIndexConvertLayout>(context);
+    patterns.add<FoldTransposedLocalLoadConvertLayout>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
 

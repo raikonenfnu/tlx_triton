@@ -30,6 +30,9 @@ public:
     auto loc = op.getLoc();
     MemDescType srcTy = op.getSrc().getType();
     RankedTensorType dstTy = op.getType();
+    if (!isa<triton::gpu::DotOperandEncodingAttr,
+             triton::gpu::LinearEncodingAttr>(dstTy.getEncoding()))
+      return failure();
 
     // Partitioned tensors have multiple bases; fall back to generic lowering.
     if (isa<triton::gpu::PartitionedSharedEncodingAttr>(srcTy.getEncoding())) {

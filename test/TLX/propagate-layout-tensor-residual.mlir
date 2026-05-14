@@ -173,3 +173,56 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %result#2 : tensor<32x32xf32, #mma_wmma>
   }
 }
+
+// -----
+// Test that a late dot-operand convert after an AMD buffer_load is folded into
+// the load itself, including the simple index/mask producer chain.
+
+#blocked_buffer_load = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_buffer_load = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @fold_buffer_load_convert_to_dot
+  tt.func public @fold_buffer_load_convert_to_dot(%ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %base: i32, %limit: i32) -> tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_buffer_load, kWidth = 8}>> {
+    %range = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked_buffer_load}>>
+    %cols = tt.expand_dims %range {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked_buffer_load}>> -> tensor<1x16xi32, #blocked_buffer_load>
+    %offs_base = tt.broadcast %cols : tensor<1x16xi32, #blocked_buffer_load> -> tensor<16x16xi32, #blocked_buffer_load>
+    %base_splat = tt.splat %base : i32 -> tensor<16x16xi32, #blocked_buffer_load>
+    %offs = arith.addi %offs_base, %base_splat : tensor<16x16xi32, #blocked_buffer_load>
+    %limit_splat = tt.splat %limit : i32 -> tensor<16x16xi32, #blocked_buffer_load>
+    %mask = arith.cmpi slt, %offs, %limit_splat : tensor<16x16xi32, #blocked_buffer_load>
+    %load = amdg.buffer_load %ptr[%offs], %mask : tensor<16x16xf16, #blocked_buffer_load>
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: %[[LOAD:.*]] = amdg.buffer_load %{{.*}}[%{{.*}}], %{{.*}} : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
+    %dot = ttg.convert_layout %load : tensor<16x16xf16, #blocked_buffer_load> -> tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_buffer_load, kWidth = 8}>>
+    // CHECK: tt.return %[[LOAD]]
+    tt.return %dot : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_buffer_load, kWidth = 8}>>
+  }
+}
+
+// -----
+// Test the flash-attention K path shape: a local_load is transposed before
+// conversion to a dot operand. The pass should load from a transposed memdesc
+// directly instead of leaving a tensor transpose and layout conversion.
+
+#blocked_local_trans_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked_local_trans_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+#mma_local_trans = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared_local_trans = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_local_trans = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @fold_transposed_local_load_convert_to_dot
+  tt.func public @fold_transposed_local_load_convert_to_dot(%src: !ttg.memdesc<64x128xf16, #shared_local_trans, #smem_local_trans, mutable>) -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_local_trans, kWidth = 8}>> {
+    %token = amdg.async_wait {num_inst = 1 : i32}
+    %load = ttg.local_load %src token %token : !ttg.memdesc<64x128xf16, #shared_local_trans, #smem_local_trans, mutable> -> tensor<64x128xf16, #blocked_local_trans_src>
+    %trans = tt.trans %load {order = array<i32: 1, 0>} : tensor<64x128xf16, #blocked_local_trans_src> -> tensor<128x64xf16, #blocked_local_trans_dst>
+    // CHECK: %[[TRANS_DESC:.*]] = ttg.memdesc_trans %{{.*}} {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #{{.*}}, #smem, mutable> -> !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable>
+    // CHECK-NEXT: %[[LOAD:.*]] = ttg.local_load %[[TRANS_DESC]] token %{{.*}} : !ttg.memdesc<128x64xf16, #{{.*}}, #smem, mutable> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>
+    // CHECK-NOT: tt.trans
+    // CHECK-NOT: ttg.convert_layout
+    %dot = ttg.convert_layout %trans : tensor<128x64xf16, #blocked_local_trans_dst> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_local_trans, kWidth = 8}>>
+    // CHECK: tt.return %[[LOAD]]
+    tt.return %dot : tensor<128x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_local_trans, kWidth = 8}>>
+  }
+}
