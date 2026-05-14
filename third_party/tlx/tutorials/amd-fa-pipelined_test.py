@@ -427,7 +427,6 @@ def _attn_fwd_async_fav3(
 
     q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
                 other=0.0)
-
     QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
 
     if IS_CAUSAL:
@@ -451,7 +450,8 @@ def _attn_fwd_async_fav3(
         for stage in tl.range(0, NUM_STAGES - 1, loop_unroll_factor=NUM_STAGES - 1):
             start_n = stage * BLOCK_N
             if MASK_STEPS:
-                mask = (start_n + offs_n[:, None]) < N_CTX
+                mask_n = (start_n + offs_n) < N_CTX
+                mask = mask_n[:, None]
                 tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, stage), mask=mask)
                 tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, stage), mask=mask)
             else:
@@ -460,13 +460,13 @@ def _attn_fwd_async_fav3(
             tlx.async_load_commit_group([tok_k, tok_v])
 
         for block_id in tl.range(NUM_STAGES - 1, n_blocks):
+            tlx.async_load_wait_group(NUM_STAGES - 2)
+
             consumer = (block_id - (NUM_STAGES - 1)) % NUM_STAGES
             producer = block_id % NUM_STAGES
             start_n = (block_id - (NUM_STAGES - 1)) * BLOCK_N
             future_start_n = block_id * BLOCK_N
             kn = start_n + offs_n
-
-            tlx.async_load_wait_group(NUM_STAGES - 2)
 
             with tlx.warp_pipeline_stage("lds_k", priority=1):
                 k_tile = tlx.local_load(tlx.local_view(k_buf, consumer), relaxed=True)
@@ -477,7 +477,8 @@ def _attn_fwd_async_fav3(
             with tlx.warp_pipeline_stage("mem", priority=1):
                 v_tile = tlx.local_load(tlx.local_view(v_buf, consumer), relaxed=True)
                 if MASK_STEPS:
-                    mask = (future_start_n + offs_n[:, None]) < N_CTX
+                    mask_n = (future_start_n + offs_n) < N_CTX
+                    mask = mask_n[:, None]
                     tok_k = tlx.async_load(k_ptrs + future_start_n * stride_kn, tlx.local_view(k_buf, producer),
                                            mask=mask)
                     tok_v = tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf, producer),
@@ -487,10 +488,13 @@ def _attn_fwd_async_fav3(
                     tok_v = tlx.async_load(v_ptrs + future_start_n * stride_vn, tlx.local_view(v_buf, producer))
                 tlx.async_load_commit_group([tok_k, tok_v])
 
-            with tlx.warp_pipeline_stage("dot2", priority=0):
+            with tlx.warp_pipeline_stage("dot2a", priority=0):
                 acc, l_i, m_i, p = _fa_apply_softmax(acc, l_i, m_i, qk, offs_m, kn, N_CTX, QK_SCALE, BLOCK_M,
                                                      BLOCK_N, IS_CAUSAL, MASK_STEPS)
-                acc = tl.dot(p.to(v_tile.dtype), v_tile, acc)
+                p = p.to(v_tile.dtype)
+
+            with tlx.warp_pipeline_stage("dot2b", priority=0):
+                acc = tl.dot(p, v_tile, acc)
 
         for tail_i in tl.static_range(0, NUM_STAGES - 1):
             stage_idx = (n_blocks - (NUM_STAGES - 1) + tail_i) % NUM_STAGES
@@ -509,7 +513,8 @@ def _attn_fwd_async_fav3(
             start_n = block_id * BLOCK_N
             kn = start_n + offs_n
             if MASK_STEPS:
-                mask = (start_n + offs_n[:, None]) < N_CTX
+                mask_n = (start_n + offs_n) < N_CTX
+                mask = mask_n[:, None]
                 tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, 0), mask=mask)
                 tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, 0), mask=mask)
             else:
@@ -524,7 +529,8 @@ def _attn_fwd_async_fav3(
                                                  BLOCK_N, IS_CAUSAL, MASK_STEPS)
             acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
 
-    acc = acc / l_i[:, None]
+    l_recip = 1.0 / l_i
+    acc = acc * l_recip[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
 
@@ -630,7 +636,8 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     o = torch.empty_like(q)
 
     BLOCK_M = kw.pop("BLOCK_M", 256)
-    BLOCK_N = kw.pop("BLOCK_N", 64)
+    default_block_n = 32 if D == 128 and N_CTX <= 1024 else 64
+    BLOCK_N = kw.pop("BLOCK_N", default_block_n)
     num_warps = kw.pop("num_warps", 8)
     waves_per_eu = kw.pop("waves_per_eu", 1)
     compiler_num_stages = kw.pop("num_stages", 1)
