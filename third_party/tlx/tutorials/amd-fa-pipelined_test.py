@@ -643,6 +643,7 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     num_warps = kw.pop("num_warps", 8)
     waves_per_eu = kw.pop("waves_per_eu", 0)
     compiler_num_stages = kw.pop("num_stages", 3)
+    schedule_hint = kw.pop("schedule_hint", "none")
     mask_steps = causal or (N_CTX % BLOCK_N != 0)
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
@@ -680,6 +681,7 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
         num_warps=num_warps,
         num_stages=compiler_num_stages,
         waves_per_eu=waves_per_eu,
+        schedule_hint=schedule_hint,
         **kw,
     )
     return o
