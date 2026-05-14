@@ -295,6 +295,186 @@ def _attn_fwd_async_split_kv(
 
 
 @triton.jit
+def _attn_fwd_async_warp_pipe(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    GRID_MN,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    XCD_REMAP: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Warp-pipelined FA with 4-stage pingpong schedule.
+
+    async_load_wait_group is placed BETWEEN stages (not inside) so the
+    WarpPipeliner treats it as an inter-cluster barrier, ensuring all
+    threads (both warp groups) see the wait + barrier.
+
+    Stages per iteration:
+      dot1  (prio=0): QK MMA
+      [wait V]
+      mem1  (prio=1): LDS load V + issue future K + softmax
+      dot2  (prio=0): PV MMA
+      [wait K]
+      mem2  (prio=1): issue future V + LDS load next K
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    if XCD_REMAP:
+        pid = _remap_xcd(pid, GRID_MN)
+    NUM_M_BLOCKS = GRID_MN // (Z * H)
+    pid_hz = pid // NUM_M_BLOCKS
+    pid_m = pid % NUM_M_BLOCKS
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_STAGES)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_STAGES)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+
+    # Prologue: issue async loads for first NUM_STAGES blocks
+    for i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        start_n = i * BLOCK_N
+        mask = (start_n + offs_n[:, None]) < hi
+        tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, i), mask=mask)
+        tlx.async_load_commit_group([tok_k])
+        tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, i), mask=mask)
+        tlx.async_load_commit_group([tok_v])
+
+    WAIT_LOOP: tl.constexpr = 2 * NUM_STAGES - 2
+
+    # Wait for K of buffer 0 and load it
+    WAIT_K0: tl.constexpr = 2 * NUM_STAGES - 1
+    tlx.async_load_wait_group(WAIT_K0)
+    k_cur = tlx.local_load(tlx.local_view(k_buf, 0), relaxed=True)
+
+    # Main loop with warp pipeline stages
+    for block_id in tl.range(0, n_blocks - NUM_STAGES, num_stages=0):
+        stage = block_id % NUM_STAGES
+        next_stage = (block_id + 1) % NUM_STAGES
+        start_n = block_id * BLOCK_N
+        future_n = start_n + NUM_STAGES * BLOCK_N
+
+        with tlx.warp_pipeline_stage("dot1", priority=0):
+            qk = tl.dot(q, k_cur.T)
+            if IS_CAUSAL:
+                kn = start_n + offs_n
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+        tlx.async_load_wait_group(WAIT_LOOP)
+
+        with tlx.warp_pipeline_stage("mem1", priority=1):
+            v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+
+            future_mask = (future_n + offs_n[:, None]) < hi
+            tok_k = tlx.async_load(k_ptrs + future_n * stride_kn, tlx.local_view(k_buf, stage), mask=future_mask)
+            tlx.async_load_commit_group([tok_k])
+
+        with tlx.warp_pipeline_stage("dot2a", priority=0):
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
+        with tlx.warp_pipeline_stage("dot2b", priority=0):
+            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+        tlx.async_load_wait_group(WAIT_LOOP)
+
+        with tlx.warp_pipeline_stage("mem2", priority=1):
+            tok_v = tlx.async_load(v_ptrs + future_n * stride_vn, tlx.local_view(v_buf, stage), mask=future_mask)
+            tlx.async_load_commit_group([tok_v])
+            k_cur = tlx.local_load(tlx.local_view(k_buf, next_stage), relaxed=True)
+
+    # Tail
+    tail_start = tl.maximum(n_blocks - NUM_STAGES, 0)
+    tlx.async_load_wait_group(0)
+    for tail_i in tl.range(0, NUM_STAGES, loop_unroll_factor=NUM_STAGES):
+        block_id = tail_start + tail_i
+        if block_id < n_blocks:
+            stage = block_id % NUM_STAGES
+            start_n = block_id * BLOCK_N
+            kn = start_n + offs_n
+
+            k_cur = tlx.local_load(tlx.local_view(k_buf, stage), relaxed=True)
+            v_cur = tlx.local_load(tlx.local_view(v_buf, stage), relaxed=True)
+
+            qk = tl.dot(q, k_cur.T)
+            qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+            acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
 def _attn_fwd_async_prefetch(
     Q,
     K,
@@ -808,11 +988,43 @@ def flash_attn_async_split_kv(q, k, v, sm_scale, causal=False, **kw):
     return o
 
 
+def flash_attn_async_warp_pipe(q, k, v, sm_scale, causal=False, **kw):
+    """Warp-pipelined FA with 4-stage pingpong schedule."""
+    B, H, N_CTX, D = q.shape
+    o = torch.empty_like(q)
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 64)
+    NUM_STAGES = kw.pop("NUM_STAGES", 4)
+    num_warps = kw.pop("num_warps", 8)
+    xcd_remap = kw.pop("xcd_remap", True)
+    schedule_hint = kw.pop("schedule_hint", "memory-bound-attention")
+    assert NUM_STAGES >= 2, "warp_pipe requires NUM_STAGES >= 2"
+
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    GRID_MN = num_m_blocks * B * H
+    grid = (GRID_MN,)
+    _attn_fwd_async_warp_pipe[grid](
+        q, k, v, o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        B, H, N_CTX, GRID_MN, sm_scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
+        IS_CAUSAL=causal, XCD_REMAP=xcd_remap, NUM_STAGES=NUM_STAGES,
+        num_warps=num_warps, schedule_hint=schedule_hint,
+        **kw,
+    )
+    return o
+
+
 KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
     "async_fav3": flash_attn_async_fav3,
     "async_split_kv": flash_attn_async_split_kv,
+    "async_warp_pipe": flash_attn_async_warp_pipe,
 }
 
 
