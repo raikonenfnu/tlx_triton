@@ -6,6 +6,7 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -251,11 +252,25 @@ private:
 
 static ttg::SwizzledSharedEncodingAttr
 computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
-                           ttg::LocalLoadOp localLoadOp) {
+                           ttg::LocalLoadOp localLoadOp, bool needTrans) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
-  auto order = ttg::getOrderForMemory(resultType);
   auto ctaLayout = ttg::getCGALayout(resultType.getEncoding());
   unsigned bitWidth = resultType.getElementType().getIntOrFloatBitWidth();
+
+  if (needTrans) {
+    // For transposed loads, compute encoding using the pre-transpose shape
+    // and order so the swizzling is correct for the transposed access pattern.
+    auto memTransOp = localLoadOp.getSrc().getDefiningOp<ttg::MemDescTransOp>();
+    assert(memTransOp && "needTrans requires memdesc_trans source");
+    auto srcMemType = cast<ttg::MemDescType>(memTransOp.getSrc().getType());
+    auto srcShape = srcMemType.getShape();
+    auto srcOrder = ttg::getOrder(srcMemType);
+    return ttg::SwizzledSharedEncodingAttr::get(
+        localLoadOp->getContext(), dotEnc, srcShape, srcOrder, ctaLayout,
+        bitWidth, /*needTrans=*/true);
+  }
+
+  auto order = ttg::getOrderForMemory(resultType);
   return ttg::SwizzledSharedEncodingAttr::get(localLoadOp->getContext(), dotEnc,
                                               resultType.getShape(), order,
                                               ctaLayout, bitWidth,
@@ -311,10 +326,20 @@ static bool isFedByTDM(Value memdesc) {
 
 static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
                                ttg::LocalLoadOp localLoadOp,
-                               OpBuilder &builder) {
+                               OpBuilder &builder, bool needTrans) {
   auto loadMemDesc = localLoadOp->getOperand(0);
 
-  if (loadMemDesc.getDefiningOp<tlx::RequireLayoutOp>())
+  // For transposed loads, apply the require_layout to the source of
+  // memdesc_trans rather than its result so PropagateLayout doesn't need
+  // to backward-propagate through the transpose.
+  Value targetMemDesc = loadMemDesc;
+  if (needTrans) {
+    if (auto memTransOp =
+            loadMemDesc.getDefiningOp<ttg::MemDescTransOp>())
+      targetMemDesc = memTransOp.getSrc();
+  }
+
+  if (targetMemDesc.getDefiningOp<tlx::RequireLayoutOp>())
     return;
 
   // Defer to the TDM anchor for buffers fed by `amdgpu.async_tdm_*`. The
@@ -322,11 +347,11 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
   // (and dot-aware when applicable); inserting a sibling swizzled anchor
   // here would conflict with that constraint and widen the lattice to
   // unknown.
-  if (isFedByTDM(loadMemDesc))
+  if (isFedByTDM(targetMemDesc))
     return;
 
   // Respect user-specified order on the source memdesc.
-  if (auto srcType = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
+  if (auto srcType = dyn_cast<ttg::MemDescType>(targetMemDesc.getType())) {
     if (auto srcEnc =
             dyn_cast<ttg::SwizzledSharedEncodingAttr>(srcType.getEncoding())) {
       if (srcEnc.getOrder() != encoding.getOrder()) {
@@ -339,14 +364,28 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
     }
   }
 
-  builder.setInsertionPoint(localLoadOp);
-  if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
+  if (auto type = dyn_cast<ttg::MemDescType>(targetMemDesc.getType())) {
     auto newType = ttg::MemDescType::get(
         type.getShape(), type.getElementType(), mlir::cast<Attribute>(encoding),
         type.getMemorySpace(), type.getMutableMemory(), type.getAllocShape());
-    auto requireOp = tlx::RequireLayoutOp::create(
-        builder, localLoadOp->getLoc(), newType, loadMemDesc);
-    localLoadOp->setOperand(0, requireOp.getResult());
+    if (needTrans) {
+      // Insert require_layout before the memdesc_trans, then rebuild the
+      // memdesc_trans so its result type is inferred from the new source.
+      auto memTransOp = loadMemDesc.getDefiningOp<ttg::MemDescTransOp>();
+      builder.setInsertionPoint(memTransOp);
+      auto requireOp = tlx::RequireLayoutOp::create(
+          builder, localLoadOp->getLoc(), newType, targetMemDesc);
+      auto newMemTrans = ttg::MemDescTransOp::create(
+          builder, memTransOp.getLoc(), requireOp.getResult(),
+          memTransOp.getOrder());
+      memTransOp.getResult().replaceAllUsesWith(newMemTrans.getResult());
+      memTransOp->erase();
+    } else {
+      builder.setInsertionPoint(localLoadOp);
+      auto requireOp = tlx::RequireLayoutOp::create(
+          builder, localLoadOp->getLoc(), newType, targetMemDesc);
+      localLoadOp->setOperand(0, requireOp.getResult());
+    }
   }
 }
 
@@ -662,9 +701,121 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
 // Main pass logic
 // ============================================================================
 
+// Trace a value backward through scf.for iter_args to find all producing
+// local_load ops. Returns false if an unsupported producer is encountered.
+static bool traceToLocalLoads(
+    Value val, SmallVector<ttg::LocalLoadOp> &loads,
+    SmallVector<std::pair<scf::ForOp, unsigned>> &forUpdates) {
+  SetVector<Value> worklist;
+  DenseSet<Value> visited;
+  worklist.insert(val);
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    if (auto loadOp = v.getDefiningOp<ttg::LocalLoadOp>()) {
+      loads.push_back(loadOp);
+      continue;
+    }
+    if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+      auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+      if (!forOp)
+        return false;
+      unsigned idx = blockArg.getArgNumber() - forOp.getNumInductionVars();
+      if (idx >= forOp.getNumRegionIterArgs())
+        return false;
+      forUpdates.emplace_back(forOp, idx);
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      worklist.insert(forOp.getInitArgs()[idx]);
+      worklist.insert(yield.getOperand(idx));
+      continue;
+    }
+    if (auto forOp = v.getDefiningOp<scf::ForOp>()) {
+      unsigned idx = cast<OpResult>(v).getResultNumber();
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      worklist.insert(yield.getOperand(idx));
+      continue;
+    }
+    return false;
+  }
+  return !loads.empty();
+}
+
+// Canonicalize tt.trans consuming local_load results (directly or via
+// scf.for iter_args) into memdesc_trans → local_load, so the transpose
+// lives in the memdesc domain where MemoryOpToLLVM lowers it to ds_read_tr
+// intrinsics. Runs before the dataflow solver so it sees a plain
+// local_load feeding the dot operand chain.
+static void hoistTransToMemdesc(ModuleOp m, OpBuilder &builder) {
+  // Collect all tt.trans ops eligible for hoisting.
+  DenseSet<Operation *> loadsToHoist;
+  SmallVector<std::pair<scf::ForOp, unsigned>> forUpdates;
+  SmallVector<tt::TransOp> transToErase;
+
+  m.walk([&](tt::TransOp transOp) {
+    if (transOp.getOrder() != ArrayRef<int32_t>{1, 0})
+      return;
+
+    SmallVector<ttg::LocalLoadOp> loads;
+    SmallVector<std::pair<scf::ForOp, unsigned>> updates;
+    if (!traceToLocalLoads(transOp.getSrc(), loads, updates))
+      return;
+
+    for (auto load : loads)
+      loadsToHoist.insert(load);
+    for (auto u : updates)
+      forUpdates.push_back(u);
+    transToErase.push_back(transOp);
+  });
+
+  if (transToErase.empty())
+    return;
+
+  // Phase 1: Insert memdesc_trans before each identified local_load.
+  for (auto *op : loadsToHoist) {
+    auto localLoadOp = cast<ttg::LocalLoadOp>(op);
+    builder.setInsertionPoint(localLoadOp);
+    auto memTransOp = ttg::MemDescTransOp::create(
+        builder, localLoadOp.getLoc(), localLoadOp.getSrc(),
+        ArrayRef<int32_t>({1, 0}));
+    localLoadOp.getSrcMutable().assign(memTransOp.getResult());
+    auto oldType = localLoadOp.getType();
+    auto shape = oldType.getShape();
+    auto newType = RankedTensorType::get({shape[1], shape[0]},
+                                         oldType.getElementType(),
+                                         oldType.getEncoding());
+    localLoadOp.getResult().setType(newType);
+  }
+
+  // Phase 2: Update scf.for iter_arg and result types.
+  DenseSet<std::pair<Operation *, unsigned>> updatedForArgs;
+  for (auto [forOp, idx] : forUpdates) {
+    if (!updatedForArgs.insert({forOp.getOperation(), idx}).second)
+      continue;
+    auto oldType =
+        cast<RankedTensorType>(forOp.getRegionIterArg(idx).getType());
+    auto shape = oldType.getShape();
+    auto newType = RankedTensorType::get({shape[1], shape[0]},
+                                         oldType.getElementType(),
+                                         oldType.getEncoding());
+    forOp.getRegionIterArg(idx).setType(newType);
+    forOp.getResult(idx).setType(newType);
+  }
+
+  // Phase 3: Erase tt.trans (replace uses with now-transposed source).
+  for (auto transOp : transToErase) {
+    transOp.getResult().replaceAllUsesWith(transOp.getSrc());
+    transOp->erase();
+  }
+}
+
 LogicalResult insertRequireLayout(ModuleOp m) {
   OpBuilder builder(m.getContext());
   LDBG("insertRequireLayout");
+
+  // Canonicalize local_load → tt.trans into memdesc_trans → local_load before
+  // the dataflow solver runs so it sees the standard local_load → dot path.
+  hoistTransToMemdesc(m, builder);
 
   // --- Run backward dataflow analysis ---
   // SparseBackwardDataFlowAnalysis requires a SymbolTableCollection even though
@@ -710,9 +861,14 @@ LogicalResult insertRequireLayout(ModuleOp m) {
 
     LDBG("local_load needs dot encoding: " << dotEnc);
 
+    // Detect if this local_load was hoisted from a tt.trans (its source is
+    // a memdesc_trans). If so, compute the shared encoding with needTrans.
+    bool needTrans =
+        localLoadOp.getSrc().getDefiningOp<ttg::MemDescTransOp>() != nullptr;
+
     // Insert RequireLayoutOp for memdesc swizzling.
-    auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp);
-    applyRequireLayout(sharedEnc, localLoadOp, builder);
+    auto sharedEnc = computeSharedEncFromDotEnc(dotEnc, localLoadOp, needTrans);
+    applyRequireLayout(sharedEnc, localLoadOp, builder, needTrans);
   });
 
   materializeDotUserTensorConstraints(m, builder);
