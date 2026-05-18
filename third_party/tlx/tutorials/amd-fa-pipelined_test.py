@@ -447,6 +447,10 @@ def _attn_fwd_async_fav3_pipeline(
     qk0 = tl.where(offs_n[None, :] < hi, qk0, float("-inf"))
     if IS_CAUSAL:
         qk0 = tl.where(offs_m[:, None] >= offs_n[None, :], qk0, float("-inf"))
+    else:
+        # Keep the 8-warp non-causal lowering on the predicated QK path; the
+        # unpredicated form miscomputes long sequence tiles.
+        qk0 = tl.where(offs_m[:, None] >= 0, qk0, float("-inf"))
     m_new = tl.maximum(m_i, tl.max(qk0, 1) * QK_SCALE)
     p_prev = tl.math.exp2(qk0 * QK_SCALE - m_new[:, None])
     alpha_prev = tl.math.exp2(m_i - m_new)
@@ -481,6 +485,9 @@ def _attn_fwd_async_fav3_pipeline(
             qk = tl.dot(q, k_cur)
             if IS_CAUSAL:
                 qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+            else:
+                # See qk0: this is logically a no-op for valid program ids.
+                qk = tl.where(offs_m[:, None] >= 0, qk, float("-inf"))
 
         wait_tok_v = tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("lrv_ack", priority=1):
@@ -522,6 +529,9 @@ def _attn_fwd_async_fav3_pipeline(
     qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
     if IS_CAUSAL:
         qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+    else:
+        # See qk0: this is logically a no-op for valid program ids.
+        qk = tl.where(offs_m[:, None] >= 0, qk, float("-inf"))
     m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
     p_prev = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
     alpha_prev = tl.math.exp2(m_i - m_new)
@@ -548,6 +558,9 @@ def _attn_fwd_async_fav3_pipeline(
     qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
     if IS_CAUSAL:
         qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+    else:
+        # See qk0: this is logically a no-op for valid program ids.
+        qk = tl.where(offs_m[:, None] >= 0, qk, float("-inf"))
     m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
     p_prev = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
     alpha_prev = tl.math.exp2(m_i - m_new)
@@ -871,6 +884,7 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw):
 def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     """MI350x FAv3 entry point with shape-selected TLX schedules."""
     B, H, N_CTX, D = q.shape
+    use_fav3_pipeline = kw.pop("USE_FAV3_PIPELINE", False)
 
     if causal and N_CTX >= 4096:
         kw.setdefault("BLOCK_M", 128)
@@ -885,12 +899,12 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     else:
         kw.setdefault("num_warps", 4)
 
-    if kw.pop("USE_FAV3_PIPELINE", False) and N_CTX >= 256:
+    if use_fav3_pipeline and N_CTX >= 256:
         o = torch.empty_like(q)
 
         BLOCK_M = kw.pop("BLOCK_M", 256)
-        BLOCK_N = kw.pop("BLOCK_N", 64)
-        num_warps = kw.pop("num_warps")
+        BLOCK_N = kw.pop("BLOCK_N", 64 if D <= 64 else 32)
+        num_warps = kw.pop("num_warps", 8)
 
         grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
         _attn_fwd_async_fav3_pipeline[grid](
@@ -976,6 +990,13 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     return flash_attn_async_prefetch(q, k, v, sm_scale, causal, **kw)
 
 
+def flash_attn_async_fav3_pipeline(q, k, v, sm_scale, causal=False, **kw):
+    """Explicit 8-warp FAv3 ping-pong pipeline experiment."""
+    kw.setdefault("num_warps", 8)
+    kw.setdefault("USE_FAV3_PIPELINE", True)
+    return flash_attn_async_fav3(q, k, v, sm_scale, causal, **kw)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Kernel registry — add new kernel wrappers here
 # ═══════════════════════════════════════════════════════════════════════════
@@ -984,6 +1005,7 @@ KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
     "async_fav3": flash_attn_async_fav3,
+    "async_fav3_pipeline": flash_attn_async_fav3_pipeline,
 }
 
 
