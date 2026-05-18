@@ -385,6 +385,7 @@ def _attn_fwd_async_fav3_pipeline(
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     REMAP_XCD: tl.constexpr,
+    MERGE_MEM_STAGES: tl.constexpr,
 ):
     _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
                     stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
@@ -477,41 +478,76 @@ def _attn_fwd_async_fav3_pipeline(
         k_next_slot = (t + 1) % 2
         k_overwrite_slot = t % 2
 
-        with tlx.warp_pipeline_stage("vec2_dot1", priority=0):
-            l_ij = tl.sum(p_prev, 1)
-            acc_scaled = acc * alpha_prev[:, None]
-            l_i = l_i * alpha_prev + l_ij
-            kn = block_id + offs_n
-            qk = tl.dot(q, k_cur)
-            if IS_CAUSAL:
-                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
-            else:
-                # See qk0: this is logically a no-op for valid program ids.
-                qk = tl.where(offs_m[:, None] >= 0, qk, float("-inf"))
+        if MERGE_MEM_STAGES:
+            with tlx.warp_pipeline_stage("main", priority=0):
+                l_ij = tl.sum(p_prev, 1)
+                acc_scaled = acc * alpha_prev[:, None]
+                l_i = l_i * alpha_prev + l_ij
+                kn = block_id + offs_n
+                qk = tl.dot(q, k_cur)
+                if IS_CAUSAL:
+                    qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+                else:
+                    # Keep D64's 8-warp lowering predicated without a row-wise
+                    # cndmask; all hot-loop key offsets are non-negative.
+                    qk = tl.where(kn[None, :] >= 0, qk, float("-inf"))
 
-        wait_tok_v = tlx.async_load_wait_group(2)
-        with tlx.warp_pipeline_stage("lrv_ack", priority=1):
-            v_prev = tlx.local_load(tlx.local_view(v_buf, v_prev_slot), token=wait_tok_v, relaxed=True)
-            tok_k = tlx.async_load(k_ptrs + future_k * stride_kn, tlx.local_view(k_buf, k_overwrite_slot),
-                                   mask=(future_k + offs_n[:, None]) < hi)
-            tlx.async_load_commit_group([tok_k])
+                wait_tok_v = tlx.async_load_wait_group(2)
+                v_prev = tlx.local_load(tlx.local_view(v_buf, v_prev_slot), token=wait_tok_v, relaxed=True)
+                tok_k = tlx.async_load(k_ptrs + future_k * stride_kn, tlx.local_view(k_buf, k_overwrite_slot),
+                                       mask=(future_k + offs_n[:, None]) < hi)
+                tlx.async_load_commit_group([tok_k])
 
-        with tlx.warp_pipeline_stage("dot2_vec1", priority=0):
-            acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc_scaled)
-            m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
-            p_cur = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
-            alpha_cur = tl.math.exp2(m_i - m_new)
-            m_i = m_new
+                acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc_scaled)
+                m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+                p_cur = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+                alpha_cur = tl.math.exp2(m_i - m_new)
+                m_i = m_new
 
-        wait_tok_k = tlx.async_load_wait_group(2)
-        with tlx.warp_pipeline_stage("lrk_acv", priority=1):
-            kt_view_lrk = tlx.local_trans(tlx.local_view(k_buf, k_next_slot))
-            k_cur = tlx.local_load(kt_view_lrk, token=wait_tok_k, relaxed=True)
-            tok_v = tlx.async_load(v_ptrs + future_v * stride_vn, tlx.local_view(v_buf, k_next_slot),
-                                   mask=(future_v + offs_n[:, None]) < hi)
-            tlx.async_load_commit_group([tok_v])
-            p_prev = p_cur
-            alpha_prev = alpha_cur
+                wait_tok_k = tlx.async_load_wait_group(2)
+                kt_view_lrk = tlx.local_trans(tlx.local_view(k_buf, k_next_slot))
+                k_cur = tlx.local_load(kt_view_lrk, token=wait_tok_k, relaxed=True)
+                tok_v = tlx.async_load(v_ptrs + future_v * stride_vn, tlx.local_view(v_buf, k_next_slot),
+                                       mask=(future_v + offs_n[:, None]) < hi)
+                tlx.async_load_commit_group([tok_v])
+                p_prev = p_cur
+                alpha_prev = alpha_cur
+        else:
+            with tlx.warp_pipeline_stage("vec2_dot1", priority=0):
+                l_ij = tl.sum(p_prev, 1)
+                acc_scaled = acc * alpha_prev[:, None]
+                l_i = l_i * alpha_prev + l_ij
+                kn = block_id + offs_n
+                qk = tl.dot(q, k_cur)
+                if IS_CAUSAL:
+                    qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+                else:
+                    # See qk0: this is logically a no-op for valid program ids.
+                    qk = tl.where(offs_m[:, None] >= 0, qk, float("-inf"))
+
+            wait_tok_v = tlx.async_load_wait_group(2)
+            with tlx.warp_pipeline_stage("lrv_ack", priority=1):
+                v_prev = tlx.local_load(tlx.local_view(v_buf, v_prev_slot), token=wait_tok_v, relaxed=True)
+                tok_k = tlx.async_load(k_ptrs + future_k * stride_kn, tlx.local_view(k_buf, k_overwrite_slot),
+                                       mask=(future_k + offs_n[:, None]) < hi)
+                tlx.async_load_commit_group([tok_k])
+
+            with tlx.warp_pipeline_stage("dot2_vec1", priority=0):
+                acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc_scaled)
+                m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+                p_cur = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+                alpha_cur = tl.math.exp2(m_i - m_new)
+                m_i = m_new
+
+            wait_tok_k = tlx.async_load_wait_group(2)
+            with tlx.warp_pipeline_stage("lrk_acv", priority=1):
+                kt_view_lrk = tlx.local_trans(tlx.local_view(k_buf, k_next_slot))
+                k_cur = tlx.local_load(kt_view_lrk, token=wait_tok_k, relaxed=True)
+                tok_v = tlx.async_load(v_ptrs + future_v * stride_vn, tlx.local_view(v_buf, k_next_slot),
+                                       mask=(future_v + offs_n[:, None]) < hi)
+                tlx.async_load_commit_group([tok_v])
+                p_prev = p_cur
+                alpha_prev = alpha_cur
 
     last_t = n_hot
     # Epilogue 1: retire tile last_t-1.
@@ -905,6 +941,8 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
         BLOCK_M = kw.pop("BLOCK_M", 256)
         BLOCK_N = kw.pop("BLOCK_N", 64 if D <= 64 else 32)
         num_warps = kw.pop("num_warps", 8)
+        if D <= 64:
+            kw.setdefault("waves_per_eu", 1)
 
         grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
         _attn_fwd_async_fav3_pipeline[grid](
@@ -937,6 +975,7 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
             HEAD_DIM=D,
             IS_CAUSAL=causal,
             REMAP_XCD=kw.pop("REMAP_XCD", False),
+            MERGE_MEM_STAGES=D <= 64,
             num_warps=num_warps,
             **kw,
         )
