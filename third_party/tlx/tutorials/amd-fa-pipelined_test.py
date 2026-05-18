@@ -355,6 +355,217 @@ def _attn_fwd_async_fav3(
 
 
 @triton.jit
+def _attn_fwd_async_fav3_pipeline(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    REMAP_XCD: tl.constexpr,
+):
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    if REMAP_XCD:
+        pid_hz = _remap_xcd(pid_hz, Z * H)
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+    n_hot = tl.maximum(n_blocks - 2, 1)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # Prologue matching the FAv3 sketch:
+    # ACK0, ACK1, ACV0 -> LRK0 -> DOT1/VEC1_0 -> ACK2, ACV1 -> LRK1.
+    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < hi)
+    tlx.async_load_commit_group([tok_k0])
+    tok_k1 = tlx.async_load(k_ptrs + BLOCK_N * stride_kn, tlx.local_view(k_buf, 1),
+                            mask=(BLOCK_N + offs_n[:, None]) < hi)
+    tlx.async_load_commit_group([tok_k1])
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < hi)
+    tlx.async_load_commit_group([tok_v0])
+
+    wait_tok = tlx.async_load_wait_group(2)
+    kt_view_p0 = tlx.local_trans(tlx.local_view(k_buf, 0))
+    k_cur = tlx.local_load(kt_view_p0, token=wait_tok, relaxed=True)
+
+    qk0 = tl.dot(q, k_cur)
+    qk0 = tl.where(offs_n[None, :] < hi, qk0, float("-inf"))
+    if IS_CAUSAL:
+        qk0 = tl.where(offs_m[:, None] >= offs_n[None, :], qk0, float("-inf"))
+    m_new = tl.maximum(m_i, tl.max(qk0, 1) * QK_SCALE)
+    p_prev = tl.math.exp2(qk0 * QK_SCALE - m_new[:, None])
+    alpha_prev = tl.math.exp2(m_i - m_new)
+    m_i = m_new
+
+    tok_k2 = tlx.async_load(k_ptrs + (2 * BLOCK_N) * stride_kn, tlx.local_view(k_buf, 0),
+                            mask=(2 * BLOCK_N + offs_n[:, None]) < hi)
+    tlx.async_load_commit_group([tok_k2])
+    tok_v1 = tlx.async_load(v_ptrs + BLOCK_N * stride_vn, tlx.local_view(v_buf, 1),
+                            mask=(BLOCK_N + offs_n[:, None]) < hi)
+    tlx.async_load_commit_group([tok_v1])
+
+    wait_tok = tlx.async_load_wait_group(3)
+    kt_view_p1 = tlx.local_trans(tlx.local_view(k_buf, 1))
+    k_cur = tlx.local_load(kt_view_p1, token=wait_tok, relaxed=True)
+
+    # Hot loop. Iteration t computes DOT1/VEC1[t] while retiring
+    # VEC2/LRV/DOT2[t-1], then reads K[t+1] and issues V[t+1].
+    for block_id in tl.range(BLOCK_N, n_hot * BLOCK_N, BLOCK_N, num_stages=0):
+        t = block_id // BLOCK_N
+        future_k = block_id + 2 * BLOCK_N
+        future_v = block_id + BLOCK_N
+        v_prev_slot = (t - 1) % 2
+        k_next_slot = (t + 1) % 2
+        k_overwrite_slot = t % 2
+
+        with tlx.warp_pipeline_stage("vec2_dot1", priority=0):
+            l_ij = tl.sum(p_prev, 1)
+            acc_scaled = acc * alpha_prev[:, None]
+            l_i = l_i * alpha_prev + l_ij
+            kn = block_id + offs_n
+            qk = tl.dot(q, k_cur)
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+        wait_tok_v = tlx.async_load_wait_group(2)
+        with tlx.warp_pipeline_stage("lrv_ack", priority=1):
+            v_prev = tlx.local_load(tlx.local_view(v_buf, v_prev_slot), token=wait_tok_v, relaxed=True)
+            tok_k = tlx.async_load(k_ptrs + future_k * stride_kn, tlx.local_view(k_buf, k_overwrite_slot),
+                                   mask=(future_k + offs_n[:, None]) < hi)
+            tlx.async_load_commit_group([tok_k])
+
+        with tlx.warp_pipeline_stage("dot2_vec1", priority=0):
+            acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc_scaled)
+            m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+            p_cur = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+            alpha_cur = tl.math.exp2(m_i - m_new)
+            m_i = m_new
+
+        wait_tok_k = tlx.async_load_wait_group(2)
+        with tlx.warp_pipeline_stage("lrk_acv", priority=1):
+            kt_view_lrk = tlx.local_trans(tlx.local_view(k_buf, k_next_slot))
+            k_cur = tlx.local_load(kt_view_lrk, token=wait_tok_k, relaxed=True)
+            tok_v = tlx.async_load(v_ptrs + future_v * stride_vn, tlx.local_view(v_buf, k_next_slot),
+                                   mask=(future_v + offs_n[:, None]) < hi)
+            tlx.async_load_commit_group([tok_v])
+            p_prev = p_cur
+            alpha_prev = alpha_cur
+
+    last_t = n_hot
+    # Epilogue 1: retire tile last_t-1.
+    wait_tok_v = tlx.async_load_wait_group(2)
+    v_prev = tlx.local_load(tlx.local_view(v_buf, (last_t - 1) % 2), token=wait_tok_v, relaxed=True)
+    l_ij = tl.sum(p_prev, 1)
+    acc = acc * alpha_prev[:, None]
+    l_i = l_i * alpha_prev + l_ij
+    acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc)
+
+    # Epilogue 2: DOT1/VEC1 for tile last_t.
+    start_n = last_t * BLOCK_N
+    kn = start_n + offs_n
+    qk = tl.dot(q, k_cur)
+    qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
+    if IS_CAUSAL:
+        qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+    m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+    p_prev = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+    alpha_prev = tl.math.exp2(m_i - m_new)
+    m_i = m_new
+
+    wait_tok_k = tlx.async_load_wait_group(1)
+    kt_view_tail = tlx.local_trans(tlx.local_view(k_buf, (last_t + 1) % 2))
+    k_tail = tlx.local_load(kt_view_tail, token=wait_tok_k, relaxed=True)
+    tok_v = tlx.async_load(v_ptrs + (last_t + 1) * BLOCK_N * stride_vn, tlx.local_view(v_buf, (last_t + 1) % 2),
+                           mask=((last_t + 1) * BLOCK_N + offs_n[:, None]) < hi)
+    tlx.async_load_commit_group([tok_v])
+
+    # Epilogue 3: retire tile last_t while DOT1/VEC1 for tile last_t+1.
+    wait_tok_v = tlx.async_load_wait_group(1)
+    v_prev = tlx.local_load(tlx.local_view(v_buf, last_t % 2), token=wait_tok_v, relaxed=True)
+    l_ij = tl.sum(p_prev, 1)
+    acc = acc * alpha_prev[:, None]
+    l_i = l_i * alpha_prev + l_ij
+    acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc)
+
+    start_n = (last_t + 1) * BLOCK_N
+    kn = start_n + offs_n
+    qk = tl.dot(q, k_tail)
+    qk = tl.where(kn[None, :] < hi, qk, float("-inf"))
+    if IS_CAUSAL:
+        qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+    m_new = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+    p_prev = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+    alpha_prev = tl.math.exp2(m_i - m_new)
+    m_i = m_new
+
+    wait_tok_v = tlx.async_load_wait_group(0)
+    v_prev = tlx.local_load(tlx.local_view(v_buf, (last_t + 1) % 2), token=wait_tok_v, relaxed=True)
+    l_ij = tl.sum(p_prev, 1)
+    acc = acc * alpha_prev[:, None]
+    l_i = l_i * alpha_prev + l_ij
+    acc = tl.dot(p_prev.to(v_prev.dtype), v_prev, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
 def _attn_fwd_async_prefetch(
     Q,
     K,
@@ -674,6 +885,51 @@ def flash_attn_async_fav3(q, k, v, sm_scale, causal=False, **kw):
     else:
         kw.setdefault("num_warps", 4)
 
+    if kw.pop("USE_FAV3_PIPELINE", False) and N_CTX >= 256:
+        o = torch.empty_like(q)
+
+        BLOCK_M = kw.pop("BLOCK_M", 256)
+        BLOCK_N = kw.pop("BLOCK_N", 64)
+        num_warps = kw.pop("num_warps")
+
+        grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
+        _attn_fwd_async_fav3_pipeline[grid](
+            q,
+            k,
+            v,
+            o,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
+            B,
+            H,
+            N_CTX,
+            sm_scale,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            HEAD_DIM=D,
+            IS_CAUSAL=causal,
+            REMAP_XCD=kw.pop("REMAP_XCD", False),
+            num_warps=num_warps,
+            **kw,
+        )
+        return o
+
+    # Older 4-stage staging prototype. Kept as an explicit experiment; the
+    # FAv3-like ACK/ACV/LRK/DOT1/VEC1/VEC2/LRV/DOT2 pipeline is above.
     if kw.pop("USE_FAV3_BODY", False) and N_CTX >= 256:
         o = torch.empty_like(q)
 
