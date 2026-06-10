@@ -26,13 +26,47 @@ pytest third_party/tlx/tutorials/amd-fa-pipelined_test.py::test_fa_correctness \
 
 ## Available kernel modes
 
-| Registry key | Description | Status |
-|---|---|---|
-| `async_prefetch` | Non-causal reference (causal=False fallback for all below) | baseline |
-| `async_prefetch_causal` | Peeled mask + **static mirror-pair** balance + XCD L2 remap | **default / champion (D=128)** |
-| `async_prefetch_persistent_causal` | Persistent, XCD-grouped, mirror-balanced | champion (D=64) |
-| `async_prefetch_persistent_nomirror_causal` | Persistent, no pairing, m-major + heavy-first | experiment (worse) |
-| `async_prefetch_dynamic_causal` | FCFS dynamic work-stealing via per-XCD atomic queue | experiment (worse) |
+Each mode = a registry key → host wrapper → `@triton.jit` kernel. All live in
+`third_party/tlx/tutorials/amd-fa-pipelined_test.py`; `causal=False` falls back
+to the non-causal `async_prefetch` for every mode.
+
+| Registry key | Host wrapper | JIT kernel | Description | Status |
+|---|---|---|---|---|
+| `async_prefetch` | `flash_attn_async_prefetch` | `_attn_fwd_async_prefetch` | Non-causal reference / fallback | baseline |
+| `async_prefetch_causal` | `flash_attn_async_prefetch_causal` | `_attn_fwd_async_prefetch_causal` | Peeled mask + **static mirror-pair** balance + XCD L2 remap | **default / champion (D=128)** |
+| `async_prefetch_persistent_causal` | `flash_attn_async_prefetch_persistent_causal` | `_attn_fwd_persistent_causal` | Persistent, XCD-grouped, mirror-balanced | champion (D=64) |
+| `async_prefetch_persistent_nomirror_causal` | `flash_attn_async_prefetch_persistent_nomirror_causal` | `_attn_fwd_persistent_nomirror_causal` | Persistent, no pairing, m-major + heavy-first | experiment (worse) |
+| `async_prefetch_dynamic_causal` | `flash_attn_async_prefetch_dynamic_causal` | `_attn_fwd_dynamic_causal` | FCFS dynamic work-stealing via per-XCD atomic queue | experiment (worse) |
+
+### Per-mode run / repro
+
+Each command benchmarks one mode (TFLOPS) across D=64/128 and N=8192/16384;
+append `-causal false` to also bench the non-causal fallback. Swap
+`python ... ` for the pytest line to check correctness instead.
+
+```bash
+source ~/nod/tlx/venv/tlx_venv/bin/activate
+BENCH="python third_party/tlx/tutorials/amd-fa-pipelined_test.py -b 1 -hq 64 -sq 8192 16384 -d 64 128 -causal true --kernel"
+
+# Non-causal reference / fallback
+$BENCH async_prefetch -causal false
+
+# Mirror static (default / champion D=128)
+$BENCH async_prefetch_causal
+
+# Mirror persistent (champion D=64)
+$BENCH async_prefetch_persistent_causal
+
+# No-mirror persistent (m-major, heavy-first)
+$BENCH async_prefetch_persistent_nomirror_causal
+
+# FCFS dynamic work-stealing (per-XCD atomic queue)
+$BENCH async_prefetch_dynamic_causal
+
+# Correctness for a given mode (all N incl. partial-block fallback):
+pytest third_party/tlx/tutorials/amd-fa-pipelined_test.py::test_fa_correctness \
+    -k async_prefetch_dynamic_causal -s --tb=short
+```
 
 ## Consolidated performance (all modes)
 
