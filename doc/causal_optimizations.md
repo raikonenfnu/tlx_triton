@@ -456,8 +456,62 @@ bundling (Step 10, greedy-bundle for arbitrary costs) is the principled general
 form. The bundling is the point, not an artifact. Kept the partition kernel as a
 documented negative result. All 12 correctness cases pass.
 
+## Step 12 — Learnings from ROCm/aiter Lean Attention (StreamK)
+
+Studied `aiter/ops/triton/_triton_kernels/attention/lean_atten.py` (ROCm/aiter),
+a production AMD Triton **StreamK** ("Lean") attention. It independently confirms
+most of our design and points at the one technique we're missing.
+
+**What it validates (we landed on the same things):**
+- **Ping-pong tile order == our mirror/fold.** `find_group_pingpong` orders a
+  head's m-tiles as `where(i%2==0, i//2, num_m-1-i//2)` → 0, N-1, 1, N-2, … i.e.
+  interleave light+heavy. It keeps a `find_group_sequential` variant but uses
+  ping-pong — exactly our Step 2/10 conclusion, from a production kernel.
+- **XCD L2 remap == ours.** Its `remap_xcd` (tall/short XCDs, contiguous pids per
+  XCD) is character-for-character our Step 3, and Lean computes its load-balance
+  split **per XCD** ("relative to 1 XCD") — matching our "balance *within* an XCD,
+  never globally" finding (Step 5: global scatter = ~520 TF).
+- **Bounded `static_range` + `if iter < end` guard**, not a `while` loop —
+  the same persistent-loop shape we were forced into (TLX pipelines `scf.for`,
+  not `scf.while`; our Step 9 dynamic kernel).
+- **exp2 + NaN-safe masking** for all-`-inf` rows (`where(m_ij==-inf, …)`), the
+  base-2 softmax we use; the NaN guard we skipped (Step 6) becomes *necessary*
+  once tiles are split (a partial tile can see only masked K-blocks).
+
+**What we're missing — StreamK K-block-level splitting (the real generalisation):**
+Step 11 concluded a tile is "atomic" so cumulative-cost partition can't balance
+the heaviest tile. StreamK dissolves exactly that limit: it flattens *all* causal
+K-block work into one 1-D stream of "lean tiles" and gives each of the fixed
+`total_programs` WGs a **contiguous equal-length slice** (`max_tiles_per_wg` for
+the first `high_load_wgs`, one fewer for the rest) — perfect balance to within
+one K-block, regardless of cost profile / ragged batch / partial blocks. The
+price is that a WG may own a *partial* output tile, so it:
+  1. carries partial online-softmax state `(m, l, acc)`;
+  2. non-"host" WGs write partials to scratch `Mp/Lp/Op` + set a `lock`;
+  3. the "host" WG (owns the tile's first lean tile) spins on locks and merges
+     partials with the standard `m_new=max; rescale by exp2` reduction.
+
+This is the principled answer to "balance arbitrary shapes": split at K-block
+granularity + a cross-WG fixup, instead of bundling whole tiles.
+
+**When it matters (and when it doesn't for us):**
+- StreamK wins in **low-parallelism** regimes — decode (`num_m==1`), short
+  sequences, or whenever `num_m * heads < #CUs` — where mirror/fold has *nothing
+  to balance* (≤1 tile per head) and our kernels would tank or fall back. There
+  StreamK splits a single head's K across many CUs.
+- For our **large-prefill** benchmark (N=8k/16k, 64 heads) there is already
+  abundant tile parallelism, so the StreamK reduction overhead (extra global
+  Op/Mp/Lp traffic + lock spins) is pure cost — mirror/fold should stay ahead.
+
+**Takeaway / future work:** add a StreamK variant aimed at the low-parallelism
+regime (decode / short-seq / small grid), keeping mirror/fold for large prefill;
+it needs the partial-state reduction (scratch buffers + locks + `.wt`/`.cv`
+cache modifiers + `debug_barrier`) and NaN-safe masking for split tiles.
+
 ## Future work
 
+- StreamK / Lean-style K-block splitting + partial-softmax reduction for the
+  low-parallelism (decode / short-seq / small-grid) regime (see Step 12).
 - Finer-grained diagonal tiling (split the diagonal block into a half-size
   sub-tile) could recover the last few % but adds complexity/branches.
 - Greedy-bundle (vs the linear fold) for non-linear/irregular cost profiles.
