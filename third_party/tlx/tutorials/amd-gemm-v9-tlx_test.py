@@ -295,16 +295,10 @@ def gemm_v9_quad(
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(sAt, 1))
 
-    acc_tl = tl.dot(a_top, b_left, acc_tl, allow_tf32=False)
-    tlx.async_load_wait_group(1)
-    a_bot = tlx.local_load(tlx.local_view(sAb, 1))
-    acc_bl = tl.dot(a_bot, b_left, acc_bl, allow_tf32=False)
-    tlx.async_load_wait_group(0)
-    b_right = tlx.local_load(tlx.local_view(sBr, 1))
-    acc_tr = tl.dot(a_top, b_right, acc_tr, allow_tf32=False)
-    acc_br = tl.dot(a_bot, b_right, acc_br, allow_tf32=False)
-
-    # Store the four quadrants.
+    # Precompute store addresses + masks up front so each quadrant can be written
+    # the instant its accumulator is final -> the HBM write latency overlaps the
+    # remaining MFMAs instead of being a fully-exposed serial tail (ATT showed the
+    # bunched-at-end stores were ~63% of stalls on the K=256 skinny case).
     cdt = tlx.dtype_of(c_ptr)
     offs_cm = tl.arange(0, HM)
     offs_cn = tl.arange(0, HN)
@@ -317,9 +311,18 @@ def gemm_v9_quad(
     c_tr = c_tl + HN * stride_cn
     c_bl = c_tl + HM * stride_cm
     c_br = c_bl + HN * stride_cn
+
+    acc_tl = tl.dot(a_top, b_left, acc_tl, allow_tf32=False)
     tl.store(c_tl, acc_tl.to(cdt), mask=m_top[:, None] & n_left[None, :])
-    tl.store(c_tr, acc_tr.to(cdt), mask=m_top[:, None] & n_right[None, :])
+    tlx.async_load_wait_group(1)
+    a_bot = tlx.local_load(tlx.local_view(sAb, 1))
+    acc_bl = tl.dot(a_bot, b_left, acc_bl, allow_tf32=False)
     tl.store(c_bl, acc_bl.to(cdt), mask=m_bot[:, None] & n_left[None, :])
+    tlx.async_load_wait_group(0)
+    b_right = tlx.local_load(tlx.local_view(sBr, 1))
+    acc_tr = tl.dot(a_top, b_right, acc_tr, allow_tf32=False)
+    tl.store(c_tr, acc_tr.to(cdt), mask=m_top[:, None] & n_right[None, :])
+    acc_br = tl.dot(a_bot, b_right, acc_br, allow_tf32=False)
     tl.store(c_br, acc_br.to(cdt), mask=m_bot[:, None] & n_right[None, :])
 
 
