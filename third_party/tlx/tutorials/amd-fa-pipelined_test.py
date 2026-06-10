@@ -760,6 +760,106 @@ def _attn_fwd_persistent_nomirror_causal(
 
 
 @triton.jit
+def _attn_fwd_persistent_balanced_causal(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """Persistent causal FA with **constant-cost fold bundling** — as general as
+    the no-mirror persistent kernel, as fast as static mirror.
+
+    This generalizes mirror pairing rather than hardcoding it. The lesson from
+    the snake / no-mirror experiments: per-program *total* balance is necessary
+    but NOT sufficient. If a program runs all its heavy tiles first and its light
+    tiles last, the kernel ends in an overhead-bound "all-light" tail (full
+    prologue/epilogue per tile for only 1-4 K-blocks) and MFMA utilisation sags
+    over time. Equivalently: **constant work *per iteration*** is what static
+    mirror buys, and that requires bundling a heavy tile with a light one.
+
+    So we bundle by cost: each iteration processes the heaviest-remaining and
+    lightest-remaining m-tile **together** (`p` and `NUM_M_BLOCKS-1-p`), so every
+    iteration costs ≈ `NUM_M_BLOCKS+1` K-blocks and fixed overheads stay
+    amortised throughout — no light tail, uniform utilisation. This is a *fold*
+    of the cost-sorted tile list; for the linear causal cost it reduces to the
+    mirror pairing, but the construction only needs a monotone cost (a
+    greedy-bundle — accumulate light tiles until the bundle hits the target cost
+    — generalises it to arbitrary/non-linear profiles, which the *fixed* mirror
+    `p<->N-1-p` rule cannot handle).
+
+    Persistent + XCD-grouped (heads pinned to XCDs for L2). Bundles are flattened
+    `(head_on_xcd, fold-pair)` and strided across the NUM_LOCAL programs of the
+    XCD; because every bundle is constant-cost, plain round-robin striding
+    balances — no snake/averaging needed.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    num_pairs = (NUM_M_BLOCKS + 1) // 2
+    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = heads_per_xcd * num_pairs
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+        local_head = unit // num_pairs
+        p = unit - local_head * num_pairs
+        pid_hz = xcd + local_head * NUM_XCDS
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            q_off = off_z * stride_qz + off_h * stride_qh
+            k_off = off_z * stride_kz + off_h * stride_kh
+            v_off = off_z * stride_vz + off_h * stride_vh
+            o_off = off_z * stride_oz + off_h * stride_oh
+
+            # Constant-cost bundle: light tile p + heavy tile NUM_M_BLOCKS-1-p.
+            _attn_causal_tile(p, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
+                              stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                              QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+            p_mirror = NUM_M_BLOCKS - 1 - p
+            if p_mirror > p:
+                _attn_causal_tile(p_mirror, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm,
+                                  stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                                  QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+
+
+@triton.jit
 def _attn_fwd_dynamic_causal(
     Q,
     K,
@@ -1140,6 +1240,70 @@ def flash_attn_async_prefetch_persistent_nomirror_causal(q, k, v, sm_scale, caus
     return o
 
 
+def flash_attn_async_prefetch_persistent_balanced_causal(q, k, v, sm_scale, causal=False, **kw):
+    """Persistent causal FA with constant-cost fold bundling.
+
+    As general as the no-mirror persistent kernel (persistent, cost-driven; the
+    bundling generalises to any monotone cost via greedy-bundle), and as fast as
+    the static mirror kernel.
+    """
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    if N_CTX % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                                num_warps=num_warps, **kw)
+
+    o = torch.empty_like(q)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    grid = (num_sms, )
+    _attn_fwd_persistent_balanced_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        NUM_SMS=num_sms,
+        NUM_XCDS=num_xcds,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
 def flash_attn_async_prefetch_dynamic_causal(q, k, v, sm_scale, causal=False, **kw):
     """Dynamic FCFS causal FA via per-XCD atomic work queues."""
     if not causal:
@@ -1219,6 +1383,7 @@ KERNEL_REGISTRY = {
     "async_prefetch_causal": flash_attn_async_prefetch_causal,
     "async_prefetch_persistent_causal": flash_attn_async_prefetch_persistent_causal,
     "async_prefetch_persistent_nomirror_causal": flash_attn_async_prefetch_persistent_nomirror_causal,
+    "async_prefetch_persistent_balanced_causal": flash_attn_async_prefetch_persistent_balanced_causal,
     "async_prefetch_dynamic_causal": flash_attn_async_prefetch_dynamic_causal,
 }
 

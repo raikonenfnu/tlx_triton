@@ -36,6 +36,7 @@ to the non-causal `async_prefetch` for every mode.
 | `async_prefetch_causal` | `flash_attn_async_prefetch_causal` | `_attn_fwd_async_prefetch_causal` | Peeled mask + **static mirror-pair** balance + XCD L2 remap | **default / champion (D=128)** |
 | `async_prefetch_persistent_causal` | `flash_attn_async_prefetch_persistent_causal` | `_attn_fwd_persistent_causal` | Persistent, XCD-grouped, mirror-balanced | champion (D=64) |
 | `async_prefetch_persistent_nomirror_causal` | `flash_attn_async_prefetch_persistent_nomirror_causal` | `_attn_fwd_persistent_nomirror_causal` | Persistent, no pairing, m-major + heavy-first | experiment (worse) |
+| `async_prefetch_persistent_balanced_causal` | `flash_attn_async_prefetch_persistent_balanced_causal` | `_attn_fwd_persistent_balanced_causal` | Persistent, **constant-cost fold bundling** (generalized mirror) | general + matches mirror |
 | `async_prefetch_dynamic_causal` | `flash_attn_async_prefetch_dynamic_causal` | `_attn_fwd_dynamic_causal` | FCFS dynamic work-stealing via per-XCD atomic queue | experiment (worse) |
 
 ### Per-mode run / repro
@@ -59,6 +60,9 @@ $BENCH async_prefetch_persistent_causal
 
 # No-mirror persistent (m-major, heavy-first)
 $BENCH async_prefetch_persistent_nomirror_causal
+
+# Constant-cost fold bundling (general + matches mirror)
+$BENCH async_prefetch_persistent_balanced_causal
 
 # FCFS dynamic work-stealing (per-XCD atomic queue)
 $BENCH async_prefetch_dynamic_causal
@@ -350,10 +354,70 @@ already balances perfectly and dynamic only adds contention + locality cost.
 Mirror stays the champion. (Kept the kernel in the registry for the
 irregular-shape case and as a reference.)
 
+## Step 10 — General + mirror-fast: constant-cost fold bundling  (landed)
+
+Goal: a scheme **as general as the no-mirror persistent kernel** (persistent,
+no hardcoded `p<->N-1-p` pairing) but **as fast as static mirror**. New kernel
+`async_prefetch_persistent_balanced_causal` (`_attn_fwd_persistent_balanced_causal`).
+
+The investigation pinned down *why* the general schemes lagged, and the answer
+generalizes mirror cleanly:
+
+1. **Snake (boustrophedon) balancing** — pairing-free. The no-mirror kernel gives
+   each program a fixed round-robin residue; since tile cost is monotone in the
+   flattened index, that residue is a systematic load bias. Walking the work list
+   in a snake (even rounds 0..P-1, odd rounds reversed) makes each program's
+   *total* work symmetric about the mean — provably balanced to within one tile
+   (verified: per-program block sums are identical). Result: 670/696/783/771 —
+   recovers most of the no-mirror gap but still **2–10% behind mirror**.
+
+2. **Why snake still loses (the key insight)**: per-program *total* balance is
+   necessary but **not sufficient**. Snake makes every program do its heavy
+   tiles early and light tiles late, so the kernel ends in an overhead-bound
+   "all-light" tail — full prologue/epilogue per tile for only 1–4 K-blocks, MFMA
+   utilisation sagging over time. Worst where the tail is longest (D128 N=16k,
+   num_m=64 → -10%). What static mirror really buys is **constant work *per
+   iteration*** (light `p` + heavy `N-1-p` = `num_m+1` blocks every step), which
+   keeps fixed overheads amortised throughout. Constant-cost-per-iteration ⟺
+   bundling a heavy tile with a light one ⟺ pairing. So a *strictly* pairing-free
+   scheme cannot fully match mirror — the few-% gap is intrinsic.
+
+   (Head-pinning each program to one head for L2 locality was also tried and did
+   *not* help — slightly worse than spreading heads, since an XCD's L2 holds
+   enough and spreading gives better wave-level balance.)
+
+3. **Constant-cost fold bundling** — the generalization that wins. Each iteration
+   processes the heaviest-remaining and lightest-remaining m-tile *together*
+   (`p` and `num_m-1-p`), so every iteration costs ≈ `num_m+1` K-blocks: no light
+   tail, uniform utilisation. This is a *fold* of the cost-sorted tile list; for
+   the linear causal cost it reduces to the mirror pairing, but the construction
+   only needs a *monotone* cost — a greedy-bundle (accumulate light tiles until a
+   bundle hits the target cost) extends it to arbitrary/non-linear profiles that
+   the fixed `p<->N-1-p` rule cannot express. Persistent + XCD-grouped, bundles
+   flattened `(head, fold-pair)` and strided across programs.
+
+| Config | mirror static | snake (pairing-free) | fold bundling | 
+|---|---|---|---|
+| D=64,  8k  | 685 | 670 | 699 |
+| D=64,  16k | 726 | 696 | 747 |
+| D=128, 8k  | 802 | 783 | 790 |
+| D=128, 16k | 851 | 771 | 850 |
+
+Conclusion: **constant-cost bundling is the general principle behind mirror.**
+The fold kernel matches static/persistent mirror across the board while being
+expressed as a general cost-driven bundling (persistent, any monotone cost) —
+strictly more general than the hardcoded static-mirror rule. It is in fact
+structurally equivalent to `async_prefetch_persistent_causal` (for causal,
+fold == mirror pairing), which confirms the persistent-mirror kernel was already
+the right general+fast answer; this kernel just states the principle explicitly.
+The pairing-free snake remains the best *strictly* pairing-free option but is
+intrinsically a few % short. All 12 correctness cases pass.
+
 ## Future work
 
 - Finer-grained diagonal tiling (split the diagonal block into a half-size
   sub-tile) could recover the last few % but adds complexity/branches.
+- Greedy-bundle (vs the linear fold) for non-linear/irregular cost profiles.
 - Fix the compiler `iota_range` crash for the modulo decode at GRID_M==1
   upstream so the constexpr special-case isn't needed.
 - Re-tune num_warps/waves_per_eu now that scheduling is balanced.
