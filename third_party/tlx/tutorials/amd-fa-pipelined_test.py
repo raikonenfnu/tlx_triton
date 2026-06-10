@@ -948,6 +948,202 @@ def _attn_fwd_persistent_partition_causal(
 
 
 @triton.jit
+def _find_group_pingpong(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    """Map a within-head stream offset `x` to the causal output tile that owns it.
+
+    Tiles are laid out in ping-pong (mirror) order — 0, N-1, 1, N-2, … — and tile
+    `q` spans `(q+1)*MASKED_BLOCKS` K-blocks. Returns (q_block_idx, task_size,
+    cumulative_blocks_before_tile)."""
+    i = tl.arange(0, num_m_blocks)
+    pair_idx = i // 2
+    q_block_idx = tl.where(i % 2 == 0, pair_idx, num_m_blocks - 1 - pair_idx)
+    task_size = (q_block_idx + 1) * MASKED_BLOCKS
+    cumulative = tl.cumsum(task_size) - task_size
+    mask = cumulative + task_size > x
+    one_hot = mask & (tl.cumsum(mask.to(tl.int32)) == 1)
+    fq = tl.sum(q_block_idx * one_hot)
+    fts = tl.sum(task_size * one_hot)
+    ftb = tl.sum(cumulative * one_hot)
+    return fq, fts, ftb
+
+
+@triton.jit
+def _attn_fwd_streamk_causal(
+    Q,
+    K,
+    V,
+    Out,
+    Mp,
+    Lp,
+    Op,
+    locks,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    stride_opp,
+    stride_opm,
+    stride_opn,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    MASKED_BLOCKS: tl.constexpr,
+    TILES_PER_HEAD: tl.constexpr,
+    HEADS_PER_XCD: tl.constexpr,
+    TOTAL_PROGRAMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+):
+    """StreamK / Lean-style causal FA: split the work at K-block granularity.
+
+    All of an XCD's causal K-block work is flattened into one 1-D stream and cut
+    into equal-length contiguous slices, one per resident program — perfect load
+    balance to within one K-block, regardless of how few output tiles there are.
+    This is the regime mirror/fold cannot help (decode / short-seq / small grid:
+    ≤1 tile per head, nothing to bundle): here every CU still gets work.
+
+    A program may own a *partial* output tile, so it keeps partial online-softmax
+    state (m, l, acc). Non-"host" programs write their partial to scratch
+    (Mp/Lp/Op) and raise a lock; the "host" program (owns a tile's first K-block)
+    spins on those locks and merges the partials with the standard
+    max-rescale-by-exp2 reduction before writing the final output.
+
+    Requires all TOTAL_PROGRAMS to be co-resident (<= #CUs) or the host spin-wait
+    can deadlock. Heads are pinned to XCDs (HEADS_PER_XCD each) for L2 locality.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+    pid = tl.program_id(0)
+    current_pid = _remap_xcd(pid, TOTAL_PROGRAMS, NUM_XCDS)
+    pids_per_xcd: tl.constexpr = TOTAL_PROGRAMS // NUM_XCDS
+    xcd_pid = current_pid % pids_per_xcd
+    xcd_id = current_pid // pids_per_xcd
+
+    total_tiles_xcd: tl.constexpr = TILES_PER_HEAD * HEADS_PER_XCD
+    max_tiles_per_wg: tl.constexpr = (total_tiles_xcd + pids_per_xcd - 1) // pids_per_xcd
+    high_load_wgs: tl.constexpr = total_tiles_xcd - (max_tiles_per_wg - 1) * pids_per_xcd
+
+    if xcd_pid < high_load_wgs:
+        iter = max_tiles_per_wg * xcd_pid
+        cta_end = iter + max_tiles_per_wg
+    else:
+        iter = (max_tiles_per_wg - 1) * (xcd_pid - high_load_wgs) + high_load_wgs * max_tiles_per_wg
+        cta_end = iter + (max_tiles_per_wg - 1)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    while iter < cta_end:
+        tile_head_idx = iter // TILES_PER_HEAD
+        x = iter - tile_head_idx * TILES_PER_HEAD
+        q_block, task_size, cum_before = _find_group_pingpong(x, MASKED_BLOCKS, NUM_M_BLOCKS)
+        tile_iter = tile_head_idx * TILES_PER_HEAD + cum_before
+        tile_iter_end = tile_iter + task_size
+        local_iter = iter - tile_iter
+        local_iter_end = tl.minimum(tile_iter_end, cta_end) - tile_iter
+
+        host_block = iter == tile_iter
+        finishing_block = cta_end >= tile_iter_end
+
+        hz = xcd_id * HEADS_PER_XCD + tile_head_idx
+        off_z = hz // H
+        off_h = hz % H
+        q_base = off_z * stride_qz + off_h * stride_qh
+        k_base = off_z * stride_kz + off_h * stride_kh
+        v_base = off_z * stride_vz + off_h * stride_vh
+
+        q_start_m = q_block * BLOCK_M
+        q_ptrs = Q + q_base + (q_start_m + offs_m)[:, None] * stride_qm + offs_k[None, :] * stride_qk
+        q = tl.load(q_ptrs)
+
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        for kb in range(local_iter, local_iter_end):
+            k_start_n = kb * BLOCK_N
+            k_ptrs = K + k_base + offs_k[:, None] * stride_kk + (k_start_n + offs_n)[None, :] * stride_kn
+            v_ptrs = V + v_base + (k_start_n + offs_n)[:, None] * stride_vn + offs_k[None, :] * stride_vk
+            k = tl.load(k_ptrs)
+            qk = tl.dot(q, k) * QK_SCALE
+            mask = (q_start_m + offs_m)[:, None] >= (k_start_n + offs_n)[None, :]
+            qk = tl.where(mask, qk, float("-inf"))
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            p_arg = qk - m_ij[:, None]
+            p_arg = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), p_arg)
+            p = tl.math.exp2(p_arg)
+            alpha_arg = m_i - m_ij
+            alpha_arg = tl.where(m_ij == float("-inf"), 0.0, alpha_arg)
+            alpha = tl.math.exp2(alpha_arg)
+            acc = acc * alpha[:, None]
+            v = tl.load(v_ptrs)
+            acc = tl.dot(p.to(v.dtype), v, acc=acc)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_ij
+
+        if not host_block:
+            offs_mp = current_pid * BLOCK_M + offs_m
+            tl.store(Mp + offs_mp, m_i, cache_modifier=".wt")
+            tl.store(Lp + offs_mp, l_i, cache_modifier=".wt")
+            op_ptrs = Op + current_pid * stride_opp + offs_m[:, None] * stride_opm + offs_k[None, :] * stride_opn
+            tl.store(op_ptrs, acc, cache_modifier=".wt")
+            tl.debug_barrier()
+            tl.store(locks + current_pid, 1, cache_modifier=".wt")
+        else:
+            if not finishing_block:
+                cta = xcd_pid + 1
+                while cta < pids_per_xcd:
+                    if cta < high_load_wgs:
+                        nstart = max_tiles_per_wg * cta
+                    else:
+                        nstart = (max_tiles_per_wg - 1) * (cta - high_load_wgs) + high_load_wgs * max_tiles_per_wg
+                    if nstart >= tile_iter_end:
+                        cta = pids_per_xcd                       # done collecting partials
+                    else:
+                        gpid = xcd_id * pids_per_xcd + cta
+                        while tl.load(locks + gpid, cache_modifier=".cv", volatile=True) != 1:
+                            pass
+                        offs_mp = gpid * BLOCK_M + offs_m
+                        m_cta = tl.load(Mp + offs_mp, cache_modifier=".cv")
+                        l_cta = tl.load(Lp + offs_mp, cache_modifier=".cv")
+                        op_ptrs = Op + gpid * stride_opp + offs_m[:, None] * stride_opm + offs_k[None, :] * stride_opn
+                        acc_cta = tl.load(op_ptrs, cache_modifier=".cv")
+                        m_new = tl.maximum(m_i, m_cta)
+                        a0 = tl.where(m_new == float("-inf"), 1.0, tl.math.exp2(m_i - m_new))
+                        a1 = tl.where(m_new == float("-inf"), 1.0, tl.math.exp2(m_cta - m_new))
+                        l_i = a0 * l_i + a1 * l_cta
+                        acc = acc * a0[:, None] + acc_cta * a1[:, None]
+                        m_i = m_new
+                        cta += 1
+            o_ptrs = Out + off_z * stride_oz + off_h * stride_oh + (q_start_m +
+                                                                    offs_m)[:, None] * stride_om + offs_k[None,
+                                                                                                          :] * stride_ok
+            l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+            tl.store(o_ptrs, (acc / l_safe[:, None]).to(Out.type.element_ty))
+
+        iter = iter + (local_iter_end - local_iter)
+
+
+@triton.jit
 def _attn_fwd_dynamic_causal(
     Q,
     K,
@@ -1481,6 +1677,119 @@ def flash_attn_async_prefetch_persistent_partition_causal(q, k, v, sm_scale, cau
     return o
 
 
+def flash_attn_streamk_causal(q, k, v, sm_scale, causal=False, **kw):
+    """StreamK / Lean-style causal FA: K-block-level split + partial reduction.
+
+    Targets the low-parallelism regime (decode / short sequences / small grids)
+    where there are fewer output tiles than CUs and mirror/fold has nothing to
+    balance. Falls back to the static mirror kernel for shapes it doesn't handle.
+    """
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 128)
+    BLOCK_N = kw.pop("BLOCK_N", 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    if N_CTX % BLOCK_M != 0 or N_CTX % BLOCK_N != 0 or BLOCK_M % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, num_warps=num_warps, **kw)
+
+    ZH = B * H
+    # Pick the largest XCD count (<=8) that evenly divides the head count so each
+    # XCD owns a whole number of heads (clean per-XCD stream).
+    num_xcds = kw.pop("NUM_XCDS", 0)
+    if num_xcds == 0:
+        num_xcds = 1
+        for nx in (8, 4, 2, 1):
+            if ZH % nx == 0:
+                num_xcds = nx
+                break
+    if ZH % num_xcds != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, num_warps=num_warps, **kw)
+
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    total_programs = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    masked_blocks = BLOCK_M // BLOCK_N
+    tiles_per_head = masked_blocks * num_m_blocks * (num_m_blocks + 1) // 2
+    heads_per_xcd = ZH // num_xcds
+
+    o = torch.empty_like(q)
+    Mp = torch.empty((total_programs, BLOCK_M), dtype=torch.float32, device=q.device)
+    Lp = torch.empty((total_programs, BLOCK_M), dtype=torch.float32, device=q.device)
+    Op = torch.empty((total_programs, BLOCK_M, D), dtype=torch.float32, device=q.device)
+    locks = torch.zeros((total_programs, ), dtype=torch.int32, device=q.device)
+
+    grid = (total_programs, )
+    _attn_fwd_streamk_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        Op.stride(0),
+        Op.stride(1),
+        Op.stride(2),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        MASKED_BLOCKS=masked_blocks,
+        TILES_PER_HEAD=tiles_per_head,
+        HEADS_PER_XCD=heads_per_xcd,
+        TOTAL_PROGRAMS=total_programs,
+        NUM_XCDS=num_xcds,
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
+def flash_attn_causal_auto(q, k, v, sm_scale, causal=False, **kw):
+    """Auto-dispatch: StreamK for low-parallelism, static mirror otherwise.
+
+    A causal launch produces ~ B*H*ceil(N/BLOCK_M) output tiles. When that is
+    smaller than the CU count the machine is under-occupied (< 1 wave) and
+    whole-tile schedulers (mirror/fold) leave CUs idle — StreamK's K-block split
+    fills them (up to ~2x here). With abundant tiles, mirror's larger BLOCK_M and
+    no-reduction path win, so we use it.
+    """
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+    B, H, N_CTX, D = q.shape
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    est_tiles = B * H * triton.cdiv(N_CTX, 256)
+    if est_tiles < cu_count:          # < ~1 wave of work -> StreamK
+        return flash_attn_streamk_causal(q, k, v, sm_scale, causal=True, **kw)
+    return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, **kw)
+
+
 def flash_attn_async_prefetch_dynamic_causal(q, k, v, sm_scale, causal=False, **kw):
     """Dynamic FCFS causal FA via per-XCD atomic work queues."""
     if not causal:
@@ -1563,6 +1872,8 @@ KERNEL_REGISTRY = {
     "async_prefetch_persistent_balanced_causal": flash_attn_async_prefetch_persistent_balanced_causal,
     "async_prefetch_persistent_partition_causal": flash_attn_async_prefetch_persistent_partition_causal,
     "async_prefetch_dynamic_causal": flash_attn_async_prefetch_dynamic_causal,
+    "streamk_causal": flash_attn_streamk_causal,
+    "causal_auto": flash_attn_causal_auto,
 }
 
 

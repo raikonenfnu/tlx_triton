@@ -39,6 +39,8 @@ to the non-causal `async_prefetch` for every mode.
 | `async_prefetch_persistent_balanced_causal` | `flash_attn_async_prefetch_persistent_balanced_causal` | `_attn_fwd_persistent_balanced_causal` | Persistent, **constant-cost fold bundling** (generalized mirror) | general + matches mirror |
 | `async_prefetch_persistent_partition_causal` | `flash_attn_async_prefetch_persistent_partition_causal` | `_attn_fwd_persistent_partition_causal` | Persistent, **cumulative-cost partition** (no bundling, variable tiles/program) | general but ~12–19% slower |
 | `async_prefetch_dynamic_causal` | `flash_attn_async_prefetch_dynamic_causal` | `_attn_fwd_dynamic_causal` | FCFS dynamic work-stealing via per-XCD atomic queue | experiment (worse) |
+| `streamk_causal` | `flash_attn_streamk_causal` | `_attn_fwd_streamk_causal` | **StreamK** K-block split + partial-softmax reduction | wins low-parallelism (≤1 wave) |
+| `causal_auto` | `flash_attn_causal_auto` | (dispatch) | Auto-pick StreamK (low-parallelism) vs mirror (else) | **best across regimes** |
 
 ### Per-mode run / repro
 
@@ -67,6 +69,12 @@ $BENCH async_prefetch_persistent_balanced_causal
 
 # Cumulative-cost partition (no bundling; general but slower)
 $BENCH async_prefetch_persistent_partition_causal
+
+# StreamK split + reduction (use a low-parallelism shape: few heads / short N)
+python third_party/tlx/tutorials/amd-fa-pipelined_test.py -b 1 -hq 8 -sq 1024 2048 4096 -d 128 -causal true --kernel streamk_causal async_prefetch_causal
+
+# Auto-dispatch (best across regimes)
+$BENCH causal_auto
 
 # FCFS dynamic work-stealing (per-XCD atomic queue)
 $BENCH async_prefetch_dynamic_causal
@@ -508,10 +516,57 @@ regime (decode / short-seq / small grid), keeping mirror/fold for large prefill;
 it needs the partial-state reduction (scratch buffers + locks + `.wt`/`.cv`
 cache modifiers + `debug_barrier`) and NaN-safe masking for split tiles.
 
+## Step 13 — StreamK split + auto-dispatch  (landed)
+
+Implemented the Step 12 plan: a StreamK causal kernel
+`streamk_causal` (`_attn_fwd_streamk_causal`) plus an occupancy-based
+auto-dispatcher `causal_auto`.
+
+Design (plain Triton, not TLX async — like aiter's lean_atten):
+- Flatten an XCD's causal K-block work into a 1-D stream (`tiles_per_head =
+  MASKED_BLOCKS·num_m(num_m+1)/2`, ping-pong tile order via
+  `_find_group_pingpong`) and cut it into equal contiguous slices, one per
+  resident program (`max_tiles_per_wg` / `high_load_wgs`) — balanced to ±1
+  K-block.
+- A program may own a *partial* tile → keeps partial `(m,l,acc)`; non-host
+  programs write `Mp/Lp/Op` + raise a `lock` (`.wt` stores + `debug_barrier`),
+  the host program (owns a tile's first K-block) spins on locks (`.cv` volatile
+  loads) and merges partials with the max-rescale-by-exp2 reduction. NaN-safe
+  masking (Step 12) for partials that see only masked K-blocks.
+- Heads pinned to XCDs (`HEADS_PER_XCD`) via `_remap_xcd` for L2 locality.
+- **Deadlock constraint**: TOTAL_PROGRAMS must be co-resident (≤ #CUs), else the
+  host spin-wait hangs. Launch `(cu//NUM_XCDS)·NUM_XCDS` programs.
+- Bounded loops only (`while iter < cta_end`, plain Triton supports it here;
+  TLX's async-only `scf.for` limitation from Step 9 doesn't apply — no tlx).
+
+Results (D=128, causal):
+| Config | mirror | StreamK | auto picks |
+|---|---|---|---|
+| H=8,  N=512   | 12.0 | **16.2** | StreamK (+35%) |
+| H=8,  N=1024  | 34.7 | **57.1** | StreamK (+65%) |
+| H=8,  N=2048  | 94.3 | **187.1**| StreamK (+98%) |
+| H=8,  N=4096  | 227.7| **401.7**| StreamK (+76%) |
+| H=8,  N=16384 | **854** | 595 | mirror |
+| H=64, N=2048  | **578** | 449 | mirror |
+| H=64, N=8192  | **801** | 526 | mirror |
+| H=64, N=16384 | **856** | 499 | mirror |
+
+Clear complementary split: **StreamK wins up to ~2× when output tiles < CUs**
+(decode / short-seq / few heads — exactly where whole-tile mirror/fold leaves
+CUs idle); **mirror wins ~1.6× with abundant tile parallelism** (bigger BLOCK_M,
+no reduction traffic, no lock spins). The auto-dispatcher (`est_tiles = B·H·
+ceil(N/256) < #CUs → StreamK`) picked the winner in every benchmarked config.
+All correctness cases pass (streamk + auto, 12/12 each).
+
+Caveats / scope: causal MHA, non-ragged, `N % BLOCK_M == 0` and
+`B*H % NUM_XCDS == 0` (else both fall back to mirror); GQA / ragged batch / true
+decode (BLOCK_M=1) not wired up (aiter's kernel covers those).
+
 ## Future work
 
-- StreamK / Lean-style K-block splitting + partial-softmax reduction for the
-  low-parallelism (decode / short-seq / small-grid) regime (see Step 12).
+- Extend StreamK to GQA, ragged batch, and true single-token decode (BLOCK_M=1).
+- Tune the `causal_auto` threshold (currently 1 wave) per arch; sweep the
+  StreamK/mirror crossover.
 - Finer-grained diagonal tiling (split the diagonal block into a half-size
   sub-tile) could recover the last few % but adds complexity/branches.
 - Greedy-bundle (vs the linear fold) for non-linear/irregular cost profiles.
