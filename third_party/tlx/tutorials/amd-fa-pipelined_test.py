@@ -860,6 +860,94 @@ def _attn_fwd_persistent_balanced_causal(
 
 
 @triton.jit
+def _attn_fwd_persistent_partition_causal(
+    Q,
+    K,
+    V,
+    Out,
+    Bounds,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """Persistent causal FA with **cumulative-cost partitioning** — NO bundling,
+    no fixed tiles-per-program. The general, simple alternative to mirror.
+
+    Mirror hardcodes "exactly 2 tiles/program". Here we instead lay out all of an
+    XCD's tiles in cost order (heaviest first: `t = (NUM_M_BLOCKS-1-m)*heads +
+    head`) and cut that 1-D list into NUM_LOCAL contiguous chunks of ≈ equal
+    cumulative cost. Each program runs one chunk `[lo, hi)`: heavy programs get a
+    few expensive tiles, light programs get many cheap ones. Boundaries are
+    precomputed on the host (`Bounds`) from the analytic cost `cost(m)=(m+1)+
+    ALPHA` (ALPHA folds in per-tile overhead so tile *count* balances too). The
+    host cost model can be anything (non-linear/empirical), so this generalises
+    well beyond the linear causal case.
+
+    Spread (not head-pinned) for finer granularity — NUM_LOCAL chunks over the
+    whole per-XCD list — and because chunks are cost-contiguous, heavy and light
+    chunks run *concurrently* and finish together, with no global "all-light"
+    tail (the snake's weakness).
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    lo = tl.load(Bounds + local)
+    hi = tl.load(Bounds + local + 1)
+    for t in tl.range(lo, hi, 1, num_stages=0):
+        m_rank = t // heads_per_xcd            # cost-major (heaviest first)
+        local_head = t - m_rank * heads_per_xcd
+        pid_m = NUM_M_BLOCKS - 1 - m_rank
+        pid_hz = xcd + local_head * NUM_XCDS
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            q_off = off_z * stride_qz + off_h * stride_qh
+            k_off = off_z * stride_kz + off_h * stride_kh
+            v_off = off_z * stride_vz + off_h * stride_vh
+            o_off = off_z * stride_oz + off_h * stride_oh
+
+            _attn_causal_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
+                              stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                              QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+
+
+@triton.jit
 def _attn_fwd_dynamic_causal(
     Q,
     K,
@@ -1304,6 +1392,95 @@ def flash_attn_async_prefetch_persistent_balanced_causal(q, k, v, sm_scale, caus
     return o
 
 
+def _cumulative_cost_bounds(num_m, heads_per_xcd, num_programs, alpha=0.5):
+    """Partition an XCD's tile list (cost-major: heaviest m first, `heads_per_xcd`
+    tiles per m-level) into `num_programs` contiguous chunks of equal cumulative
+    cost. cost = (m+1) K-blocks + alpha (per-tile fixed overhead). Returns an
+    int32 list of length num_programs+1 (chunk boundaries into the flat list)."""
+    total_tiles = heads_per_xcd * num_m
+    # Flat index t -> m_rank = t // heads_per_xcd (0 = heaviest), pid_m = num_m-1-m_rank.
+    costs = [(num_m - (t // heads_per_xcd)) + alpha for t in range(total_tiles)]
+    total = sum(costs)
+    bounds = [0] * (num_programs + 1)
+    bounds[num_programs] = total_tiles
+    csum = 0.0
+    i = 1
+    for t in range(total_tiles):
+        csum += costs[t]
+        while i < num_programs and csum >= (total * i) / num_programs:
+            bounds[i] = t + 1
+            i += 1
+    while i < num_programs:                    # if rounding left trailing bounds
+        bounds[i] = total_tiles
+        i += 1
+    return bounds
+
+
+def flash_attn_async_prefetch_persistent_partition_causal(q, k, v, sm_scale, causal=False, **kw):
+    """Persistent causal FA via cumulative-cost partitioning (no bundling)."""
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+    alpha = kw.pop("ALPHA", 0.5)
+
+    if N_CTX % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                                num_warps=num_warps, **kw)
+
+    o = torch.empty_like(q)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    num_local = num_sms // num_xcds
+    heads_per_xcd = (B * H + num_xcds - 1) // num_xcds
+    bounds = _cumulative_cost_bounds(num_m_blocks, heads_per_xcd, num_local, alpha=alpha)
+    bounds_t = torch.tensor(bounds, dtype=torch.int32, device=q.device)
+    grid = (num_sms, )
+    _attn_fwd_persistent_partition_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        bounds_t,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        NUM_SMS=num_sms,
+        NUM_XCDS=num_xcds,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
 def flash_attn_async_prefetch_dynamic_causal(q, k, v, sm_scale, causal=False, **kw):
     """Dynamic FCFS causal FA via per-XCD atomic work queues."""
     if not causal:
@@ -1384,6 +1561,7 @@ KERNEL_REGISTRY = {
     "async_prefetch_persistent_causal": flash_attn_async_prefetch_persistent_causal,
     "async_prefetch_persistent_nomirror_causal": flash_attn_async_prefetch_persistent_nomirror_causal,
     "async_prefetch_persistent_balanced_causal": flash_attn_async_prefetch_persistent_balanced_causal,
+    "async_prefetch_persistent_partition_causal": flash_attn_async_prefetch_persistent_partition_causal,
     "async_prefetch_dynamic_causal": flash_attn_async_prefetch_dynamic_causal,
 }
 

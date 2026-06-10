@@ -37,6 +37,7 @@ to the non-causal `async_prefetch` for every mode.
 | `async_prefetch_persistent_causal` | `flash_attn_async_prefetch_persistent_causal` | `_attn_fwd_persistent_causal` | Persistent, XCD-grouped, mirror-balanced | champion (D=64) |
 | `async_prefetch_persistent_nomirror_causal` | `flash_attn_async_prefetch_persistent_nomirror_causal` | `_attn_fwd_persistent_nomirror_causal` | Persistent, no pairing, m-major + heavy-first | experiment (worse) |
 | `async_prefetch_persistent_balanced_causal` | `flash_attn_async_prefetch_persistent_balanced_causal` | `_attn_fwd_persistent_balanced_causal` | Persistent, **constant-cost fold bundling** (generalized mirror) | general + matches mirror |
+| `async_prefetch_persistent_partition_causal` | `flash_attn_async_prefetch_persistent_partition_causal` | `_attn_fwd_persistent_partition_causal` | Persistent, **cumulative-cost partition** (no bundling, variable tiles/program) | general but ~12–19% slower |
 | `async_prefetch_dynamic_causal` | `flash_attn_async_prefetch_dynamic_causal` | `_attn_fwd_dynamic_causal` | FCFS dynamic work-stealing via per-XCD atomic queue | experiment (worse) |
 
 ### Per-mode run / repro
@@ -63,6 +64,9 @@ $BENCH async_prefetch_persistent_nomirror_causal
 
 # Constant-cost fold bundling (general + matches mirror)
 $BENCH async_prefetch_persistent_balanced_causal
+
+# Cumulative-cost partition (no bundling; general but slower)
+$BENCH async_prefetch_persistent_partition_causal
 
 # FCFS dynamic work-stealing (per-XCD atomic queue)
 $BENCH async_prefetch_dynamic_causal
@@ -412,6 +416,45 @@ fold == mirror pairing), which confirms the persistent-mirror kernel was already
 the right general+fast answer; this kernel just states the principle explicitly.
 The pairing-free snake remains the best *strictly* pairing-free option but is
 intrinsically a few % short. All 12 correctness cases pass.
+
+## Step 11 — Is mirror "hardcoded"? Cumulative-cost partition (no bundling)  (experiment, worse)
+
+Mirror/fold bundles tiles in pairs ("exactly 2/program"). Is there something
+*more general and simpler* that drops bundling entirely? New kernel
+`async_prefetch_persistent_partition_causal` (`_attn_fwd_persistent_partition_causal`):
+lay out an XCD's tiles in cost order and cut that 1-D list into NUM_LOCAL
+contiguous chunks of **equal cumulative cost** — light programs get many cheap
+m-rows, heavy programs get few expensive ones. Boundaries are precomputed on the
+host from `cost(m) = (m+1) + ALPHA` (any cost model works → fully general); no
+pairing, no fixed tiles/program, and heavy & light chunks run concurrently so
+there's no global light tail.
+
+| Config | mirror | partition (best ALPHA) |
+|---|---|---|
+| D=64,  8k  | 672 | 592  (-12%) |
+| D=128, 16k | 852 | 693  (-19%) |
+
+Swept ALPHA ∈ {0..16} and tried both head-pinned and head-spread layouts — none
+got within ~12%. The reason is fundamental and is the real answer to "isn't
+mirror hardcoded?":
+
+**A program's runtime ≈ (K-block compute) + (per-tile fixed overhead × tile
+count) — two independent cost dimensions.** To equalize makespan you must
+equalize *both* the K-block sum *and* the tile count across programs. A
+contiguous cumulative partition only equalizes one weighted combination
+(`blocks + ALPHA·count`): for a triangular profile, heavy programs unavoidably
+get few tiles and light programs many, and a single ALPHA knob cannot flatten
+both dimensions at once (small ALPHA balances blocks but light programs drown in
+per-tile overhead; large ALPHA balances count but heavy programs do too much
+compute).
+
+**Bundling a heavy tile with a light tile is the unique simple construction that
+makes every unit identical in BOTH dimensions simultaneously** (constant count =
+2, constant blocks = num_m+1), so both balance for free. So mirror's "exactly 2"
+is not arbitrary — it is the *minimal constant-cost bundle*, and constant-cost
+bundling (Step 10, greedy-bundle for arbitrary costs) is the principled general
+form. The bundling is the point, not an artifact. Kept the partition kernel as a
+documented negative result. All 12 correctness cases pass.
 
 ## Future work
 
