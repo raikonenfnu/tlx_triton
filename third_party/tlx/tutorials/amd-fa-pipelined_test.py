@@ -589,6 +589,266 @@ def _attn_fwd_async_prefetch_causal(
                           EVEN_N=EVEN_N)
 
 
+@triton.jit
+def _attn_fwd_persistent_causal(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    GRID_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """Persistent causal FA — XCD-grouped + mirror-balanced.
+
+    Launches exactly NUM_SMS resident programs. The HW pins program `pid` to
+    XCD `pid % NUM_XCDS`, so we assign head `hz` to XCD `hz % NUM_XCDS`: every
+    program loops over the heads owned by its XCD (`for hz in range(xcd, Z*H,
+    NUM_XCDS)`), keeping each head's K/V resident in that XCD's L2 slice.
+
+    Within an XCD the `NUM_LOCAL = NUM_SMS//NUM_XCDS` local programs split the
+    head's m-tiles by *mirror pair* (`p` and `NUM_M_BLOCKS-1-p`) so each unit
+    is balanced (combined ~NUM_M_BLOCKS+1 K-blocks), eliminating the causal
+    tail imbalance. Q/K/V LDS buffers are allocated once and reused across all
+    tiles a program processes.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    # Flatten (head_on_xcd, mirror_pair) work units and stride across the
+    # NUM_LOCAL programs of this XCD, so every program stays busy even when
+    # GRID_M < NUM_LOCAL (e.g. N=8192). heads_per_xcd rounds up; guard hz range.
+    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = heads_per_xcd * GRID_M
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+        local_head = unit // GRID_M
+        p = unit - local_head * GRID_M
+        pid_hz = xcd + local_head * NUM_XCDS
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            q_off = off_z * stride_qz + off_h * stride_qh
+            k_off = off_z * stride_kz + off_h * stride_kh
+            v_off = off_z * stride_vz + off_h * stride_vh
+            o_off = off_z * stride_oz + off_h * stride_oh
+
+            _attn_causal_tile(p, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
+                              stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                              QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+            p_mirror = NUM_M_BLOCKS - 1 - p
+            if p_mirror > p:
+                _attn_causal_tile(p_mirror, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm,
+                                  stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                                  QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+
+
+@triton.jit
+def _attn_fwd_persistent_nomirror_causal(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    REVERSE: tl.constexpr,
+):
+    """Persistent causal FA WITHOUT mirror pairing — balance by averaging only.
+
+    Same XCD-grouping as the mirror version (heads pinned to XCDs for L2), but
+    each work unit is a *single* m-tile, not a balanced pair. To still balance,
+    tiles are flattened **m-major** (`unit = m*heads_per_xcd + local_head`) so a
+    program's round-robin set `{local, local+NUM_LOCAL, ...}` spreads its
+    m-values across the full 0..NUM_M_BLOCKS range (step NUM_LOCAL//heads_per_xcd)
+    rather than locking onto a fixed light/heavy band. This relies purely on the
+    law-of-large-numbers averaging — no explicit pairing. Experiment to compare
+    against the mirror-balanced persistent kernel.
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = heads_per_xcd * NUM_M_BLOCKS
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+        m_idx = unit // heads_per_xcd          # m-major: slow index
+        local_head = unit - m_idx * heads_per_xcd
+        # REVERSE: schedule heaviest (bottom-of-mask) m-tiles first.
+        pid_m = (NUM_M_BLOCKS - 1 - m_idx) if REVERSE else m_idx
+        pid_hz = xcd + local_head * NUM_XCDS
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            q_off = off_z * stride_qz + off_h * stride_qh
+            k_off = off_z * stride_kz + off_h * stride_kh
+            v_off = off_z * stride_vz + off_h * stride_vh
+            o_off = off_z * stride_oz + off_h * stride_oh
+
+            _attn_causal_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
+                              stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                              QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+
+
+@triton.jit
+def _attn_fwd_dynamic_causal(
+    Q,
+    K,
+    V,
+    Out,
+    Counter,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    ITERS_CAP: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """Dynamic (first-come-first-serve) causal FA via per-XCD atomic queues.
+
+    Instead of a fixed tile->workgroup mapping, each program repeatedly grabs
+    the next available tile from its XCD's work queue with an atomic counter:
+    a program that drew a heavy tile finishes later and pulls fewer subsequent
+    tiles, so load balances dynamically — the tail shrinks to ≤1 tile, no mirror
+    pairing needed.
+
+    L2 locality is preserved by keeping *one queue per XCD* (Counter[xcd]):
+    head `hz` is owned by XCD `hz % NUM_XCDS`, so a program only ever touches
+    its XCD's heads, keeping their K/V resident in that XCD's L2 slice. Tiles
+    are ordered heavy-first (bottom of causal mask) so the long tiles are
+    claimed first (LPT scheduling).
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    heads_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units_per_xcd = heads_per_xcd * NUM_M_BLOCKS
+
+    # FCFS dynamic claim, but expressed as a *bounded* tl.range (scf.for) loop
+    # rather than scf.while: TLX only lowers the async-prefetch pipeline over
+    # scf.for. Upper bound = units_per_xcd guarantees coverage (no dropped
+    # tiles); programs that have claimed their share simply spin the atomic and
+    # skip via the guard.
+    idx = tl.atomic_add(Counter + xcd, 1, sem="relaxed", scope="gpu")
+    for _ in tl.range(0, ITERS_CAP, 1, num_stages=0):
+        if idx < units_per_xcd:
+            m_idx = idx // heads_per_xcd
+            local_head = idx - m_idx * heads_per_xcd
+            pid_m = NUM_M_BLOCKS - 1 - m_idx       # heavy (bottom-of-mask) first
+            pid_hz = xcd + local_head * NUM_XCDS
+            if pid_hz < Z * H:
+                off_z = pid_hz // H
+                off_h = pid_hz % H
+                q_off = off_z * stride_qz + off_h * stride_qh
+                k_off = off_z * stride_kz + off_h * stride_kh
+                v_off = off_z * stride_vz + off_h * stride_vh
+                o_off = off_z * stride_oz + off_h * stride_oh
+
+                _attn_causal_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm, stride_qk,
+                                  stride_kn, stride_kk, stride_vn, stride_vk, stride_om, stride_ok, N_CTX,
+                                  QK_SCALE=QK_SCALE, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, EVEN_N=EVEN_N)
+            idx = tl.atomic_add(Counter + xcd, 1, sem="relaxed", scope="gpu")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Host wrapper
 # ═══════════════════════════════════════════════════════════════════════════
@@ -751,6 +1011,204 @@ def flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=False, **kw):
     return o
 
 
+def flash_attn_async_prefetch_persistent_causal(q, k, v, sm_scale, causal=False, **kw):
+    """Persistent-style causal FA (fixed NUM_SMS resident programs).
+
+    For causal=False this falls back to the generic prefetch kernel so the
+    shared correctness suite still exercises both paths.
+    """
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    # Partial-block edge cases (N not a multiple of BLOCK_N) hit a compiler
+    # iota_range crash with the persistent index decode; fall back to the
+    # robust mirror-paired kernel (these tiny shapes are not perf-critical).
+    if N_CTX % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                                num_warps=num_warps, **kw)
+
+    o = torch.empty_like(q)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    grid_m = (num_m_blocks + 1) // 2
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    # Keep NUM_SMS a multiple of NUM_XCDS so each XCD gets equal local programs.
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    grid = (num_sms, )
+    _attn_fwd_persistent_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        GRID_M=grid_m,
+        NUM_SMS=num_sms,
+        NUM_XCDS=num_xcds,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
+def flash_attn_async_prefetch_persistent_nomirror_causal(q, k, v, sm_scale, causal=False, **kw):
+    """Persistent causal FA without mirror pairing (balance by averaging only)."""
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    if N_CTX % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                                num_warps=num_warps, **kw)
+
+    o = torch.empty_like(q)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    grid = (num_sms, )
+    _attn_fwd_persistent_nomirror_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        NUM_SMS=num_sms,
+        NUM_XCDS=num_xcds,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        REVERSE=kw.pop("REVERSE", True),
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
+def flash_attn_async_prefetch_dynamic_causal(q, k, v, sm_scale, causal=False, **kw):
+    """Dynamic FCFS causal FA via per-XCD atomic work queues."""
+    if not causal:
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, **kw)
+
+    B, H, N_CTX, D = q.shape
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    if N_CTX % BLOCK_N != 0:
+        return flash_attn_async_prefetch_causal(q, k, v, sm_scale, causal=True, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                                num_warps=num_warps, **kw)
+
+    o = torch.empty_like(q)
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    # Per-XCD atomic work-queue counters (fresh zeros each launch).
+    counter = torch.zeros(num_xcds, dtype=torch.int32, device=q.device)
+    heads_per_xcd = (B * H + num_xcds - 1) // num_xcds
+    units_per_xcd = heads_per_xcd * num_m_blocks
+    programs_per_xcd = max(1, num_sms // num_xcds)
+    avg = triton.cdiv(units_per_xcd, programs_per_xcd)
+    # Generous slack (3x avg) so an unlucky/slow program can still claim extra
+    # tiles without dropping any; capped at the total queue length.
+    iters_cap = kw.pop("ITERS_CAP", min(units_per_xcd, avg * 3))
+    grid = (num_sms, )
+    _attn_fwd_dynamic_causal[grid](
+        q,
+        k,
+        v,
+        o,
+        counter,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=D,
+        NUM_M_BLOCKS=num_m_blocks,
+        NUM_XCDS=num_xcds,
+        ITERS_CAP=iters_cap,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        num_warps=num_warps,
+        **kw,
+    )
+    return o
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Kernel registry — add new kernel wrappers here
 # ═══════════════════════════════════════════════════════════════════════════
@@ -759,6 +1217,9 @@ KERNEL_REGISTRY = {
     "async_simple": flash_attn_async_simple,
     "async_prefetch": flash_attn_async_prefetch,
     "async_prefetch_causal": flash_attn_async_prefetch_causal,
+    "async_prefetch_persistent_causal": flash_attn_async_prefetch_persistent_causal,
+    "async_prefetch_persistent_nomirror_causal": flash_attn_async_prefetch_persistent_nomirror_causal,
+    "async_prefetch_dynamic_causal": flash_attn_async_prefetch_dynamic_causal,
 }
 
 
