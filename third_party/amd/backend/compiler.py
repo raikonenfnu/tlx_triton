@@ -64,6 +64,9 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = "hip"
     instrumentation_mode: str = ""
+    # Extra LLVM function attributes applied to the kernel, as a tuple of
+    # (name, value) pairs, e.g. (("amdgpu-agpr-alloc", "0,0"),) to forbid AGPRs.
+    llvm_fn_attrs: Tuple[Tuple[str, str], ...] = ()
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. The "none" variant preserves the default
@@ -507,6 +510,9 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        # User-supplied extra LLVM function attributes (e.g. amdgpu-agpr-alloc=0,0).
+        for attr_name, attr_val in options.llvm_fn_attrs:
+            fns[0].add_fn_attr(attr_name, attr_val)
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:

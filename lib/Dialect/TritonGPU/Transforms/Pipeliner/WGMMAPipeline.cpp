@@ -136,6 +136,19 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
 void mlir::triton::updateWaits(ModuleOp module) {
   llvm::SmallSetVector<ttg::AsyncWaitOp, 8> waitOps;
   module.walk([&](ttg::AsyncWaitOp waitOp) {
+    // updateWaits derives the pending count from the async-token dependency
+    // graph threaded through pipeliner-created waits (each carries the
+    // async_commit_group token and a placeholder num that we fill in here). A
+    // wait with no token operands instead carries an author-supplied count:
+    // hand-written pipelines (e.g. TLX/Gluon warp-pipeline kernels) emit
+    // `ttg.async_wait {num = N}` with no token, so there is no graph to
+    // analyze. Recomputing such a wait would only clobber the author's intent
+    // -- minNumInterleavedCommitOps returns a conservative 0, which on
+    // asyncmark targets lowers straight to wait.asyncmark(0) / vmcnt(0), a full
+    // memory drain that serializes the hand-scheduled pipeline. Leave tokenless
+    // waits untouched (and out of the redundant-wait combining below).
+    if (waitOp.getNumOperands() == 0)
+      return;
     int minNumCommits = minNumInterleavedCommitOps(waitOp);
     waitOp.setNum(minNumCommits);
     waitOps.insert(waitOp);
