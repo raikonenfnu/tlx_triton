@@ -111,12 +111,43 @@ def a16w16_8wave(
     HALF_N: tl.constexpr = BLOCK_N // 2
 
     # Four separate double-buffered LDS allocations — one per operand half-tile.
-    # Separate allocs let the membar disambiguate LR/GR buffers, so the shared
-    # layout is inferred by the compiler from how each buffer feeds tl.dot.
-    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2)
-    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2)
+    # Pin the *swizzled* padded_shared layout (row/col-permuted offset bases,
+    # identical to the Gluon reference) so the ds_reads feeding the MFMAs are
+    # bank-conflict-free. The default inferred padded layout ({order, shape})
+    # conflicts on CDNA4 (measured 50M SQ_LDS_BANK_CONFLICT vs 0 for this one).
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+        [HALF_M, BLOCK_K],
+    )
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8]],
+        [BLOCK_K, HALF_N],
+    )
+    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
+    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+
+    # 8-wave global-load (offset-tensor) distributed layouts, transcribed from the
+    # Gluon reference (gLoadLayoutA/B). These MUST be co-pinned with the swizzled
+    # shared layouts above: the direct-to-LDS buffer_load write is coalesced only
+    # when the offset tensor's #linear layout matches the swizzled LDS layout.
+    # Without them the offset tensors get a naive #blocked layout and
+    # buffer_load_to_local fails to lower (canLoadDirectToLDS).
+    a_load: tl.constexpr = tlx.distributed_linear_layout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]],
+        lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
+        warp_bases=[[1, 0], [2, 0], [4, 0]],
+        shape=[HALF_M, BLOCK_K],
+    )
+    b_load: tl.constexpr = tlx.distributed_linear_layout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [0, 8]],
+        lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
+        warp_bases=[[0, 1], [0, 2], [0, 4]],
+        shape=[BLOCK_K, HALF_N],
+    )
 
     offs_am = pid_m * BLOCK_M + tl.arange(0, HALF_M)
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
@@ -144,22 +175,22 @@ def a16w16_8wave(
     iterMax: tl.constexpr = K // BLOCK_K
 
     # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
-    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, offset_layout=b_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, offset_layout=a_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, offset_layout=a_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, offset_layout=b_load)
     tlx.async_load_commit_group()
 
-    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, offset_layout=b_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, offset_layout=a_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, offset_layout=a_load)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, offset_layout=b_load)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -177,7 +208,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, offset_layout=b_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -185,7 +216,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, offset_layout=a_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -193,7 +224,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, offset_layout=a_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -201,7 +232,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, offset_layout=b_load)
             tlx.async_load_commit_group()
 
         # --- sub-iter 1 (buffer 1, _next offsets) ---
@@ -210,7 +241,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, offset_layout=b_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -218,7 +249,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, offset_layout=a_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -226,7 +257,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, offset_layout=a_load)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -234,7 +265,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, offset_layout=b_load)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2

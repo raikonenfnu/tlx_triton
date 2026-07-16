@@ -459,6 +459,19 @@ static bool isFedByAsyncLdsProducer(Value memdesc) {
                                amdgpu::BufferLoadToLocalOp>(memdesc);
 }
 
+// True if the alloc feeding this memdesc carries a user-pinned encoding
+// (#tlx.user_layout / any PinnedEncodingTrait). Such an alloc is a hard
+// constraint: the author chose the shared layout (and matching load offsets)
+// explicitly, so this pass must not synthesize a require_layout that would
+// override it. Skipping also avoids querying getOrder / composePaddedLayout on
+// the wrapper before tlx-propagate-layout retires it.
+static bool isUserPinnedMemDesc(Value memdesc) {
+  Value root = findMemDescRoot(memdesc);
+  if (auto ty = dyn_cast<ttg::MemDescType>(root.getType()))
+    return isa_and_nonnull<ttg::PinnedEncodingTrait>(ty.getEncoding());
+  return false;
+}
+
 // True if the alloc feeding this memdesc is written by a `buffer_load_to_local`
 // (AMD direct-to-LDS buffer load).  Unlike the async-copy path, the
 // direct-to-LDS lowering cannot reorder the load source to follow a *permuted*
@@ -913,6 +926,12 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   // 3. Leave tensor/register propagation, region-branch retagging, and final
   //    convert cleanup to tlx-propagate-layout and downstream cleanup passes.
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
+    // A user-pinned shared alloc is a hard constraint (see
+    // isUserPinnedMemDesc): don't synthesize a memdesc-side require_layout that
+    // would override it.
+    if (isUserPinnedMemDesc(localLoadOp->getOperand(0)))
+      return;
+
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
     if (!lattice)

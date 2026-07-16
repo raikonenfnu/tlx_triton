@@ -107,6 +107,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    offset_layout=None,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -133,8 +134,21 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        offset_layout: Optional distributed layout to pin on the offset tensor
+            (e.g. a tlx.distributed_linear_layout) so the direct-to-LDS write
+            matches a pinned swizzled shared layout on `dest`.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    # Pin the offset tensor's distributed layout as the LAST step before the
+    # load (after any address arithmetic), so a direct-to-LDS write coalesces
+    # into a pinned swizzled shared layout. Doing it here (not on the base
+    # offsets) avoids arith encoding-mismatch on subsequent `+ k` adds.
+    offset_layout = tl._unwrap_if_constexpr(offset_layout)
+    if offset_layout is not None:
+        enc = offset_layout.to_ir(_semantic.builder, offsets.shape, offsets.dtype)
+        off_handle = _semantic.builder.create_require_layout(offsets.handle, enc, True)
+        offsets = tl.tensor(off_handle, offsets.type)
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -155,6 +169,25 @@ def buffer_load_to_local(
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
                                                            other_handle, cache_mod)
     return tlx.async_token(handle)
+
+
+@tl.builtin
+def require_layout(value, layout, pinned=True, _semantic=None):
+    """Pin a distributed (register) `layout` onto a tensor `value`.
+
+    Emits a `tlx.require_layout` that fixes the tensor's `#ttg.linear` encoding.
+    With `pinned=True` (default) the encoding is wrapped as `#tlx.user_layout`,
+    so the layout passes treat it as a hard anchor (never rewrite it) — mirroring
+    a user-pinned shared layout. Use this to co-pin the offset-tensor layout of an
+    AMD `buffer_load_to_local` so its direct-to-LDS write matches a pinned
+    swizzled shared layout.
+    """
+    builder = _semantic.builder
+    layout = tl._unwrap_if_constexpr(layout)
+    pinned = tl._unwrap_if_constexpr(pinned)
+    enc = layout.to_ir(builder, value.shape, value.dtype)
+    handle = builder.create_require_layout(value.handle, enc, pinned)
+    return tl.tensor(handle, value.type)
 
 
 @tl.builtin
