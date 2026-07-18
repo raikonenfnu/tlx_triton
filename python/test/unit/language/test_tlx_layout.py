@@ -666,6 +666,59 @@ def test_with_bases_builds_swizzled_padded_encoding():
     assert enc.shape == _A16W16_TILE
 
 
+# The B operand's tile/swizzle (tile [BLOCK_K=64, HALF_N=128]): the same
+# bit_split reorder applied to the non-contiguous (N) dim.
+_A16W16_B_TILE = [64, 128]
+_A16W16_B_OFFSET_BASES = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2],
+                          [0, 4], [0, 8]]
+
+
+def test_make_composed_layout_matches_with_bases():
+    """`tlx.make_composed_layout` (CuTe-style padding + bit_split swizzle) produces
+    a `padded_shared_layout_encoding` byte-identical to the hand-written
+    `with_bases([...13 bases...])` a16w16 layout: same intervals/paddings, same
+    offset bases, same shape -> the same `#ttg.padded_shared` lowers. Pure-Python."""
+
+    def _same(composed, expected):
+        assert composed.intervals == expected.intervals
+        assert composed.paddings == expected.paddings
+        assert composed.offset_bases == expected.offset_bases
+        assert composed.block_bases == expected.block_bases
+        assert composed.shape == expected.shape
+
+    # A operand: K (dim 1) contiguous; N/M swizzle splits the non-contiguous M.
+    a_expected = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
+                                                              _A16W16_TILE)
+    a_composed = tlx.make_composed_layout(shape=_A16W16_TILE, contiguous_dim=1, swizzle=tlx.bit_split(dim=0, low=16),
+                                          padding=_A16W16_SHARED_INTERVALS)
+    _same(a_composed, a_expected)
+
+    # B operand: K (dim 0) contiguous; swizzle splits the non-contiguous N.
+    b_expected = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_B_OFFSET_BASES,
+                                                              _A16W16_B_TILE)
+    b_composed = tlx.make_composed_layout(shape=_A16W16_B_TILE, contiguous_dim=0, swizzle=tlx.bit_split(dim=1, low=16),
+                                          padding=_A16W16_SHARED_INTERVALS)
+    _same(b_composed, b_expected)
+
+    # The `contiguous_dim` shorthand and an explicit CuTe `base` (modes ordered
+    # LSB -> MSB, K innermost then M) compose to the same bases.
+    a_base = tlx.make_composed_layout(shape=_A16W16_TILE, base=[(1, 64), (0, 128)],
+                                      swizzle=tlx.bit_split(dim=0, low=16), padding=_A16W16_SHARED_INTERVALS)
+    _same(a_base, a_expected)
+
+    # No swizzle -> the plain (identity-ordered) padded layout.
+    ident = tlx.make_composed_layout(shape=_A16W16_TILE, contiguous_dim=1, swizzle=None,
+                                     padding=_A16W16_SHARED_INTERVALS)
+    assert ident.offset_bases == [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [1, 0], [2, 0], [4, 0], [8, 0],
+                                  [16, 0], [32, 0], [64, 0]]
+
+    # base= and contiguous_dim= are mutually exclusive; base modes must tile shape.
+    with pytest.raises(AssertionError):
+        tlx.make_composed_layout(shape=_A16W16_TILE, base=[(1, 64), (0, 128)], contiguous_dim=1)
+    with pytest.raises(AssertionError):
+        tlx.make_composed_layout(shape=_A16W16_TILE, base=[(1, 32), (0, 128)])
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_user_pinned_swizzled_padded_survives_amd():
     """A user-pinned *swizzled* padded_shared (built with `with_bases`) survives

@@ -312,6 +312,125 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class bit_split:
+    """Swizzle spec for :func:`make_composed_layout` (a CuTe-style reorder).
+
+    Splits dimension ``dim`` (size ``D``) into a low part of size ``low`` and a
+    high part of size ``D // low``, then relocates the LOW part to the most-
+    significant offset position while the HIGH part stays adjacent to the
+    contiguous axis. Equivalently, the ``log2(low)`` least-significant address
+    bits of ``dim`` move to the coarsest offset stride -- the bank-conflict-
+    avoiding reorder the gfx9 GEMM LDS layouts rely on. Use ``swizzle=None`` for
+    an identity (non-swizzled) layout.
+
+    As a linear map this is a permutation of the layout's bit bases; it composes
+    with any base tile (see :func:`make_composed_layout`).
+    """
+
+    def __init__(self, dim, low):
+        self.dim = int(dim)
+        self.low = int(low)
+
+    def apply(self, bits):
+        """Reorder a base ``bits`` list (each entry ``(dim, coord_delta)``,
+        LSB -> MSB) by peeling this dim's low bits out to the most-significant end."""
+        low_part = [b for b in bits if b[0] == self.dim and b[1] < self.low]
+        rest = [b for b in bits if not (b[0] == self.dim and b[1] < self.low)]
+        return rest + low_part
+
+    def __repr__(self):
+        return f"bit_split(dim={self.dim}, low={self.low})"
+
+    def __eq__(self, other):
+        return isinstance(other, bit_split) and self.dim == other.dim and self.low == other.low
+
+    def __hash__(self):
+        return hash((self.dim, self.low))
+
+
+@constexpr_function
+def make_composed_layout(shape, contiguous_dim=None, base=None, swizzle=None, padding=None):
+    """CuTe-style composed layout: ``base ⊗ swizzle`` (+ optional padding).
+
+    Composes legible pieces into a single **linear** shared layout, materialized
+    as ``#ttg.padded_shared`` in the offset-bases form (the same attribute the
+    explicit ``with_bases([...])`` produces). It lets kernel authors describe a
+    bank-conflict-free LDS layout without hand-writing raw linear offset bases:
+
+      - ``shape``          : the per-buffer tile shape, e.g. ``[HALF_M, BLOCK_K]``.
+      - ``base``           : the un-swizzled tile as an ordered list of CuTe modes
+                             ``[(dim, size), ...]`` (LSB -> MSB, fastest-varying
+                             first); sizes are powers of two and multiply to
+                             ``prod(shape)``. This is the same shape/stride
+                             vocabulary as :class:`layout`.
+      - ``contiguous_dim`` : shorthand for ``base`` -- that dim is stride-1
+                             (innermost); the rest follow in ascending order.
+                             Defaults to the last dim. Mutually exclusive with
+                             ``base``.
+      - ``swizzle``        : an optional :class:`bit_split` reorder (or ``None``).
+      - ``padding``        : ``[(interval, pad), ...]`` applied along the flat
+                             offset (e.g. ``[(512, 16)]``), or ``None``.
+
+    The composition is a linear map from physical offset bit -> tile coordinate
+    (GF(2)): the base lays the tile's bits out LSB -> MSB, a ``swizzle`` permutes
+    them, and each resulting bit ``(dim, delta)`` emits an offset base moving
+    ``dim`` by ``delta``. ``padding=None`` yields a pure linear layout (no pad).
+    The bytes are identical to the hand-written ``with_bases([...])`` form.
+    """
+    rank = len(shape)
+    assert rank > 0, "shape must be non-empty"
+    assert not (base is not None and contiguous_dim is not None), \
+        "make_composed_layout: pass either base= or contiguous_dim=, not both"
+
+    def _log2_pow2(n):
+        n = int(n)
+        assert n > 0 and (n & (n - 1)) == 0, f"extent {n} must be a positive power of two"
+        return n.bit_length() - 1
+
+    # Base offset modes, LSB -> MSB, as (dim, size) pairs.
+    if base is not None:
+        modes = [(int(d), int(sz)) for (d, sz) in base]
+        total = 1
+        for (_, sz) in modes:
+            total *= int(sz)
+        expected = 1
+        for s in shape:
+            expected *= int(s)
+        assert total == expected, \
+            f"base modes cover {total} elements but shape {list(shape)} has {expected}"
+    else:
+        cd = (rank - 1) if contiguous_dim is None else int(contiguous_dim)
+        assert 0 <= cd < rank, f"contiguous_dim {cd} out of range for rank {rank}"
+        dim_order = [cd] + [d for d in range(rank) if d != cd]
+        modes = [(d, int(shape[d])) for d in dim_order]
+
+    # Expand each mode into its per-bit coordinate deltas: (dim, delta) LSB -> MSB.
+    bits = []
+    for (d, sz) in modes:
+        assert 0 <= d < rank, f"base dim {d} out of range for rank {rank}"
+        delta = 1
+        for _ in range(_log2_pow2(sz)):
+            bits.append((d, delta))
+            delta <<= 1
+
+    if swizzle is not None:
+        assert isinstance(swizzle, bit_split), "swizzle must be a tlx.bit_split or None"
+        assert 0 <= swizzle.dim < rank, f"bit_split dim {swizzle.dim} out of range for rank {rank}"
+        bits = swizzle.apply(bits)
+
+    offset_bases = []
+    for (d, delta) in bits:
+        base_vec = [0] * rank
+        base_vec[d] = delta
+        offset_bases.append(base_vec)
+
+    return padded_shared_layout_encoding.with_bases(
+        list(padding or []),
+        offset_bases,
+        list(shape),
+    )
+
+
 class TMemCTAMode:
     # The order of fields here must be in sync with TTNG_TensorMemoryCTAMode enum
     DEFAULT = 0

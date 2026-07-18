@@ -95,19 +95,25 @@ def a16w16_8wave(
     HALF_N: tl.constexpr = BLOCK_N // 2
 
     # Four separate double-buffered LDS allocations — one per operand half-tile.
-    # Pin the *swizzled* padded_shared layout (row/col-permuted offset bases,
-    # identical to the Gluon reference) so the ds_reads feeding the MFMAs are
+    # Pin a *swizzled* padded_shared layout so the ds_reads feeding the MFMAs are
     # bank-conflict-free. The default inferred padded layout ({order, shape})
     # conflicts on CDNA4 (measured 50M SQ_LDS_BANK_CONFLICT vs 0 for this one).
-    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)],
-        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
-        [HALF_M, BLOCK_K],
+    #
+    # Expressed CuTe-style: the contiguous (K) axis stays innermost, a `bit_split`
+    # peels the low 16 elements of the non-contiguous axis (M for A, N for B) out
+    # to the coarsest LDS-offset stride, and a [512:+16] pad breaks the residual
+    # conflict. This is byte-identical to the Gluon reference's explicit bases.
+    a_shared: tl.constexpr = tlx.make_composed_layout(
+        shape=[HALF_M, BLOCK_K],
+        contiguous_dim=1,
+        swizzle=tlx.bit_split(dim=0, low=16),
+        padding=[(512, 16)],
     )
-    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)],
-        [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8]],
-        [BLOCK_K, HALF_N],
+    b_shared: tl.constexpr = tlx.make_composed_layout(
+        shape=[BLOCK_K, HALF_N],
+        contiguous_dim=0,
+        swizzle=tlx.bit_split(dim=1, low=16),
+        padding=[(512, 16)],
     )
     smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
     smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
