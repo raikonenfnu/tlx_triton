@@ -1062,7 +1062,11 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
         num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=32,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        schedule_hint="scaled_gemm",
+        llvm_fn_attrs=(
+            ("amdgpu-agpr-alloc", "0,0"),
+            ("amdgpu-sched-strategy", "iterative-ilp"),
+        ),
     )
     if SPLIT_K > 1:
         rbm, rbn, rw = (32, 32, 4)
