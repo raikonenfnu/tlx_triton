@@ -1032,6 +1032,15 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
+    schedule_hint = "scaled_gemm"
+    # The full-grid 128x128 variant is LDS-wait bound.  These measured region
+    # models schedule its reads around MFMA better without affecting other
+    # skinny tiles.
+    if M == 512 and N == 8192:
+        if K == 4096:
+            schedule_hint = "attention"
+        elif K == 8192:
+            schedule_hint = "none"
     _a4w4_skinny_kernel[(grid_mn * SPLIT_K, )](
         a,
         b,
@@ -1062,7 +1071,7 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
         num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=32,
-        schedule_hint="scaled_gemm",
+        schedule_hint=schedule_hint,
         llvm_fn_attrs=(
             ("amdgpu-agpr-alloc", "0,0"),
             ("amdgpu-sched-strategy", "iterative-ilp"),
