@@ -1270,12 +1270,12 @@ def test_a4w4_gfx950_dispatch_policy():
     assert _a4w4_select_matmul_path(2048, 8192, 8192) == "intra_wave_256x256"
     assert _a4w4_select_matmul_path(2048, 4096, 1024) == "intra_wave_128x256"
 
-    # 256x4096 has 64 skinny workgroups: SK2 reaches the measured 128-WG
-    # target.  At 128 unsplit workgroups, the reduction tax no longer pays.
-    assert _a4w4_skinny_target_wgs == 128
-    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 2
-    assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 1
-    assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 1
+    # Fill the 256 CUs when K can be divided into whole BLOCK_K chunks.
+    # Naturally full 128x128 grids retain split-K 1.
+    assert _a4w4_skinny_target_wgs == 256
+    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 4
+    assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 2
+    assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 2
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

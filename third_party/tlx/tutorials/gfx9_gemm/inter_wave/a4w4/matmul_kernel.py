@@ -483,10 +483,10 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
 NUM_CU = 256  # gfx950 (CDNA4) compute units
 # An 8-wave skinny workgroup already occupies both wave slots on each SIMD.
 # Cold-L2 wrapper measurements show that targeting half of the reported CUs
-# balances occupancy against the fp32 workspace/reduction tax.  Filling all
-# 256 CUs by increasing SPLIT_K is slower once the unsplit MN grid reaches 128
-# workgroups.
-SKINNY_TARGET_WGS = NUM_CU // 2
+# balances occupancy against the fp32 workspace/reduction tax. Measured
+# M=256/512 sweeps favor filling all 256 CUs; naturally full grids avoid the
+# workspace and reduction entirely.
+SKINNY_TARGET_WGS = NUM_CU
 # The 4-wave family can use a 128x256 tile to double the workgroup count on
 # medium grids, matching AITER's occupancy geometry without a split-K reduce.
 # Once the 256x256 grid itself fills the machine, its larger M tile is faster.
@@ -809,10 +809,10 @@ def _a4w4_skinny_kernel(
 def choose_split_k_skinny(M, N, K):
     """Smallest-cost SPLIT_K for the 128x128 skinny tile.
 
-    Use split-K only until the compute grid reaches SKINNY_TARGET_WGS.  Each
-    split must retain a whole BLOCK_K-aligned K chunk.  Going on to fill all
-    NUM_CU workgroups increases fp32 workspace traffic and reduction latency
-    more than it improves occupancy for this 8-wave workgroup.
+    Use split-K only until the compute grid reaches SKINNY_TARGET_WGS. Each
+    split must retain a whole BLOCK_K-aligned K chunk. Cold-L2 sweeps on gfx950
+    show that filling all 256 CUs is worthwhile for the M=256 production
+    shapes; naturally full 128x128 grids retain SPLIT_K=1.
     """
     grid_mn = triton.cdiv(M, SKINNY_BLOCK_M) * triton.cdiv(N, SKINNY_BLOCK_N)
     best = 1
