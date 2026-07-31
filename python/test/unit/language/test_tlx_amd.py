@@ -40,6 +40,8 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.matmul_kernel
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
     SKINNY_TARGET_WGS as _a4w4_skinny_target_wgs,
     _matmul_256tile as _a4w4_inter_wave_256tile,
+    _matmul_skinny as _a4w4_inter_wave_skinny,
+    choose_skinny_block_m as _a4w4_choose_skinny_block_m,
     choose_split_k_skinny as _a4w4_choose_split_k_skinny,
     matmul as _a4w4_inter_wave_matmul,
     select_matmul_path as _a4w4_select_matmul_path,
@@ -1252,8 +1254,7 @@ def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
-    # 512x256x1536 -> 256-tile grid = 2*1 = 2 <= NUM_CU/4, so the dispatcher takes
-    # the occupancy-starved 128x128 + split-K TLX path (and its fp32 reduce).
+    # The dispatcher selects the four-wave 64x128 path and bounded split-K.
     m = 512
     n = 256
     k = 1536
@@ -1261,6 +1262,17 @@ def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+    # Keep the eight-wave 128x128 fallback covered as well.
+    fallback = _a4w4_inter_wave_skinny(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        SPLIT_K=1,
+        BLOCK_M=128,
+    )
+    torch.testing.assert_close(fallback, expected, atol=0.1, rtol=0.0)
 
 
 def test_a4w4_gfx950_dispatch_policy():
@@ -1273,9 +1285,13 @@ def test_a4w4_gfx950_dispatch_policy():
     # Fill the 256 CUs when K can be divided into whole BLOCK_K chunks.
     # Naturally full 128x128 grids retain split-K 1.
     assert _a4w4_skinny_target_wgs == 256
-    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 4
-    assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 2
-    assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 2
+    assert _a4w4_choose_skinny_block_m(256, 4096) == 64
+    assert _a4w4_choose_skinny_block_m(512, 4096) == 64
+    assert _a4w4_choose_skinny_block_m(256, 8192) == 64
+    assert _a4w4_choose_skinny_block_m(512, 8192) == 128
+    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 2
+    assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 1
+    assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 1
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

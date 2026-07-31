@@ -598,18 +598,17 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
 
 
 # ---------------------------------------------------------------------------
-# Skinny-N path: a standalone 128x128 tile (8 warps [2,4], one 32x32x64 MFMA
-# tile per warp) -- which is exactly ONE quadrant of the 256-tile 8-wave kernel, so
-# it reuses that kernel's [128,128] Shape:Stride layouts verbatim. On
-# occupancy-starved shapes the 256-tile leaves the machine idle (2048x256 -> 8
-# workgroups); the 128-tile has 4x the MN-tiles and, with split-K, reaches ~full
-# CU occupancy (2048x256x8192 -> 32 tiles x SK8 = 256 wg). It is a real TLX
-# kernel (direct-to-LDS buffer_load_to_local + pinned layouts + double-buffered
-# LDS), single accumulator, no warp_pipeline (so it is not bound by the
-# single-trip MIN_K constraint and split-K can go as deep as occupancy needs).
+# Skinny-N path: 64x128 (4 warps [1,4]) and 128x128 (8 warps [2,4]) tiles.
+# The 64x128 tile doubles the natural workgroup count for small M and removes
+# the second per-wave M tile. The 128x128 tile remains the fallback when 64x128
+# would create more than one natural workgroup per CU. Both are real TLX
+# kernels: direct-to-LDS buffer_load_to_local, pinned layouts, double-buffered
+# LDS, one accumulator, and no warp_pipeline. Split-K is used only when the
+# natural tile grid still cannot fill the machine.
 # Measured 2048x256x8192 device-time: 16.0us (SK4) vs the 256-tile's 42.5us and
 # the best hipBLASLt algo's 20.8us. Slower than the 256-tile on large shapes
 # (tiny tiles, huge grid), so it is used only via the dispatcher below.
+SKINNY_SMALL_BLOCK_M = 64
 SKINNY_BLOCK_M = 128
 SKINNY_BLOCK_N = 128
 
@@ -649,25 +648,94 @@ def _a4w4_skinny_kernel(
     KS: tl.constexpr = K // SPLIT_K
     iter_max: tl.constexpr = KS // BLOCK_K
 
-    # Reused the 256-tile kernel's [128,128]-quadrant layouts (a standalone 128x128 tile == one quadrant).
-    g_load_layout: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
-                                             stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)))
-    blocked_scales: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-                                              stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)))
-    shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+    # The 64x128 variant assigns two 32x32 MFMA output tiles to each of four
+    # waves (one M tile and two N tiles). It drops the second per-wave M tile
+    # used by the 128x128 variant and keeps all
+    # global A loads as adjacent 16-byte groups.
+    if BLOCK_M == 64:
+        g_load_layout_a: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((16, 32, 64, 128, 256, 512, 1024, 2048), (1, 2, 4, 8, 4096)),
+        )
+        blocked_scales_a: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((32, 64, 128, 256, 1, 2, 0, 4), (8, 16)),
+        )
+        shared_tile_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [[1024, 16]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+             [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+            [BLOCK_M, BKP],
+        )
+        scale_a_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+            stride=((8, 16, 32, 64, 128, 1, 0, 0), (2, 4, 256)),
+        )
+        accumulator_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((128, 256, 512, 1024, 2048, 4, 32, 64), (1, 2, 8, 16, 4096)),
+        )
+        store_layout_c: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((8, 16, 32, 64, 128, 256, 512, 1024), (1, 2, 4, 2048, 4096)),
+        )
+    else:
+        g_load_layout_a: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
+        )
+        blocked_scales_a: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+        )
+        shared_tile_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [[1024, 16]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+             [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+            [BLOCK_M, BKP],
+        )
+        scale_a_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+            stride=((8, 16, 32, 64, 128, 1, 0, 0, 256), (2, 4, 512)),
+        )
+        accumulator_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((128, 256, 512, 1024, 2048, 4, 32, 64, 4096), (1, 2, 8, 16, 8192)),
+        )
+        store_layout_c: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
+            stride=((8, 16, 32, 64, 512, 1024, 0, 0, 2048), (1, 2, 4, 128, 256, 4096, 8192)),
+        )
+    if BLOCK_M == 64:
+        g_load_layout_b: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2)),
+            stride=((16, 32, 64, 128, 4096, 8192, 256, 512), (1, 2, 4, 8, 1024, 2048)),
+        )
+        blocked_scales_b: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((32, 64, 128, 256, 512, 1, 2, 4), (8, 16)),
+        )
+        scale_b_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((8, 16, 32, 64, 128, 1, 256, 512), (2, 4)),
+        )
+    else:
+        g_load_layout_b: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+            stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
+        )
+        blocked_scales_b: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+        )
+        scale_b_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+            stride=((8, 16, 32, 64, 128, 1, 256, 512, 0), (2, 4)),
+        )
+    shared_tile_b: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 16]], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0],
-                       [4, 0], [8, 0], [16, 0]], [BLOCK_M, BKP])
+                       [4, 0], [8, 0], [16, 0]], [BLOCK_N, BKP])
     shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
-    scale_a_layout: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
-                                              stride=((8, 16, 32, 64, 128, 1, 0, 0, 256), (2, 4, 512)))
-    scale_b_layout: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-                                              stride=((8, 16, 32, 64, 128, 1, 256, 512, 0), (2, 4)))
-    accumulator_layout: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
-        stride=((128, 256, 512, 1024, 2048, 4, 32, 64, 4096), (1, 2, 8, 16, 8192)))
-    store_layout_c: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
-        stride=((8, 16, 32, 64, 512, 1024, 0, 0, 2048), (1, 2, 4, 128, 256, 4096, 8192)))
 
     split_id = tl.program_id(0) // GRID_MN
     pid = tl.program_id(0) % GRID_MN
@@ -695,28 +763,28 @@ def _a4w4_skinny_kernel(
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
-    smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
+    smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), 2, layout=shared_tile_a)
+    smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), 2, layout=shared_tile_b)
     smem_asc = tlx.local_alloc((BLOCK_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
     smem_bsc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
 
     offs_am = tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BKP)
-    a_off = tlx.require_layout(offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak, g_load_layout)
+    a_off = tlx.require_layout(offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak, g_load_layout_a)
     a_base = a_ptr + pid_m * BLOCK_M * stride_am + split_id * (KS // 2) * stride_ak
     offs_bn = tl.arange(0, BLOCK_N)
-    b_off = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk, g_load_layout)
+    b_off = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk, g_load_layout_b)
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn + split_id * (KS // 2) * stride_bk
     offs_sg = tl.arange(0, NG)
     offs_asm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     asc_off = tlx.require_layout(
         tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) +
-        tl.mul(offs_sg[None, :], stride_ask, sanitize_overflow=False), blocked_scales)
+        tl.mul(offs_sg[None, :], stride_ask, sanitize_overflow=False), blocked_scales_a)
     a_scales_ptr += split_id * (KS // SCALE_GROUP_SIZE) * stride_ask
     offs_bsn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     bsc_off = tlx.require_layout(
         tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) +
-        tl.mul(offs_sg[None, :], stride_bsk, sanitize_overflow=False), blocked_scales)
+        tl.mul(offs_sg[None, :], stride_bsk, sanitize_overflow=False), blocked_scales_b)
     b_scales_ptr += split_id * (KS // SCALE_GROUP_SIZE) * stride_bsk
 
     ak = BKP * stride_ak
@@ -806,15 +874,25 @@ def _a4w4_skinny_kernel(
         tl.store(workspace_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn, acc)
 
 
-def choose_split_k_skinny(M, N, K):
-    """Smallest-cost SPLIT_K for the 128x128 skinny tile.
+def choose_skinny_block_m(M, N):
+    """Use 64x128 while it creates at most one natural workgroup per CU."""
+    grid_64 = triton.cdiv(M, SKINNY_SMALL_BLOCK_M) * triton.cdiv(
+        N, SKINNY_BLOCK_N
+    )
+    return SKINNY_SMALL_BLOCK_M if grid_64 <= NUM_CU else SKINNY_BLOCK_M
+
+
+def choose_split_k_skinny(M, N, K, block_m=None):
+    """Smallest-cost SPLIT_K for the selected skinny tile.
 
     Use split-K only until the compute grid reaches SKINNY_TARGET_WGS. Each
     split must retain a whole BLOCK_K-aligned K chunk. Cold-L2 sweeps on gfx950
     show that filling all 256 CUs is worthwhile for the M=256 production
     shapes; naturally full 128x128 grids retain SPLIT_K=1.
     """
-    grid_mn = triton.cdiv(M, SKINNY_BLOCK_M) * triton.cdiv(N, SKINNY_BLOCK_N)
+    if block_m is None:
+        block_m = choose_skinny_block_m(M, N)
+    grid_mn = triton.cdiv(M, block_m) * triton.cdiv(N, SKINNY_BLOCK_N)
     best = 1
     for sk in range(2, SKINNY_TARGET_WGS // grid_mn + 1):
         ks = K // sk
@@ -823,17 +901,15 @@ def choose_split_k_skinny(M, N, K):
     return best
 
 
-def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None):
-    """128x128-tile TLX path for occupancy-starved (skinny-N) shapes. The 128
-    tile only reaches ~32 workgroups alone, so it relies on split-K to fill the
-    CUs (device-time 16us at SK8 vs 22.6us at SK1); the reduce adds a 2nd launch,
-    a wall-clock cost that amortizes under CUDA-graph / pooled-workspace use."""
+def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
+    """64/128x128 TLX path for occupancy-starved shapes."""
     M = a.shape[0]
     K = a.shape[1] * 2
     N = b.shape[0]
-    BM, BN = SKINNY_BLOCK_M, SKINNY_BLOCK_N
+    BM = choose_skinny_block_m(M, N) if BLOCK_M is None else BLOCK_M
+    BN = SKINNY_BLOCK_N
     if SPLIT_K is None:
-        SPLIT_K = choose_split_k_skinny(M, N, K)
+        SPLIT_K = choose_split_k_skinny(M, N, K, BM)
     KS = K // SPLIT_K
     assert K % SPLIT_K == 0 and KS % BLOCK_K == 0
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
@@ -866,7 +942,7 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
-        num_warps=NUM_WARPS,
+        num_warps=4 if BM == SKINNY_SMALL_BLOCK_M else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=32,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
