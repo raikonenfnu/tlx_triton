@@ -154,6 +154,51 @@ def test_async_load_correctness(device):
 
 
 # ---------------------------------------------------------------------------
+# Test: a pinned physical buffer-load offset passed through a @triton.jit
+# helper is not released merely because the helper reshapes the loaded value.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _buffer_load_then_restructure_helper(base, offsets):
+    value = tlx.buffer_load(base, offsets, contiguity=4)
+    value = tl.reshape(value, [4, 4, 16, 2, 2])
+    value = tl.trans(value, (0, 4, 2, 3, 1))
+    return tl.reshape(value, [128, 8])
+
+
+@triton.jit
+def _pinned_buffer_load_helper_kernel(src, dst, PHYSICAL: tl.constexpr):
+    row = tl.arange(0, 4)[:, None]
+    col = tl.arange(0, 256)[None, :]
+    offsets = tlx.require_layout(row * 256 + col, PHYSICAL)
+    value = _buffer_load_then_restructure_helper(src, offsets)
+    out_row = tl.arange(0, 128)[:, None]
+    out_col = tl.arange(0, 8)[None, :]
+    tl.store(dst + out_row * 8 + out_col, value)
+
+
+def test_pinned_buffer_load_helper_preserves_offset_layout_gfx950():
+    """A reshape of a buffer_load result is downstream of the memory
+    ownership boundary and must not release the physical offset layout."""
+    physical = tlx.layout(
+        shape=((16, 4, 4), (2, 2, 4)),
+        stride=((4, 64, 0), (1, 2, 256)),
+    )
+    compiled = compile_for_gfx950(
+        _pinned_buffer_load_helper_kernel,
+        signature={"src": "*fp8e4nv", "dst": "*fp8e4nv"},
+        constexprs={"PHYSICAL": physical},
+    )
+    ttgir = compiled.asm["ttgir"]
+    load_line = next(line for line in ttgir.splitlines() if "amdg.buffer_load " in line)
+    load_layout = re.search(r", (#\w+)>", load_line)
+    assert load_layout is not None
+    assert f"{load_layout.group(1)} = #ttg.linear" in ttgir
+    assert "#blocked" not in load_line
+
+
+# ---------------------------------------------------------------------------
 # Test: warp-pipelined batched matmul (bmm) with a partial-K tail on gfx950.
 #
 # Models the production "compression bmm" (batch, M, prime K=2309, N).

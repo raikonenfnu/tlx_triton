@@ -10,6 +10,7 @@
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -202,6 +203,47 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         }
         return;
       }
+      // amdg.buffer_load: the result, offsets, mask, and `other` have one
+      // encoding.  This matters when a pinned offset enters a @triton.jit
+      // helper: specializing the helper argument must also specialize the
+      // loaded value before the op verifier runs.  The result is then free to
+      // be restructured without implying that the offset itself was
+      // restructured.
+      if (auto load = dyn_cast<::mlir::triton::amdgpu::BufferLoadOp>(op)) {
+        SmallVector<Value> linked{load.getOffsets(), load.getResult()};
+        if (load.getMask())
+          linked.push_back(load.getMask());
+        if (load.getOther())
+          linked.push_back(load.getOther());
+        Attribute enc = findPlaceholder(linked, op);
+        if (!enc)
+          return;
+        changed |= retypeWithEncoding(load.getResult(), enc);
+        // offsets is the source of the pin in the helper case.  Retype the
+        // optional operands as well to satisfy SameLoadStoreOperandsEncoding.
+        bridgeOrRetype(load.getOffsets(), enc, op, /*operandIdx=*/1);
+        if (load.getMask())
+          bridgeOrRetype(load.getMask(), enc, op, /*operandIdx=*/3);
+        if (load.getOther())
+          bridgeOrRetype(load.getOther(), enc, op, /*operandIdx=*/4);
+        return;
+      }
+      // tt.dot / tt.dot_scaled require the result to have exactly the
+      // accumulator type. A pinned accumulator can enter through a specialized
+      // @triton.jit helper argument after the dot was originally constructed,
+      // so keep the result synchronized before verification.
+      if (auto dot = dyn_cast<::mlir::triton::DotOp>(op)) {
+        auto accTy = dyn_cast<RankedTensorType>(dot.getC().getType());
+        if (accTy && isPlaceholderEncoding(accTy.getEncoding()))
+          changed |= retypeWithEncoding(dot.getD(), accTy.getEncoding());
+        return;
+      }
+      if (auto dot = dyn_cast<::mlir::triton::DotScaledOp>(op)) {
+        auto accTy = dyn_cast<RankedTensorType>(dot.getC().getType());
+        if (accTy && isPlaceholderEncoding(accTy.getEncoding()))
+          changed |= retypeWithEncoding(dot.getD(), accTy.getEncoding());
+        return;
+      }
       // tt.store: value / ptr / mask must share one encoding
       // (SameLoadStoreOperandsEncoding). If the value carries a user pin,
       // propagate it to ptr/mask so make_ttir's verifier accepts the store
@@ -300,12 +342,12 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
       }
       // tt.call to a @triton.jit helper carrying a pinned (placeholder) arg.
       // Three cases, keyed on what the (monomorphized, encoding-stripped)
-      // callee does:
-      //   (A) it restructures the tensor (reshape / split / join / trans, e.g.
-      //       subtile_ops._split_n_2D): the row-per-thread pin has no meaning
-      //       across the restructure, so auto-release the placeholder args
-      //       before the call (make_ttgir picks the tail layout) -- the kernel
-      //       does not need an explicit tlx.release_layout.
+      // callee does with each pinned argument:
+      //   (A) the argument itself flows into a restructure (reshape / split /
+      //       join / trans, e.g. subtile_ops._split_n_2D): the row-per-thread
+      //       pin has no meaning across the restructure, so auto-release that
+      //       argument before the call (make_ttgir picks the tail layout) --
+      //       the kernel does not need an explicit tlx.release_layout.
       //   (B/C) it is elementwise (fast_fma) or a reduction (standard.max/sum):
       //       specialize the callee params, then sync the call result to the
       //       callee return -- forcing the placeholder for an elementwise
@@ -329,19 +371,63 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         if (!callee)
           return;
 
-        // (A) restructuring callee -> release the placeholder args.
-        bool restructures = false;
-        callee.walk([&](Operation *o) {
-          if (isa<::mlir::triton::ReshapeOp, ::mlir::triton::SplitOp,
-                  ::mlir::triton::JoinOp, ::mlir::triton::TransOp>(o))
-            restructures = true;
-        });
-        if (restructures) {
-          OpBuilder b(callOp);
-          for (unsigned i = 0; i < callOp.getNumOperands(); ++i) {
-            auto t = dyn_cast<RankedTensorType>(callOp.getOperand(i).getType());
-            if (!t || !isPlaceholderEncoding(t.getEncoding()))
+        // (A) Release only a pinned argument whose SSA value actually reaches
+        // a restructuring op.  Looking for any restructure anywhere in the
+        // callee is too broad: a common load helper consumes a pinned physical
+        // offset in amdg.buffer_load and then reshapes the *loaded value*.  The
+        // load is an ownership boundary; its result does not inherit the
+        // offset's physical register ownership.  Releasing the offset in that
+        // case silently repartitions the memory transaction and can make an
+        // otherwise correct kernel load the wrong elements.
+        auto argumentIsRestructured = [&](BlockArgument argument) {
+          SmallVector<Value> worklist{argument};
+          SmallVector<Value> visited;
+          while (!worklist.empty()) {
+            Value value = worklist.pop_back_val();
+            if (llvm::is_contained(visited, value))
               continue;
+            visited.push_back(value);
+            for (OpOperand &use : value.getUses()) {
+              Operation *user = use.getOwner();
+              if (isa<::mlir::triton::ReshapeOp,
+                      ::mlir::triton::SplitOp,
+                      ::mlir::triton::JoinOp,
+                      ::mlir::triton::TransOp>(user))
+                return true;
+
+              // Follow only shape-preserving elementwise value flow.  In
+              // particular, do not walk through loads, stores, dot, or calls:
+              // their results have a new ownership relation to the argument.
+              if (!user->hasTrait<OpTrait::Elementwise>() &&
+                  !isEncodingUniformArithOp(user))
+                continue;
+              auto valueTy = dyn_cast<RankedTensorType>(value.getType());
+              if (!valueTy)
+                continue;
+              for (Value result : user->getResults())
+                if (auto resultTy =
+                        dyn_cast<RankedTensorType>(result.getType()))
+                  if (resultTy.getShape() == valueTy.getShape())
+                    worklist.push_back(result);
+            }
+          }
+          return false;
+        };
+
+        Block &entry = callee.getBody().front();
+        SmallVector<unsigned> restructuredArgs;
+        for (unsigned i = 0; i < callOp.getNumOperands() &&
+                             i < entry.getNumArguments();
+             ++i) {
+          auto t = dyn_cast<RankedTensorType>(callOp.getOperand(i).getType());
+          if (t && isPlaceholderEncoding(t.getEncoding()) &&
+              argumentIsRestructured(entry.getArgument(i)))
+            restructuredArgs.push_back(i);
+        }
+        if (!restructuredArgs.empty()) {
+          OpBuilder b(callOp);
+          for (unsigned i : restructuredArgs) {
+            auto t = dyn_cast<RankedTensorType>(callOp.getOperand(i).getType());
             auto relTy =
                 RankedTensorType::get(t.getShape(), t.getElementType());
             Value rel = ReleaseLayoutOp::create(b, callOp.getLoc(), relTy,
@@ -374,7 +460,6 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         // FunctionType inputs) to the placeholder; nested helper calls and the
         // callee body (e.g. the reduction's tt.reduce) are re-inferred by the
         // fixpoint once their params are set.
-        Block &entry = callee.getBody().front();
         SmallVector<Type> newInputs(
             callee.getFunctionType().getInputs().begin(),
             callee.getFunctionType().getInputs().end());
