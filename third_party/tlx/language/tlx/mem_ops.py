@@ -26,7 +26,7 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
 
 @tl.builtin
-def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
+def buffer_load(ptr, offsets, mask=None, other=None, cache=None, contiguity=1, _semantic=None):
     """
     AMD buffer load from global memory via a scalar base pointer and a tensor
     of i32 element offsets. Loads data directly into registers.
@@ -40,6 +40,9 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache: Optional cache modifier string.
+        contiguity: Number of consecutive elements owned by each thread.
+            This is a correctness promise used to select the buffer-load vector
+            width, not an alignment hint. Defaults to one.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
 
@@ -58,9 +61,13 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
     mask_handle = mask.handle if mask is not None else None
     other_handle = other.handle if other is not None else None
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert isinstance(contiguity, int) and contiguity > 0 and (contiguity & (contiguity - 1)) == 0, \
+        "contiguity must be a positive power of two"
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
-    handle = _semantic.builder.create_buffer_load(ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier)
+    handle = _semantic.builder.create_buffer_load(
+        ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier, contiguity)
     return tl.tensor(handle, ret_ty)
 
 
@@ -107,6 +114,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    contiguity=1,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -133,6 +141,9 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        contiguity: Number of consecutive elements owned by each thread.
+            This is a correctness promise used to select the direct-to-LDS
+            vector width, not an alignment hint. Defaults to one.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
 
@@ -151,9 +162,12 @@ def buffer_load_to_local(
     mask_handle = mask.handle if mask is not None else None
     other_handle = other.handle if other is not None else None
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert isinstance(contiguity, int) and contiguity > 0 and (contiguity & (contiguity - 1)) == 0, \
+        "contiguity must be a positive power of two"
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
-                                                           other_handle, cache_mod)
+                                                           other_handle, cache_mod, contiguity)
     return tlx.async_token(handle)
 
 

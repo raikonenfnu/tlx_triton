@@ -1219,7 +1219,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_buffer_load",
            [](TritonOpBuilder &self, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
+              tt::CacheModifier cache, unsigned contiguity) -> Value {
              auto offsetsType = cast<RankedTensorType>(offsets.getType());
              auto ptrType = cast<tt::PointerType>(ptr.getType());
              auto resultType = RankedTensorType::get(offsetsType.getShape(),
@@ -1227,7 +1227,8 @@ void init_triton_tlx_ir(py::module &&m) {
                                                      offsetsType.getEncoding());
              return self.create<ttag::BufferLoadOp>(
                  resultType, ptr, offsets, Value() /*stride*/, cache,
-                 mask.value_or(Value()), other.value_or(Value()));
+                 mask.value_or(Value()), other.value_or(Value()),
+                 contiguity);
            })
       .def("create_buffer_store",
            [](TritonOpBuilder &self, Value storedValue, Value ptr,
@@ -1240,10 +1241,11 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_buffer_load_to_local",
            [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
+              tt::CacheModifier cache, unsigned contiguity) -> Value {
              return self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask.value_or(Value()),
-                 other.value_or(Value()), Value() /*stride*/, cache);
+                 other.value_or(Value()), Value() /*stride*/, cache,
+                 contiguity);
            });
 }
 
