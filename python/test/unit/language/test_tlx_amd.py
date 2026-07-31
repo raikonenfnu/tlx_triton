@@ -1254,7 +1254,7 @@ def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
-    # The dispatcher selects the four-wave 64x128 path and bounded split-K.
+    # The dispatcher selects a four-wave skinny path and bounded split-K.
     m = 512
     n = 256
     k = 1536
@@ -1274,6 +1274,18 @@ def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
     )
     torch.testing.assert_close(fallback, expected, atol=0.1, rtol=0.0)
 
+    # Cover the 32x128 path's packed-dword A-scale copy and zero-copy LDS byte
+    # view independently of its narrowly measured production dispatch shape.
+    tiny = _a4w4_inter_wave_skinny(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        SPLIT_K=1,
+        BLOCK_M=32,
+    )
+    torch.testing.assert_close(tiny, expected, atol=0.1, rtol=0.0)
+
 
 def test_a4w4_gfx950_dispatch_policy():
     assert _a4w4_select_matmul_path(256, 4096, 4096) == "skinny"
@@ -1285,11 +1297,13 @@ def test_a4w4_gfx950_dispatch_policy():
     # Fill the 256 CUs when K can be divided into whole BLOCK_K chunks.
     # Naturally full 128x128 grids retain split-K 1.
     assert _a4w4_skinny_target_wgs == 256
+    assert _a4w4_choose_skinny_block_m(256, 4096, 4096) == 32
+    assert _a4w4_choose_skinny_block_m(256, 4096, 8192) == 64
     assert _a4w4_choose_skinny_block_m(256, 4096) == 64
     assert _a4w4_choose_skinny_block_m(512, 4096) == 64
     assert _a4w4_choose_skinny_block_m(256, 8192) == 64
     assert _a4w4_choose_skinny_block_m(512, 8192) == 128
-    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 2
+    assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 1
     assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 1
     assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 1
 
