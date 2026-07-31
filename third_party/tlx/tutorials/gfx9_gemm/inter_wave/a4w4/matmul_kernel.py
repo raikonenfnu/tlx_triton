@@ -29,16 +29,10 @@ The Shape:Stride register/blocked/accumulator layouts below encode the gfx950
 round-trip-verified against the compiler's resolved linear layouts.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-# Keep the LLVM post-RA machine scheduler from re-ordering the
-# warp_pipeline_stage mem/MFMA interleave.
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 BLOCK_M = 256
 BLOCK_N = 256

@@ -404,6 +404,12 @@ def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
 
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    # Sweep a complete M column when N has at most 16 tiles, which maximizes
+    # B-tile reuse at the 2048x4096 production shape. Wider N grids benefit
+    # from smaller groups so work reaches additional N tiles sooner.
+    num_pid_n = triton.cdiv(N, BLOCK_N)
+    group_size_m = 16 if num_pid_n <= 16 else 8
+
     _a4w4_kernel[(grid_mn, )](
         a,
         b,
@@ -426,11 +432,13 @@ def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=4,
+        GROUP_SIZE_M=group_size_m,
         NUM_XCDS=8,
         GRID_MN=grid_mn,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,
+        schedule_hint="scaled_gemm",
+        llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-ilp"), ),
     )
     return c

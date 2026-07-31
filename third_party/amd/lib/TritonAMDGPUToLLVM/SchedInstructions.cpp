@@ -67,7 +67,6 @@ struct InstructionSchedHintsRewriter
     // backend documentation.
     const bool limitSchedulingRange =
         schedVariant == mlir::triton::amdgpu::SchedHint::attention;
-    ;
     Location loc = instructionSchedHint->getLoc();
     Block *block = instructionSchedHint->getBlock();
     if (limitSchedulingRange) {
@@ -80,6 +79,13 @@ struct InstructionSchedHintsRewriter
 
     switch (schedVariant) {
     case mlir::triton::amdgpu::SchedHint::attention:
+      createIglpOpt(rewriter, loc, 2);
+      break;
+    case mlir::triton::amdgpu::SchedHint::scaled_gemm:
+      // Scaled matrix instructions need the experimental MFMA interleaver.
+      // The small-GEMM DS/MFMA interleaver (strategy 0) and the simple
+      // interleaver (strategy 3) serialize too much of the scale/LDS
+      // preparation and substantially regress A4W4 GEMM.
       createIglpOpt(rewriter, loc, 2);
       break;
     case mlir::triton::amdgpu::SchedHint::none:
@@ -160,9 +166,30 @@ struct TritonAMDGPUInsertInstructionSchedHints
       mod.walk([&](scf::ForOp forOp) {
         // The attention schedule hint is inserted to the beginning of a
         // for-loop with chained dots.
-        auto result = forOp->walk([](triton::DotOp op) {
-          if (isChainDotHead(op))
+        auto result = forOp->walk([](triton::DotOpInterface dotOp) {
+          if (isChainDotHead(dotOp))
             return WalkResult::interrupt();
+          return WalkResult::advance();
+        });
+
+        if (result.wasInterrupted()) {
+          OpBuilder rewriter(ctx);
+          rewriter.setInsertionPointToStart(forOp.getBody());
+          triton::amdgpu::InstructionSchedHint::create(
+              rewriter, forOp->getLoc(), schedHint);
+        }
+      });
+      break;
+    case mlir::triton::amdgpu::SchedHint::scaled_gemm:
+      mod.walk([&](scf::ForOp forOp) {
+        // Apply the scaled-MFMA interleaver only when a scaled dot feeds the
+        // accumulator of another scaled dot.
+        auto result = forOp->walk([](triton::DotScaledOp op) {
+          for (Operation *user : op->getUsers()) {
+            auto nextDot = dyn_cast<triton::DotScaledOp>(user);
+            if (nextDot && nextDot.getC() == op.getResult())
+              return WalkResult::interrupt();
+          }
           return WalkResult::advance();
         });
 

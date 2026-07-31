@@ -52,11 +52,13 @@ class TritonAMDGPU_I32EnumAttr<string mnemonic, TritonAMDGPU_I32Enum enumInfo> :
 
 def SchedHintCaseNone : I32EnumAttrCase<"none", 0>;
 def SchedHintCaseAttention : I32EnumAttrCase<"attention", 2>;
+def SchedHintCaseScaledGemm : I32EnumAttrCase<"scaled_gemm", 3>;
 
 def TritonAMDGPU_SchedHintsEnum : TritonAMDGPU_I32Enum<
   "SchedHint", "Instruction Scheduling Hints for AMD GPUs", [
     SchedHintCaseNone,
     SchedHintCaseAttention,
+    SchedHintCaseScaledGemm,
   ]>;
 
 def TritonAMDGPU_SchedHintVariantAttr :
