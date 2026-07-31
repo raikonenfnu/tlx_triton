@@ -999,6 +999,7 @@ def choose_skinny_buffer_count(M, N, K):
     """Use a deeper operand ring for measured full-grid skinny tiles."""
     return 4 if (M, N, K) in {
         (256, 4096, 4096),
+        (256, 4096, 8192),
         (256, 8192, 4096),
         (256, 8192, 8192),
         (512, 4096, 4096),
@@ -1030,6 +1031,14 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
     buffer_count = choose_skinny_buffer_count(M, N, K)
+    group_size_m = GROUP_SIZE_M
+    num_xcds = NUM_XCDS
+    # This full-grid shape already assigns one CTA per CU.  Linear CTA order
+    # avoids the otherwise unnecessary grouping/XCD remap and is consistently
+    # a little faster under cold-L2 paired measurements.
+    if (M, N, K) == (512, 8192, 4096):
+        group_size_m = 1
+        num_xcds = 1
     schedule_hint = "scaled_gemm"
     sched_strategy = (
         "max-memory-clause"
@@ -1067,8 +1076,8 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_XCDS=NUM_XCDS,
+        GROUP_SIZE_M=group_size_m,
+        NUM_XCDS=num_xcds,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
         BUFFER_COUNT=buffer_count,
