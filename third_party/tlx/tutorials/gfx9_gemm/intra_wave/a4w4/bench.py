@@ -263,6 +263,7 @@ def compile_shape(shape, cache_root):
             "GROUP_SIZE_M": GROUP_SIZE_M,
             "NUM_XCDS": NUM_XCDS,
             "GRID_MN": grid_mn,
+            "ASYNC_SCALE_LDS": False,
             "num_warps": 4,
             "num_stages": 1,
             "matrix_instr_nonkdim": 16,
