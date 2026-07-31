@@ -2,11 +2,11 @@
 """Benchmark the TLX MXFP4 (A4W4) GEMM against the AITER baseline on gfx950.
 
 The **baseline is AITER** (`aiter.ops.gemm_op_a4w4.gemm_a4w4`, its tuned assembly
-`_ZN...` kernel with pre-shuffled B). This script runs the *unchanged* public TLX
-A4W4 matmul next to that AITER baseline on the same inputs, checks both against a
-FP32-dequantized reference, and reports TLX latency relative to the AITER
-baseline. It is fully self-contained: no external product, serving, or framework
-dependencies.
+`_ZN...` kernel with pre-shuffled B). This script runs the public, shape-selected
+TLX A4W4 matmul next to that AITER baseline on the same inputs, checks both
+against a FP32-dequantized reference, and reports TLX latency relative to the
+AITER baseline. It is fully self-contained: no external product, serving, or
+framework dependencies.
 
 We are sharing this to ask for help closing the gap to the AITER baseline: on
 large shapes the TLX kernel is materially slower, and we would like guidance on
@@ -50,12 +50,12 @@ from typing import Protocol
 import torch
 import triton
 
-# Kernel under test: the in-repo inter_wave matmul_kernel.py shipped in this change
-# (co-located under this tutorials tree, including the skinny-gate dispatch tweak
-# that routes grid_256 <= NUM_CU//4 to the 128-tile split-K path). EXPECTED_TLX_SHA256
-# pins that exact file so the benchmarked kernel cannot silently drift; pass
-# --allow-source-mismatch to benchmark a modified copy. AITER is the baseline.
-EXPECTED_TLX_SHA256 = "5808240cc31ce9c30238678cfbad437eedae56745a2a830342b788e0f93f350d"
+# Kernel under test: the public selector in the in-repo inter_wave
+# matmul_kernel.py. It chooses bounded split-K, 128x256 intra-wave, or 256x256
+# intra-wave based on the output grid. EXPECTED_TLX_SHA256 pins that exact file
+# so the benchmarked kernel cannot silently drift; pass --allow-source-mismatch
+# to benchmark a modified copy. AITER is the baseline.
+EXPECTED_TLX_SHA256 = "c42fffca39c1554fe7a57d3f5039b284ccf8f4c893fff0c3accc6f047e088459"
 TLX_MODULE = (
     "triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel"
 )
@@ -503,6 +503,11 @@ def tlx_dispatch(module, m: int, n: int) -> dict:
     block_n = getattr(module, "BLOCK_N", 256)
     grid_256 = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     info = {"grid_256": grid_256}
+    selector = getattr(module, "select_matmul_path", None)
+    if selector is not None:
+        # All benchmark shapes use K from the enclosing run_shape invocation;
+        # add it there after this generic grid metadata is constructed.
+        info["selector_available"] = True
     num_cu = getattr(module, "NUM_CU", None)
     if num_cu is not None and hasattr(module, "SKINNY_BLOCK_M"):
         skinny_threshold = num_cu // 4
@@ -536,6 +541,10 @@ def run_shape(tlx_variants, shape, args, flusher) -> dict:
         for name, module in tlx_variants
     ]
     dispatch = {name: tlx_dispatch(module, m, n) for name, module in tlx_variants}
+    for name, module in tlx_variants:
+        selector = getattr(module, "select_matmul_path", None)
+        if selector is not None:
+            dispatch[name]["expected_selected_dispatch"] = selector(m, n, k)
     # AITER first: it is the baseline every TLX number is reported against.
     runners: list[Runner] = [aiter_runner, *tlx_runners]
 
@@ -611,9 +620,9 @@ def main() -> None:
         EXPECTED_TLX_SHA256,
         "tlx_a4w4_inter_kernel",
     )
-    tlx_variants = [("inter_wave_TLX", inter_module)]
+    tlx_variants = [("selected_TLX", inter_module)]
     kernels_under_test = {
-        "inter_wave_TLX": {
+        "selected_TLX": {
             "path": str(inter_source),
             "sha256": inter_digest,
             "expected_sha256": EXPECTED_TLX_SHA256,

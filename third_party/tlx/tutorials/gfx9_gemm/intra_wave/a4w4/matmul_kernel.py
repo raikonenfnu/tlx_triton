@@ -46,10 +46,16 @@ def _a4w4_kernel(
     BLOCK_K_SCALE: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE
     HALF_N: tl.constexpr = BLOCK_N // 2
 
-    g_load_layout_a: tl.constexpr = tlx.layout(
-        shape=((8, 8, 4), (16, 4, 2)),
-        stride=((16, 2048, 128), (1, 512, 16384)),
-    )
+    if BLOCK_M == 128:
+        g_load_layout_a: tl.constexpr = tlx.layout(
+            shape=((8, 8, 4), (16, 4)),
+            stride=((16, 2048, 128), (1, 512)),
+        )
+    else:
+        g_load_layout_a: tl.constexpr = tlx.layout(
+            shape=((8, 8, 4), (16, 4, 2)),
+            stride=((16, 2048, 128), (1, 512, 16384)),
+        )
     g_load_layout_b: tl.constexpr = tlx.layout(
         shape=((8, 8, 4), (16, 4)),
         stride=((16, 2048, 128), (1, 512)),
@@ -62,27 +68,49 @@ def _a4w4_kernel(
         shape=((32, 2, 4), (4, )),
         stride=((32, 1, 2), (8, )),
     )
-    shared_layout_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [[1024, 32]],
-        [
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [16, 0],
-            [32, 0],
-            [64, 0],
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [128, 0],
-        ],
-        [BLOCK_M, BLOCK_K_PACKED],
-    )
+    if BLOCK_M == 128:
+        shared_layout_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [[1024, 32]],
+            [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+            ],
+            [BLOCK_M, BLOCK_K_PACKED],
+        )
+    else:
+        shared_layout_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [[1024, 32]],
+            [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [128, 0],
+            ],
+            [BLOCK_M, BLOCK_K_PACKED],
+        )
     shared_layout_b: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
@@ -112,16 +140,28 @@ def _a4w4_kernel(
         shape=((16, 4, 2, 2), (2, 4)),
         stride=((8, 1, 128, 0), (4, 256)),
     )
-    store_layout_c: tl.constexpr = tlx.layout(
-        shape=((64, 4), (8, 16)),
-        stride=((8, 512), (1, 2048)),
-    )
+    if BLOCK_M == 128:
+        store_layout_c: tl.constexpr = tlx.layout(
+            shape=((64, 4), (8, 8)),
+            stride=((8, 512), (1, 2048)),
+        )
+    else:
+        store_layout_c: tl.constexpr = tlx.layout(
+            shape=((64, 4), (8, 16)),
+            stride=((8, 512), (1, 2048)),
+        )
     # Generalized Shape:Stride form of the gfx950 16x16x128 MFMA
     # accumulator layout for one [BLOCK_M, HALF_N] result tile.
-    accumulator_layout: tl.constexpr = tlx.layout(
-        shape=((16, 4, 2, 2), (4, 4, 8)),
-        stride=((128, 4, 16, 2048), (1, 32, 4096)),
-    )
+    if BLOCK_M == 128:
+        accumulator_layout: tl.constexpr = tlx.layout(
+            shape=((16, 4, 2, 2), (4, 4, 4)),
+            stride=((128, 4, 16, 2048), (1, 32, 4096)),
+        )
+    else:
+        accumulator_layout: tl.constexpr = tlx.layout(
+            shape=((16, 4, 2, 2), (4, 4, 8)),
+            stride=((128, 4, 16, 2048), (1, 32, 4096)),
+        )
 
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -338,7 +378,7 @@ def _a4w4_kernel(
     tlx.buffer_store(c_right, c_tile_base, c_right_offsets)
 
 
-def matmul(a, b, a_scales, b_scales):
+def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
     assert a.dtype is torch.uint8
     assert b.dtype is torch.uint8
     assert a_scales.dtype is torch.uint8
@@ -356,8 +396,9 @@ def matmul(a, b, a_scales, b_scales):
     assert a_scales.stride(0) == 1, "A scales must be contiguous along M"
     assert b_scales.stride(0) == 1, "B scales must be contiguous along N"
 
-    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 256
-    assert M % BLOCK_M == 0, "M must be a multiple of 256"
+    BLOCK_N, BLOCK_K = 256, 256
+    assert BLOCK_M in (128, 256), "BLOCK_M must be 128 or 256"
+    assert M % BLOCK_M == 0, f"M must be a multiple of {BLOCK_M}"
     assert N % BLOCK_N == 0, "N must be a multiple of 256"
     assert K >= 4 * BLOCK_K and K % (2 * BLOCK_K) == 0, "K must be at least 1024 and a multiple of 512"
 

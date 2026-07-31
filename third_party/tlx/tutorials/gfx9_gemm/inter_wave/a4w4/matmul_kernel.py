@@ -487,6 +487,16 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
+# An 8-wave skinny workgroup already occupies both wave slots on each SIMD.
+# Cold-L2 wrapper measurements show that targeting half of the reported CUs
+# balances occupancy against the fp32 workspace/reduction tax.  Filling all
+# 256 CUs by increasing SPLIT_K is slower once the unsplit MN grid reaches 128
+# workgroups.
+SKINNY_TARGET_WGS = NUM_CU // 2
+# The 4-wave family can use a 128x256 tile to double the workgroup count on
+# medium grids, matching AITER's occupancy geometry without a split-K reduce.
+# Once the 256x256 grid itself fills the machine, its larger M tile is faster.
+INTRA_256_MIN_GRID = NUM_CU
 # Each split must be a whole number of BLOCK_K tiles and keep the pipelined loop
 # at >= 2 trips (KS >= 6*BLOCK_K == MIN_K; see the module comment on MIN_K).
 MIN_KTILES_PER_SPLIT = MIN_K // BLOCK_K  # == 6
@@ -803,11 +813,16 @@ def _a4w4_skinny_kernel(
 
 
 def choose_split_k_skinny(M, N, K):
-    """SPLIT_K for the 128x128 skinny tile: fill the CUs with a whole,
-    2*BLOCK_K-aligned K-chunk per split (no warp_pipeline -> no MIN_K limit)."""
+    """Smallest-cost SPLIT_K for the 128x128 skinny tile.
+
+    Use split-K only until the compute grid reaches SKINNY_TARGET_WGS.  Each
+    split must retain a whole BLOCK_K-aligned K chunk.  Going on to fill all
+    NUM_CU workgroups increases fp32 workspace traffic and reduction latency
+    more than it improves occupancy for this 8-wave workgroup.
+    """
     grid_mn = triton.cdiv(M, SKINNY_BLOCK_M) * triton.cdiv(N, SKINNY_BLOCK_N)
     best = 1
-    for sk in range(2, NUM_CU // grid_mn + 1):
+    for sk in range(2, SKINNY_TARGET_WGS // grid_mn + 1):
         ks = K // sk
         if K % sk == 0 and ks % BLOCK_K == 0 and ks >= 2 * BLOCK_K:
             best = sk
@@ -870,16 +885,44 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None):
     return c
 
 
-def matmul(a, b, a_scales, b_scales):
-    """A @ B.T for packed MXFP4 A/B. Dispatches on the 256-tile grid fill:
-    the 256x256 inter-wave tile only fills the GPU once its grid reaches ~half the
-    CUs; below that it wastes CUs (a 256x256 tile is 1 workgroup/CU), so route those
-    occupancy-starved shapes to the 128x128 + split-K path, which spawns 4x the
-    workgroups and refills with split-K. Measured crossover on gfx950 (256 CUs):
-    skinny wins for grid_256 <= 64, the 256x256 tile wins from grid_256 >= 128."""
-    M = a.shape[0]
-    N = b.shape[0]
+def select_matmul_path(M, N, K):
+    """Select the measured gfx950 kernel family for an MXFP4 shape."""
     grid_mn_256 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     if grid_mn_256 <= NUM_CU // 4:
+        return "skinny"
+    if grid_mn_256 < INTRA_256_MIN_GRID:
+        return "intra_wave_128x256"
+    return "intra_wave_256x256"
+
+
+def _matmul_intra_wave(a, b, a_scales, b_scales, block_m):
+    # Import lazily so compiling or using the standalone inter-wave kernel
+    # does not eagerly load its sibling.  The tutorials directory is exposed
+    # as tlx.tutorials by the package's existing symlink.
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.matmul_kernel import (
+        matmul as intra_wave_matmul,
+    )
+
+    return intra_wave_matmul(a, b, a_scales, b_scales, BLOCK_M=block_m)
+
+
+def matmul(a, b, a_scales, b_scales):
+    """A @ B.T for packed MXFP4 A/B using measured gfx950 dispatch.
+
+    * occupancy-starved grids use 128x128 plus a bounded split-K;
+    * medium grids use a 4-wave 128x256 tile to expose more independent work;
+    * full grids use the 4-wave 256x256 tile.
+
+    The 8-wave kernel remains available through _matmul_256tile for explicit
+    experiments, but its phase barriers lose to the shape-matched 4-wave
+    kernels at every measured dispatcher crossover.
+    """
+    M = a.shape[0]
+    K = a.shape[1] * 2
+    N = b.shape[0]
+    path = select_matmul_path(M, N, K)
+    if path == "skinny":
         return _matmul_skinny(a, b, a_scales, b_scales)
-    return _matmul_256tile(a, b, a_scales, b_scales)
+    if path == "intra_wave_128x256":
+        return _matmul_intra_wave(a, b, a_scales, b_scales, 128)
+    return _matmul_intra_wave(a, b, a_scales, b_scales, 256)
