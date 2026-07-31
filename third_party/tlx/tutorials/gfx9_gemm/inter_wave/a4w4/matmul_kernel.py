@@ -999,7 +999,9 @@ def choose_skinny_buffer_count(M, N, K):
     """Use a deeper operand ring for measured full-grid skinny tiles."""
     return 4 if (M, N, K) in {
         (256, 4096, 4096),
+        (256, 8192, 4096),
         (256, 8192, 8192),
+        (512, 4096, 4096),
         (512, 4096, 8192),
     } else 2
 
@@ -1029,7 +1031,11 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
     buffer_count = choose_skinny_buffer_count(M, N, K)
     schedule_hint = "scaled_gemm"
-    sched_strategy = "iterative-ilp"
+    sched_strategy = (
+        "max-memory-clause"
+        if BM == SKINNY_SMALL_BLOCK_M and buffer_count == 4
+        else "iterative-ilp"
+    )
     # The full-grid 128x128 variant is LDS-wait bound.  These measured region
     # models schedule its reads around MFMA better without affecting other
     # skinny tiles.
@@ -1038,8 +1044,6 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
             schedule_hint = "attention"
         elif K == 8192:
             schedule_hint = "none"
-    elif M == 512 and N == 4096 and K == 8192:
-        sched_strategy = "max-memory-clause"
     _a4w4_skinny_kernel[(grid_mn * SPLIT_K, )](
         a,
         b,
