@@ -40,6 +40,7 @@ def _a4w4_kernel(
     GROUP_SIZE_M: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
+    ASYNC_SCALE_LDS: tl.constexpr,
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
     BLOCK_K_PACKED: tl.constexpr = BLOCK_K // 2
@@ -193,8 +194,18 @@ def _a4w4_kernel(
     smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K_PACKED), tlx.dtype_of(a_ptr), 2, layout=shared_layout_a)
     smem_b_left = tlx.local_alloc((HALF_N, BLOCK_K_PACKED), tlx.dtype_of(b_ptr), 2, layout=shared_layout_b)
     smem_b_right = tlx.local_alloc((HALF_N, BLOCK_K_PACKED), tlx.dtype_of(b_ptr), 2, layout=shared_layout_b)
-    smem_as = tlx.local_alloc((BLOCK_M, BLOCK_K_SCALE), tlx.dtype_of(a_scales_ptr), 1, layout=shared_scales)
-    smem_bs = tlx.local_alloc((HALF_N, BLOCK_K_SCALE), tlx.dtype_of(b_scales_ptr), 1, layout=shared_scales)
+    smem_as = tlx.local_alloc(
+        (BLOCK_M, BLOCK_K_SCALE),
+        tlx.dtype_of(a_scales_ptr),
+        2 if ASYNC_SCALE_LDS else 1,
+        layout=shared_scales,
+    )
+    smem_bs = tlx.local_alloc(
+        (HALF_N, BLOCK_K_SCALE),
+        tlx.dtype_of(b_scales_ptr),
+        4 if ASYNC_SCALE_LDS else 1,
+        layout=shared_scales,
+    )
 
     offs_am = tl.arange(0, BLOCK_M)
     offs_ak = tl.arange(0, BLOCK_K_PACKED)
@@ -221,7 +232,10 @@ def _a4w4_kernel(
     a_scale_m_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False)
     a_scale_k_offsets = tl.mul(offs_sk_a[None, :], stride_ask, sanitize_overflow=False)
     a_scale_offsets = tl.add(a_scale_m_offsets, a_scale_k_offsets, sanitize_overflow=False)
-    a_scale_offsets = tlx.require_layout(a_scale_offsets, scale_load_layout_a)
+    a_scale_offsets = tlx.require_layout(
+        a_scale_offsets,
+        scale_load_layout_b if ASYNC_SCALE_LDS else scale_load_layout_a,
+    )
     a_scale_offsets_next = tl.add(a_scale_offsets, BLOCK_K_SCALE * stride_ask, sanitize_overflow=False)
     offs_sk_b = tl.arange(0, BLOCK_K_SCALE)
     offs_bsn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
@@ -246,23 +260,82 @@ def _a4w4_kernel(
 
     tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
-    b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), scale_load_layout_b)
+    if ASYNC_SCALE_LDS:
+        tlx.buffer_load_to_local(
+            smem_as[0],
+            a_scales_base,
+            a_scale_offsets,
+            contiguity=4,
+        )
+        tlx.buffer_load_to_local(
+            smem_bs[0],
+            b_scales_base,
+            b_scale_left_offsets,
+            contiguity=4,
+        )
+        tlx.buffer_load_to_local(
+            smem_bs[1],
+            b_scales_base,
+            b_scale_right_offsets,
+            contiguity=4,
+        )
+    else:
+        a_sc_buf1 = tlx.require_layout(
+            tlx.buffer_load(a_scales_base, a_scale_offsets),
+            scale_load_layout_a,
+        )
+        b_sc_left_buf1 = tlx.require_layout(
+            tlx.buffer_load(b_scales_base, b_scale_left_offsets),
+            scale_load_layout_b,
+        )
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
-    b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets), scale_load_layout_b)
+    if not ASYNC_SCALE_LDS:
+        b_sc_right_buf1 = tlx.require_layout(
+            tlx.buffer_load(b_scales_base, b_scale_right_offsets),
+            scale_load_layout_b,
+        )
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
     tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), scale_load_layout_a)
-    b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next), scale_load_layout_b)
+    if ASYNC_SCALE_LDS:
+        tlx.buffer_load_to_local(
+            smem_as[1],
+            a_scales_base,
+            a_scale_offsets_next,
+            contiguity=4,
+        )
+        tlx.buffer_load_to_local(
+            smem_bs[2],
+            b_scales_base,
+            b_scale_left_offsets_next,
+            contiguity=4,
+        )
+        tlx.buffer_load_to_local(
+            smem_bs[3],
+            b_scales_base,
+            b_scale_right_offsets_next,
+            contiguity=4,
+        )
+    else:
+        a_sc_buf3 = tlx.require_layout(
+            tlx.buffer_load(a_scales_base, a_scale_offsets_next),
+            scale_load_layout_a,
+        )
+        b_sc_left_buf3 = tlx.require_layout(
+            tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
+            scale_load_layout_b,
+        )
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
-    b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
-                                         scale_load_layout_b)
+    if not ASYNC_SCALE_LDS:
+        b_sc_right_buf3 = tlx.require_layout(
+            tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
+            scale_load_layout_b,
+        )
     tlx.async_load_commit_group()
 
     a_base += BLOCK_K_PACKED * stride_ak * 2
@@ -273,8 +346,9 @@ def _a4w4_kernel(
     tlx.async_load_wait_group(3)
     a = tlx.local_load(smem_a[0], relaxed=True)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
-    tlx.local_store(smem_as[0], a_sc_buf1)
-    tlx.local_store(smem_bs[0], b_sc_left_buf1)
+    if not ASYNC_SCALE_LDS:
+        tlx.local_store(smem_as[0], a_sc_buf1)
+        tlx.local_store(smem_bs[0], b_sc_left_buf1)
     a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
     b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
@@ -282,49 +356,123 @@ def _a4w4_kernel(
         acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
         tlx.async_load_wait_group(2)
         b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
-        tlx.local_store(smem_bs[0], b_sc_right_buf1)
-        b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        if not ASYNC_SCALE_LDS:
+            tlx.local_store(smem_bs[0], b_sc_right_buf1)
+        b_sc_right_reg_buf0 = tlx.local_load(
+            smem_bs[1 if ASYNC_SCALE_LDS else 0],
+            layout=scale_b_layout,
+        )
         tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
         tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-        a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
-        b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), scale_load_layout_b)
+        if ASYNC_SCALE_LDS:
+            tlx.buffer_load_to_local(
+                smem_as[0],
+                a_scales_base,
+                a_scale_offsets,
+                contiguity=4,
+            )
+            tlx.buffer_load_to_local(
+                smem_bs[0],
+                b_scales_base,
+                b_scale_left_offsets,
+                contiguity=4,
+            )
+            tlx.buffer_load_to_local(
+                smem_bs[1],
+                b_scales_base,
+                b_scale_right_offsets,
+                contiguity=4,
+            )
+        else:
+            a_sc_buf1 = tlx.require_layout(
+                tlx.buffer_load(a_scales_base, a_scale_offsets),
+                scale_load_layout_a,
+            )
+            b_sc_left_buf1 = tlx.require_layout(
+                tlx.buffer_load(b_scales_base, b_scale_left_offsets),
+                scale_load_layout_b,
+            )
         tlx.async_load_commit_group()
 
         acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
         tlx.async_load_wait_group(2)
         a_next = tlx.local_load(smem_a[1], relaxed=True)
         b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
-        tlx.local_store(smem_as[0], a_sc_buf3)
-        tlx.local_store(smem_bs[0], b_sc_left_buf3)
-        a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
-        b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        if not ASYNC_SCALE_LDS:
+            tlx.local_store(smem_as[0], a_sc_buf3)
+            tlx.local_store(smem_bs[0], b_sc_left_buf3)
+        a_sc_reg_buf2 = tlx.local_load(
+            smem_as[1 if ASYNC_SCALE_LDS else 0],
+            layout=scale_a_layout,
+        )
+        b_sc_left_reg_buf2 = tlx.local_load(
+            smem_bs[2 if ASYNC_SCALE_LDS else 0],
+            layout=scale_b_layout,
+        )
         tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
-        b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets), scale_load_layout_b)
+        if not ASYNC_SCALE_LDS:
+            b_sc_right_buf1 = tlx.require_layout(
+                tlx.buffer_load(b_scales_base, b_scale_right_offsets),
+                scale_load_layout_b,
+            )
         tlx.async_load_commit_group()
 
         acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
         tlx.async_load_wait_group(2)
         b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
-        tlx.local_store(smem_bs[0], b_sc_right_buf3)
-        b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        if not ASYNC_SCALE_LDS:
+            tlx.local_store(smem_bs[0], b_sc_right_buf3)
+        b_sc_right_reg_buf2 = tlx.local_load(
+            smem_bs[3 if ASYNC_SCALE_LDS else 0],
+            layout=scale_b_layout,
+        )
         tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
         tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-        a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), scale_load_layout_a)
-        b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
-                                            scale_load_layout_b)
+        if ASYNC_SCALE_LDS:
+            tlx.buffer_load_to_local(
+                smem_as[1],
+                a_scales_base,
+                a_scale_offsets_next,
+                contiguity=4,
+            )
+            tlx.buffer_load_to_local(
+                smem_bs[2],
+                b_scales_base,
+                b_scale_left_offsets_next,
+                contiguity=4,
+            )
+            tlx.buffer_load_to_local(
+                smem_bs[3],
+                b_scales_base,
+                b_scale_right_offsets_next,
+                contiguity=4,
+            )
+        else:
+            a_sc_buf3 = tlx.require_layout(
+                tlx.buffer_load(a_scales_base, a_scale_offsets_next),
+                scale_load_layout_a,
+            )
+            b_sc_left_buf3 = tlx.require_layout(
+                tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
+                scale_load_layout_b,
+            )
         tlx.async_load_commit_group()
 
         acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
         tlx.async_load_wait_group(2)
         a = tlx.local_load(smem_a[0], relaxed=True)
         b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
-        tlx.local_store(smem_as[0], a_sc_buf1)
-        tlx.local_store(smem_bs[0], b_sc_left_buf1)
+        if not ASYNC_SCALE_LDS:
+            tlx.local_store(smem_as[0], a_sc_buf1)
+            tlx.local_store(smem_bs[0], b_sc_left_buf1)
         a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
         b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
         tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
-        b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
-                                             scale_load_layout_b)
+        if not ASYNC_SCALE_LDS:
+            b_sc_right_buf3 = tlx.require_layout(
+                tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
+                scale_load_layout_b,
+            )
         tlx.async_load_commit_group()
 
         a_base += BLOCK_K_PACKED * stride_ak * 2
@@ -335,23 +483,38 @@ def _a4w4_kernel(
     acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
     tlx.async_load_wait_group(2)
     b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
-    tlx.local_store(smem_bs[0], b_sc_right_buf1)
-    b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+    if not ASYNC_SCALE_LDS:
+        tlx.local_store(smem_bs[0], b_sc_right_buf1)
+    b_sc_right_reg_buf0 = tlx.local_load(
+        smem_bs[1 if ASYNC_SCALE_LDS else 0],
+        layout=scale_b_layout,
+    )
 
     acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
     tlx.async_load_wait_group(1)
     a_next = tlx.local_load(smem_a[1], relaxed=True)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
-    tlx.local_store(smem_as[0], a_sc_buf3)
-    tlx.local_store(smem_bs[0], b_sc_left_buf3)
-    a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
-    b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+    if not ASYNC_SCALE_LDS:
+        tlx.local_store(smem_as[0], a_sc_buf3)
+        tlx.local_store(smem_bs[0], b_sc_left_buf3)
+    a_sc_reg_buf2 = tlx.local_load(
+        smem_as[1 if ASYNC_SCALE_LDS else 0],
+        layout=scale_a_layout,
+    )
+    b_sc_left_reg_buf2 = tlx.local_load(
+        smem_bs[2 if ASYNC_SCALE_LDS else 0],
+        layout=scale_b_layout,
+    )
 
     acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
     tlx.async_load_wait_group(0)
     b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
-    tlx.local_store(smem_bs[0], b_sc_right_buf3)
-    b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+    if not ASYNC_SCALE_LDS:
+        tlx.local_store(smem_bs[0], b_sc_right_buf3)
+    b_sc_right_reg_buf2 = tlx.local_load(
+        smem_bs[3 if ASYNC_SCALE_LDS else 0],
+        layout=scale_b_layout,
+    )
 
     offs_cm = tl.arange(0, BLOCK_M)
     offs_cn_left = pid_n * BLOCK_N + tl.arange(0, HALF_N)
@@ -409,6 +572,14 @@ def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
     # from smaller groups so work reaches additional N tiles sooner.
     num_pid_n = triton.cdiv(N, BLOCK_N)
     group_size_m = 16 if num_pid_n <= 16 else 8
+    # At long K, fold the scale copies into the direct-to-LDS async groups.
+    # This avoids the intermediate VGPR -> LDS scale stores and reduces the
+    # generated wait/barrier count. At K=4096 the extra LDS footprint is a
+    # small regression, so retain the compact register-staged path there.
+    async_scale_lds = K >= 8192 and BLOCK_M == 128
+    sched_strategy = (
+        "max-memory-clause" if async_scale_lds else "iterative-ilp"
+    )
 
     _a4w4_kernel[(grid_mn, )](
         a,
@@ -435,10 +606,11 @@ def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
         GROUP_SIZE_M=group_size_m,
         NUM_XCDS=8,
         GRID_MN=grid_mn,
+        ASYNC_SCALE_LDS=async_scale_lds,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,
         schedule_hint="scaled_gemm",
-        llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-ilp"), ),
+        llvm_fn_attrs=(("amdgpu-sched-strategy", sched_strategy), ),
     )
     return c

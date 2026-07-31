@@ -1226,6 +1226,19 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_async_scale_lds_correctness_gfx950(device):
+    # K >= 8192 and BLOCK_M=128 select the direct-to-LDS scale pipeline.
+    m = n = 256
+    k = 8192
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_intra_wave_matmul(
+        a, b, a_scales, b_scales, BLOCK_M=128
+    )
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
     # Exercise the explicit 8-wave kernel even though measured public dispatch
     # now prefers shape-matched 4-wave kernels.
