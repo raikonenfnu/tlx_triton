@@ -55,7 +55,7 @@ import triton
 # intra-wave based on the output grid. EXPECTED_TLX_SHA256 pins that exact file
 # so the benchmarked kernel cannot silently drift; pass --allow-source-mismatch
 # to benchmark a modified copy. AITER is the baseline.
-EXPECTED_TLX_SHA256 = "e75eb82bd32ba90861499bbd6f50e81455e17a42620a56d2980261112b3ec593"
+EXPECTED_TLX_SHA256 = "38349da71f489d0e0a3759850202750c624d423f3404c93f15a002ed2d94d242"
 TLX_MODULE = (
     "triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel"
 )

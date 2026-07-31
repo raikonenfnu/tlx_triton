@@ -1305,6 +1305,8 @@ def test_a4w4_gfx950_dispatch_policy():
     assert _a4w4_choose_skinny_block_m(256, 8192) == 64
     assert _a4w4_choose_skinny_block_m(512, 8192) == 128
     assert _a4w4_choose_skinny_buffer_count(256, 4096, 4096) == 4
+    assert _a4w4_choose_skinny_buffer_count(256, 8192, 8192) == 4
+    assert _a4w4_choose_skinny_buffer_count(512, 4096, 8192) == 4
     assert _a4w4_choose_skinny_buffer_count(256, 4096, 8192) == 2
     assert _a4w4_choose_skinny_buffer_count(512, 4096, 4096) == 2
     assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 1
