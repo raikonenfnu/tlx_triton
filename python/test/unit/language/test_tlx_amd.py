@@ -42,6 +42,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     _matmul_256tile as _a4w4_inter_wave_256tile,
     _matmul_skinny as _a4w4_inter_wave_skinny,
     choose_skinny_block_m as _a4w4_choose_skinny_block_m,
+    choose_skinny_buffer_count as _a4w4_choose_skinny_buffer_count,
     choose_split_k_skinny as _a4w4_choose_split_k_skinny,
     matmul as _a4w4_inter_wave_matmul,
     select_matmul_path as _a4w4_select_matmul_path,
@@ -1303,6 +1304,9 @@ def test_a4w4_gfx950_dispatch_policy():
     assert _a4w4_choose_skinny_block_m(512, 4096) == 64
     assert _a4w4_choose_skinny_block_m(256, 8192) == 64
     assert _a4w4_choose_skinny_block_m(512, 8192) == 128
+    assert _a4w4_choose_skinny_buffer_count(256, 4096, 4096) == 4
+    assert _a4w4_choose_skinny_buffer_count(256, 4096, 8192) == 2
+    assert _a4w4_choose_skinny_buffer_count(512, 4096, 4096) == 2
     assert _a4w4_choose_split_k_skinny(256, 4096, 4096) == 1
     assert _a4w4_choose_split_k_skinny(256, 8192, 4096) == 1
     assert _a4w4_choose_split_k_skinny(512, 4096, 4096) == 1

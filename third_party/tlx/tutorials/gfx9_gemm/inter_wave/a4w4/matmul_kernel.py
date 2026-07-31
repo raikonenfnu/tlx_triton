@@ -642,6 +642,7 @@ def _a4w4_skinny_kernel(
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    BUFFER_COUNT: tl.constexpr,
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
     NG: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE
@@ -811,13 +812,13 @@ def _a4w4_skinny_kernel(
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), 2, layout=shared_tile_a)
-    smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), 2, layout=shared_tile_b)
+    smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), BUFFER_COUNT, layout=shared_tile_a)
+    smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), BUFFER_COUNT, layout=shared_tile_b)
     if BLOCK_M == 32:
-        smem_asc = tlx.local_alloc((BLOCK_M // 4, NG), tl.uint32, 2, layout=shared_scales)
+        smem_asc = tlx.local_alloc((BLOCK_M // 4, NG), tl.uint32, BUFFER_COUNT, layout=shared_scales)
     else:
-        smem_asc = tlx.local_alloc((BLOCK_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
-    smem_bsc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
+        smem_asc = tlx.local_alloc((BLOCK_M, NG), tlx.dtype_of(a_scales_ptr), BUFFER_COUNT, layout=shared_scales)
+    smem_bsc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), BUFFER_COUNT, layout=shared_scales)
 
     offs_am = tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BKP)
@@ -858,104 +859,89 @@ def _a4w4_skinny_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     tl.assume(iter_max > 1)
 
-    # Prologue: buffers 0,1 (K-steps 0,1); one commit per buffer.
-    tlx.buffer_load_to_local(smem_a[0], a_base, a_off)
-    tlx.buffer_load_to_local(smem_asc[0], a_scales_load_ptr, asc_off)
-    tlx.buffer_load_to_local(smem_b[0], b_base, b_off)
-    tlx.buffer_load_to_local(smem_bsc[0], b_scales_ptr, bsc_off)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a[1], a_base + ak, a_off)
-    tlx.buffer_load_to_local(smem_asc[1], a_scales_load_ptr + sck_a, asc_off)
-    tlx.buffer_load_to_local(smem_b[1], b_base + bk, b_off)
-    tlx.buffer_load_to_local(smem_bsc[1], b_scales_ptr + sck_b, bsc_off)
-    tlx.async_load_commit_group()
-    a_base += ak * 2
-    b_base += bk * 2
-    a_scales_load_ptr += sck_a * 2
-    b_scales_ptr += sck_b * 2
+    # Keep a true ring of independent K-tiles live.  A static inner loop makes
+    # every stage visible to LLVM while the outer loop remains rolled.
+    for stage in tl.static_range(0, BUFFER_COUNT):
+        tlx.buffer_load_to_local(smem_a[stage], a_base + stage * ak, a_off)
+        tlx.buffer_load_to_local(
+            smem_asc[stage], a_scales_load_ptr + stage * sck_a, asc_off
+        )
+        tlx.buffer_load_to_local(smem_b[stage], b_base + stage * bk, b_off)
+        tlx.buffer_load_to_local(
+            smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off
+        )
+        tlx.async_load_commit_group()
+    a_base += ak * BUFFER_COUNT
+    b_base += bk * BUFFER_COUNT
+    a_scales_load_ptr += sck_a * BUFFER_COUNT
+    b_scales_ptr += sck_b * BUFFER_COUNT
 
-    # Main loop (2x unrolled): consume a buffer, refill it one K-step ahead.
-    for k in tl.range(0, iter_max - 2, 2, num_stages=1):
-        tlx.async_load_wait_group(1)
-        a = tlx.local_load(smem_a[0], relaxed=True)
-        b = tlx.local_load(tlx.local_trans(smem_b[0]), relaxed=True)
+    for k in tl.range(
+        0, iter_max - BUFFER_COUNT, BUFFER_COUNT, num_stages=1
+    ):
+        for stage in tl.static_range(0, BUFFER_COUNT):
+            tlx.async_load_wait_group(BUFFER_COUNT - 1)
+            a = tlx.local_load(smem_a[stage], relaxed=True)
+            b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
+            if BLOCK_M == 32:
+                asc_view = tlx.local_reinterpret(
+                    smem_asc[stage],
+                    tl.uint8,
+                    [BLOCK_M // 4, NG, 4],
+                    shared_scale_bytes,
+                )
+                asc_view = tlx.local_trans(asc_view, (0, 2, 1))
+                asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
+                asc = tlx.local_load(asc_view, layout=scale_a_layout)
+            else:
+                asc = tlx.local_load(
+                    smem_asc[stage], layout=scale_a_layout
+                )
+            bsc = tlx.local_load(
+                smem_bsc[stage], layout=scale_b_layout
+            )
+            acc = tl.dot_scaled(
+                a, asc, "e2m1", b, bsc, "e2m1", acc
+            )
+            tlx.buffer_load_to_local(
+                smem_a[stage], a_base + stage * ak, a_off
+            )
+            tlx.buffer_load_to_local(
+                smem_asc[stage],
+                a_scales_load_ptr + stage * sck_a,
+                asc_off,
+            )
+            tlx.buffer_load_to_local(
+                smem_b[stage], b_base + stage * bk, b_off
+            )
+            tlx.buffer_load_to_local(
+                smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off
+            )
+            tlx.async_load_commit_group()
+        a_base += ak * BUFFER_COUNT
+        b_base += bk * BUFFER_COUNT
+        a_scales_load_ptr += sck_a * BUFFER_COUNT
+        b_scales_ptr += sck_b * BUFFER_COUNT
+
+    # Drain the ring without refilling it.
+    for stage in tl.static_range(0, BUFFER_COUNT):
+        tlx.async_load_wait_group(BUFFER_COUNT - 1 - stage)
+        a = tlx.local_load(smem_a[stage], relaxed=True)
+        b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
         if BLOCK_M == 32:
             asc_view = tlx.local_reinterpret(
-                smem_asc[0], tl.uint8, [BLOCK_M // 4, NG, 4], shared_scale_bytes
+                smem_asc[stage],
+                tl.uint8,
+                [BLOCK_M // 4, NG, 4],
+                shared_scale_bytes,
             )
             asc_view = tlx.local_trans(asc_view, (0, 2, 1))
             asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
             asc = tlx.local_load(asc_view, layout=scale_a_layout)
         else:
-            asc = tlx.local_load(smem_asc[0], layout=scale_a_layout)
-        bsc = tlx.local_load(smem_bsc[0], layout=scale_b_layout)
+            asc = tlx.local_load(smem_asc[stage], layout=scale_a_layout)
+        bsc = tlx.local_load(smem_bsc[stage], layout=scale_b_layout)
         acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
-        tlx.buffer_load_to_local(smem_a[0], a_base, a_off)
-        tlx.buffer_load_to_local(smem_asc[0], a_scales_load_ptr, asc_off)
-        tlx.buffer_load_to_local(smem_b[0], b_base, b_off)
-        tlx.buffer_load_to_local(smem_bsc[0], b_scales_ptr, bsc_off)
-        tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(1)
-        a = tlx.local_load(smem_a[1], relaxed=True)
-        b = tlx.local_load(tlx.local_trans(smem_b[1]), relaxed=True)
-        if BLOCK_M == 32:
-            asc_view = tlx.local_reinterpret(
-                smem_asc[1], tl.uint8, [BLOCK_M // 4, NG, 4], shared_scale_bytes
-            )
-            asc_view = tlx.local_trans(asc_view, (0, 2, 1))
-            asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
-            asc = tlx.local_load(asc_view, layout=scale_a_layout)
-        else:
-            asc = tlx.local_load(smem_asc[1], layout=scale_a_layout)
-        bsc = tlx.local_load(smem_bsc[1], layout=scale_b_layout)
-        acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
-        tlx.buffer_load_to_local(smem_a[1], a_base + ak, a_off)
-        tlx.buffer_load_to_local(smem_asc[1], a_scales_load_ptr + sck_a, asc_off)
-        tlx.buffer_load_to_local(smem_b[1], b_base + bk, b_off)
-        tlx.buffer_load_to_local(smem_bsc[1], b_scales_ptr + sck_b, bsc_off)
-        tlx.async_load_commit_group()
-        a_base += ak * 2
-        b_base += bk * 2
-        a_scales_load_ptr += sck_a * 2
-        b_scales_ptr += sck_b * 2
-
-    # Epilogue: drain the two prefetched buffers (no refill).
-    tlx.async_load_wait_group(1)
-    a = tlx.local_load(tlx.local_view(smem_a, 0), relaxed=True)
-    b = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b, 0)), relaxed=True)
-    if BLOCK_M == 32:
-        asc_view = tlx.local_reinterpret(
-            tlx.local_view(smem_asc, 0),
-            tl.uint8,
-            [BLOCK_M // 4, NG, 4],
-            shared_scale_bytes,
-        )
-        asc_view = tlx.local_trans(asc_view, (0, 2, 1))
-        asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
-        asc = tlx.local_load(asc_view, layout=scale_a_layout)
-    else:
-        asc = tlx.local_load(tlx.local_view(smem_asc, 0), layout=scale_a_layout)
-    bsc = tlx.local_load(tlx.local_view(smem_bsc, 0), layout=scale_b_layout)
-    acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
-
-    tlx.async_load_wait_group(0)
-    a = tlx.local_load(tlx.local_view(smem_a, 1), relaxed=True)
-    b = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b, 1)), relaxed=True)
-    if BLOCK_M == 32:
-        asc_view = tlx.local_reinterpret(
-            tlx.local_view(smem_asc, 1),
-            tl.uint8,
-            [BLOCK_M // 4, NG, 4],
-            shared_scale_bytes,
-        )
-        asc_view = tlx.local_trans(asc_view, (0, 2, 1))
-        asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
-        asc = tlx.local_load(asc_view, layout=scale_a_layout)
-    else:
-        asc = tlx.local_load(tlx.local_view(smem_asc, 1), layout=scale_a_layout)
-    bsc = tlx.local_load(tlx.local_view(smem_bsc, 1), layout=scale_b_layout)
-    acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
 
     offs_cm = tl.arange(0, BLOCK_M)
     offs_cn = tl.arange(0, BLOCK_N)
@@ -1009,6 +995,11 @@ def choose_split_k_skinny(M, N, K, block_m=None):
     return best
 
 
+def choose_skinny_buffer_count(M, N, K):
+    """Use a deeper operand ring only for the measured native 32x128 tile."""
+    return 4 if M == 256 and N == 4096 and K == 4096 else 2
+
+
 def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     """32/64/128x128 TLX path for occupancy-starved shapes."""
     M = a.shape[0]
@@ -1032,6 +1023,7 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
+    buffer_count = choose_skinny_buffer_count(M, N, K)
     schedule_hint = "scaled_gemm"
     # The full-grid 128x128 variant is LDS-wait bound.  These measured region
     # models schedule its reads around MFMA better without affecting other
@@ -1068,6 +1060,7 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
+        BUFFER_COUNT=buffer_count,
         num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=32,
