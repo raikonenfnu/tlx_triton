@@ -222,6 +222,46 @@
     .event h3 { margin: 0 0 4px; font-size: 1.05rem; }
     .event p { margin: 0; font-size: 0.92rem; }
     .formula { margin: 24px 0; padding: 24px; text-align: center; border-radius: 14px; color: white; background: linear-gradient(120deg, rgba(113, 183, 255, 0.12), rgba(189, 156, 255, 0.10)); font: 700 clamp(1rem, 2vw, 1.3rem)/1.5 ui-monospace, monospace; }
+    .axis-legend { display: flex; flex-wrap: wrap; gap: 9px; margin: 18px 0; }
+    .axis-pill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 999px; color: #dbe9fb; background: rgba(255,255,255,0.045); font: 700 0.76rem/1.4 ui-monospace, monospace; }
+    .axis-pill::before { content: ""; width: 9px; height: 9px; border-radius: 3px; background: var(--axis, var(--blue)); box-shadow: 0 0 10px color-mix(in srgb, var(--axis, var(--blue)), transparent 35%); }
+    .shape-flow { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px; margin: 25px 0; }
+    .shape-box { min-width: 135px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: rgba(16, 29, 48, 0.92); text-align: center; }
+    .shape-box b { display: block; color: white; font: 800 0.9rem/1.4 ui-monospace, monospace; }
+    .shape-box small { color: var(--muted); }
+    .shape-arrow { color: var(--cyan); font-size: 1.3rem; font-weight: 900; }
+    .memory-compare { display: grid; grid-template-columns: 1fr 76px 1fr; gap: 16px; align-items: center; margin: 28px 0; }
+    .memory-panel { padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: rgba(10, 19, 33, 0.78); }
+    .memory-panel h3 { margin-top: 0; }
+    .matrix-map { display: grid; grid-template-columns: repeat(8, minmax(18px, 1fr)); gap: 4px; margin-top: 15px; }
+    .matrix-map span { aspect-ratio: 1.35; display: grid; place-items: center; border-radius: 4px; color: rgba(255,255,255,0.75); background: color-mix(in srgb, var(--cell, var(--blue)), transparent 66%); border: 1px solid color-mix(in srgb, var(--cell, var(--blue)), transparent 48%); font: 700 0.58rem/1 ui-monospace, monospace; }
+    .reorder-arrow { text-align: center; color: var(--cyan); font-size: 2.3rem; font-weight: 900; }
+    .reorder-arrow small { display: block; color: var(--muted); font: 600 0.65rem/1.3 ui-sans-serif, sans-serif; }
+    .address-eq { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; margin: 20px 0; }
+    .address-eq > div { padding: 17px; border-radius: 13px; background: #060c15; border: 1px solid var(--line); color: #dceaff; font: 700 0.82rem/1.65 ui-monospace, monospace; overflow-x: auto; }
+    .trace-lab { margin: 28px 0; padding: 24px; border: 1px solid rgba(92, 225, 208, 0.25); border-radius: var(--radius); background: linear-gradient(145deg, rgba(12,31,47,0.93), rgba(10,18,31,0.9)); }
+    .trace-lab h3 { margin-top: 0; }
+    .trace-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0 20px; }
+    .trace-button { padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; color: #dceaff; background: rgba(113,183,255,0.07); cursor: pointer; font: 700 0.76rem/1.3 ui-monospace, monospace; }
+    .trace-button:hover, .trace-button.active { color: #07111b; border-color: var(--cyan); background: var(--cyan); }
+    .trace-grid { display: grid; grid-template-columns: repeat(5, minmax(90px,1fr)); gap: 9px; }
+    .trace-value { padding: 12px 9px; border-radius: 10px; background: rgba(255,255,255,0.045); text-align: center; }
+    .trace-value b { display: block; color: var(--cyan); font: 900 1.12rem/1.3 ui-monospace, monospace; }
+    .trace-value small { color: var(--muted); font-size: 0.68rem; }
+    .trace-offsets { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .trace-offsets div { padding: 12px; border-radius: 10px; background: #060c15; color: #dceaff; font: 700 0.78rem/1.45 ui-monospace, monospace; text-align: center; }
+    .pipeline-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 26px 0; }
+    .pipe-lane { padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: rgba(10,18,31,0.82); }
+    .pipe-lane h3 { margin-top: 0; }
+    .pipe-steps { display: flex; flex-direction: column; gap: 8px; }
+    .pipe-step { position: relative; padding: 10px 12px; border-left: 3px solid var(--step, var(--blue)); border-radius: 7px; background: color-mix(in srgb, var(--step, var(--blue)), transparent 91%); color: #d5e3f6; font-size: 0.82rem; }
+    .pipe-step:not(:last-child)::after { content: "↓"; position: absolute; left: 50%; bottom: -15px; z-index: 2; color: var(--muted); }
+    .vector-strip { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; margin: 12px 0; }
+    .vector-strip span { height: 24px; display: grid; place-items: center; border-radius: 3px; color: #07111b; background: linear-gradient(180deg, var(--cyan), #42adca); font: 900 0.52rem/1 ui-monospace, monospace; }
+    .verdict-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 14px; margin: 24px 0; }
+    .verdict { padding: 18px; border-radius: 14px; border-top: 3px solid var(--verdict, var(--amber)); background: var(--panel); }
+    .verdict b { display: block; color: white; }
+    .verdict small { color: var(--muted); }
     .checklist { list-style: none; padding: 0; }
     .checklist li { position: relative; margin: 10px 0; padding-left: 30px; color: #bdcbe0; }
     .checklist li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 900; }
@@ -234,11 +274,16 @@
       .grid-4 { grid-template-columns: repeat(2, 1fr); }
       .flow { grid-template-columns: 1fr; }
       .flow .node:not(:last-child)::after { content: "↓"; right: 50%; top: auto; bottom: -20px; transform: translateX(50%); }
+      .memory-compare { grid-template-columns: 1fr; }
+      .reorder-arrow { transform: rotate(90deg); }
+      .trace-grid { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 700px) {
       .shell { width: min(100% - 22px, 1440px); }
       .hero { min-height: auto; padding-top: 52px; }
       .grid-2, .grid-3, .grid-4, .decision-grid { grid-template-columns: 1fr; }
+      .address-eq, .trace-offsets, .pipeline-compare, .verdict-grid { grid-template-columns: 1fr; }
+      .trace-grid { grid-template-columns: repeat(2, 1fr); }
       aside { columns: 1; }
       h1 { font-size: 3.25rem; }
       .analogy { grid-template-columns: 1fr; }
@@ -545,25 +590,210 @@ scratch_load_dword  ... ; Folded Reload</span>
       </section>
 
       <section id="preshuffle">
-        <div class="section-no">Lecture 10 · Controlled negative result</div>
-        <h2>Pre-shuffling B is useful—but not magic</h2>
-        <p>AITER accepts pre-shuffled B and scales. We reproduced the weight permutation and exposed it through a separate cached-weight ABI rather than silently changing the raw API.</p>
-        <div class="code-card">
-          <div class="code-title"><span>Physical packed-B slab</span><span>metadata-only LDS view</span></div>
-          <pre>[8, 2048]
-  → reshape   [8, 4, 2, 16, 16]
-  → transpose [8, 16, 4, 2, 16]
-  → reshape   [128, 128]
-  → local_trans for the MFMA operand</pre>
+        <div class="section-no">Lecture 10 · Weight-layout laboratory</div>
+        <h2>B pre-shuffling, one byte at a time</h2>
+        <p class="thesis">Pre-shuffling does not change a weight value. It changes which values live next to each other in memory so that the kernel's natural unit of work—a 16-byte vector inside a 16-row microtile—can be copied and reinterpreted with less awkward addressing.</p>
+
+        <div class="analogy">
+          <div class="icon">📚</div>
+          <div><h3>Same books, different shelving</h3><p>Raw B shelves every K byte for row 0, then every K byte for row 1. The shuffled layout groups one K micro-block across 16 neighboring N rows. No book changes; only the shelving order changes. This helps only when the readers repeatedly ask for that same 16-row × 32-byte bundle.</p></div>
         </div>
-        <p>For M=256, packed B improved TLX by about 1–2%. For M=512 it was neutral or slightly slower. On medium and large kernels it usually moved performance by less than 1.5% and did not remove a load, LDS stage, barrier, or MFMA. Therefore:</p>
-        <ul class="checklist">
-          <li>Small-M packed B remains an explicit opt-in ABI for cached weights.</li>
-          <li>Raw B remains the public default and the basis of the unified 13-shape table.</li>
-          <li>Pre-shuffled B-scales were rejected: direct loads landed on the MFMA critical path and regressed to roughly 22 µs.</li>
-          <li>The large BM256 spill existed before packing; packed B merely enlarged the existing spill frame.</li>
-        </ul>
-        <div class="callout"><strong>Lesson:</strong> A permutation helps only if it removes work or relocates a dependency. A different address sequence with the same instruction families is usually a small, shape-dependent effect.</div>
+
+        <h3>Step 1 · Decompose a logical coordinate</h3>
+        <p>Take one logical packed-B tile with <code>BLOCK_N=128</code> rows and <code>BKP=128</code> packed-K bytes. AITER's <code>shuffle_weight(layout=(16,16))</code> factors a coordinate <code>(n, k_byte)</code> into five axes:</p>
+
+        <div class="axis-legend">
+          <span class="axis-pill" style="--axis:var(--violet)">N-block · 8 groups</span>
+          <span class="axis-pill" style="--axis:var(--blue)">K-block · 4 groups</span>
+          <span class="axis-pill" style="--axis:var(--amber)">K-half · 2 groups</span>
+          <span class="axis-pill" style="--axis:var(--green)">N-row · 16 rows</span>
+          <span class="axis-pill" style="--axis:var(--cyan)">K-byte16 · 16 bytes</span>
+        </div>
+
+        <div class="address-eq">
+          <div><span class="hl-blue">n</span> = N_block × 16 + N_row<br><span class="hl-blue">k_byte</span> = K_block × 32 + K_half × 16 + K_byte16</div>
+          <div><span class="hl-green">axis sizes</span> = [8, 4, 2, 16, 16]<br><span class="hl-green">product</span> = 8 × 4 × 2 × 16 × 16 = 16,384 bytes</div>
+        </div>
+
+        <p>Raw row-major storage orders these axes as:</p>
+        <div class="formula">raw B: [N-block, N-row, K-block, K-half, K-byte16]</div>
+        <p>The AITER-compatible shuffled storage moves <code>N-row</code> inside a particular K block/half:</p>
+        <div class="formula">shuffled B: [N-block, K-block, K-half, N-row, K-byte16]</div>
+
+        <div class="memory-compare" aria-label="Raw and shuffled B memory ordering">
+          <div class="memory-panel">
+            <h3>Raw row-major stream</h3>
+            <p>Finish K chunks for one N row before moving to the next row.</p>
+            <div class="matrix-map" aria-label="Raw B order sample">
+              <span style="--cell:var(--violet)">n0k0</span><span style="--cell:var(--blue)">n0k1</span><span style="--cell:var(--amber)">n0k2</span><span style="--cell:var(--cyan)">n0k3</span><span style="--cell:var(--violet)">n0k4</span><span style="--cell:var(--blue)">n0k5</span><span style="--cell:var(--amber)">n0k6</span><span style="--cell:var(--cyan)">n0k7</span>
+              <span style="--cell:var(--violet)">n1k0</span><span style="--cell:var(--blue)">n1k1</span><span style="--cell:var(--amber)">n1k2</span><span style="--cell:var(--cyan)">n1k3</span><span style="--cell:var(--violet)">n1k4</span><span style="--cell:var(--blue)">n1k5</span><span style="--cell:var(--amber)">n1k6</span><span style="--cell:var(--cyan)">n1k7</span>
+              <span style="--cell:var(--violet)">n2k0</span><span style="--cell:var(--blue)">n2k1</span><span style="--cell:var(--amber)">n2k2</span><span style="--cell:var(--cyan)">n2k3</span><span style="--cell:var(--violet)">n2k4</span><span style="--cell:var(--blue)">n2k5</span><span style="--cell:var(--amber)">n2k6</span><span style="--cell:var(--cyan)">n2k7</span>
+              <span style="--cell:var(--violet)">n3k0</span><span style="--cell:var(--blue)">n3k1</span><span style="--cell:var(--amber)">n3k2</span><span style="--cell:var(--cyan)">n3k3</span><span style="--cell:var(--violet)">n3k4</span><span style="--cell:var(--blue)">n3k5</span><span style="--cell:var(--amber)">n3k6</span><span style="--cell:var(--cyan)">n3k7</span>
+            </div>
+          </div>
+          <div class="reorder-arrow">⇄<small>permute axes</small></div>
+          <div class="memory-panel">
+            <h3>Shuffled microtile stream</h3>
+            <p>Finish one K chunk across N rows before advancing K.</p>
+            <div class="matrix-map" aria-label="Shuffled B order sample">
+              <span style="--cell:var(--violet)">n0k0</span><span style="--cell:var(--violet)">n1k0</span><span style="--cell:var(--violet)">n2k0</span><span style="--cell:var(--violet)">n3k0</span><span style="--cell:var(--violet)">n4k0</span><span style="--cell:var(--violet)">n5k0</span><span style="--cell:var(--violet)">n6k0</span><span style="--cell:var(--violet)">n7k0</span>
+              <span style="--cell:var(--blue)">n0k1</span><span style="--cell:var(--blue)">n1k1</span><span style="--cell:var(--blue)">n2k1</span><span style="--cell:var(--blue)">n3k1</span><span style="--cell:var(--blue)">n4k1</span><span style="--cell:var(--blue)">n5k1</span><span style="--cell:var(--blue)">n6k1</span><span style="--cell:var(--blue)">n7k1</span>
+              <span style="--cell:var(--amber)">n0k2</span><span style="--cell:var(--amber)">n1k2</span><span style="--cell:var(--amber)">n2k2</span><span style="--cell:var(--amber)">n3k2</span><span style="--cell:var(--amber)">n4k2</span><span style="--cell:var(--amber)">n5k2</span><span style="--cell:var(--amber)">n6k2</span><span style="--cell:var(--amber)">n7k2</span>
+              <span style="--cell:var(--cyan)">n0k3</span><span style="--cell:var(--cyan)">n1k3</span><span style="--cell:var(--cyan)">n2k3</span><span style="--cell:var(--cyan)">n3k3</span><span style="--cell:var(--cyan)">n4k3</span><span style="--cell:var(--cyan)">n5k3</span><span style="--cell:var(--cyan)">n6k3</span><span style="--cell:var(--cyan)">n7k3</span>
+            </div>
+          </div>
+        </div>
+
+        <h3>Step 2 · The host transform is only a view, permutation, and copy</h3>
+        <div class="code-card">
+          <div class="code-title"><span>AITER-compatible transformation</span><span>raw [N, K/2] → shuffled physical storage</span></div>
+          <pre>b_preshuffled = (
+    b.view(N // 16, 16, (K // 2) // 32, 2, 16)
+     <span class="hl-green">.permute(0, 2, 3, 1, 4)</span>
+     .contiguous()
+     .view_as(b)
+)
+
+<span class="hl-blue"># Before permutation:</span> [N_block, N_row, K_block, K_half, K_byte16]
+<span class="hl-blue"># After permutation: </span> [N_block, K_block, K_half, N_row, K_byte16]</pre>
+        </div>
+
+        <p>The innermost axis remains exactly 16 bytes. That is deliberate: each thread receives complete aligned vector packets rather than a byte gather. For the four-wave 32/64×128 kernels, the physical load layout assigns four 16-byte vectors per thread; the eight-wave 128×128 kernel assigns two.</p>
+        <div class="vector-strip" aria-label="One contiguous 16-byte packet">
+          <span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span><span>11</span><span>12</span><span>13</span><span>14</span><span>15</span>
+        </div>
+
+        <div class="trace-lab" id="byte-tracer">
+          <h3>Interactive byte tracer</h3>
+          <p>Choose a logical byte from one 128×128 packed-B tile. The decomposition and both physical offsets update below.</p>
+          <div class="trace-buttons">
+            <button class="trace-button active" data-n="0" data-k="0">B[0,0]</button>
+            <button class="trace-button" data-n="1" data-k="16">B[1,16]</button>
+            <button class="trace-button" data-n="17" data-k="33">B[17,33]</button>
+            <button class="trace-button" data-n="63" data-k="79">B[63,79]</button>
+            <button class="trace-button" data-n="127" data-k="127">B[127,127]</button>
+          </div>
+          <div class="trace-grid">
+            <div class="trace-value"><b id="trace-nb">0</b><small>N_block = n / 16</small></div>
+            <div class="trace-value"><b id="trace-kb">0</b><small>K_block = k / 32</small></div>
+            <div class="trace-value"><b id="trace-kh">0</b><small>K_half = (k % 32) / 16</small></div>
+            <div class="trace-value"><b id="trace-nr">0</b><small>N_row = n % 16</small></div>
+            <div class="trace-value"><b id="trace-k16">0</b><small>K_byte16 = k % 16</small></div>
+          </div>
+          <div class="trace-offsets">
+            <div>raw offset = <span id="trace-raw" class="hl-amber">0</span><br><small>n × 128 + k</small></div>
+            <div>shuffled offset = <span id="trace-packed" class="hl-green">0</span><br><small>((((Nb×4+Kb)×2+Kh)×16+Nr)×16+K16)</small></div>
+          </div>
+        </div>
+
+        <h3>Step 3 · Global storage enters LDS as a compact physical slab</h3>
+        <p>One logical <code>[128 N, 128 packed-K]</code> tile contains 16,384 bytes. In shuffled form, TLX copies it as eight physical rows of 2,048 bytes—one row per 16-row N block. Across a full matrix, those rows are separated by the full-K physical stride; inside LDS they become a compact <code>[8,2048]</code> allocation.</p>
+
+        <div class="shape-flow" aria-label="Preshuffled B LDS view transformation">
+          <div class="shape-box"><b>[8, 2048]</b><small>physical LDS slab</small></div><div class="shape-arrow">→</div>
+          <div class="shape-box"><b>[8,4,2,16,16]</b><small>recover five axes</small></div><div class="shape-arrow">→</div>
+          <div class="shape-box"><b>[4,2,16,8,16]</b><small>permute (1,2,4,0,3)</small></div><div class="shape-arrow">→</div>
+          <div class="shape-box"><b>[128,128]</b><small>[packed-K, N]</small></div><div class="shape-arrow">→</div>
+          <div class="shape-box"><b>dot operand B</b><small>local_load for MFMA</small></div>
+        </div>
+
+        <div class="code-card">
+          <div class="code-title"><span>TLX kernel view</span><span>reshape/trans/reshape move no bytes</span></div>
+          <pre>smem_b = tlx.local_alloc((8, 2048), ..., BUFFER_COUNT)
+tlx.buffer_load_to_local(smem_b[stage], b_base, b_off)
+
+b_view = tlx.local_reshape(smem_b[stage], [8, 4, 2, 16, 16])
+b_view = tlx.local_trans(b_view, <span class="hl-green">(1, 2, 4, 0, 3)</span>)
+b_view = tlx.local_reshape(b_view, [128, 128])  <span class="hl-blue"># [packed-K, N]</span>
+b = tlx.local_load(b_view, relaxed=True)
+
+<span class="hl-green"># No global gather. No register transpose. The LDS view carries the permutation.</span></pre>
+        </div>
+
+        <h3>Raw and shuffled kernels still perform the same major work</h3>
+        <div class="pipeline-compare">
+          <div class="pipe-lane">
+            <h3>Raw B path</h3>
+            <div class="pipe-steps">
+              <div class="pipe-step" style="--step:var(--blue)">row-major B addresses</div>
+              <div class="pipe-step" style="--step:var(--cyan)">async global → padded LDS [128,128]</div>
+              <div class="pipe-step" style="--step:var(--violet)">metadata local transpose</div>
+              <div class="pipe-step" style="--step:var(--green)">ds_read → MFMA B operand</div>
+            </div>
+          </div>
+          <div class="pipe-lane">
+            <h3>Pre-shuffled B path</h3>
+            <div class="pipe-steps">
+              <div class="pipe-step" style="--step:var(--blue)">microtile-ordered B addresses</div>
+              <div class="pipe-step" style="--step:var(--cyan)">async global → physical LDS [8,2048]</div>
+              <div class="pipe-step" style="--step:var(--violet)">metadata reshape/trans/reshape</div>
+              <div class="pipe-step" style="--step:var(--green)">ds_read → MFMA B operand</div>
+            </div>
+          </div>
+        </div>
+
+        <p>This is the central reason the speedup is modest: pre-shuffling improves address/LDS locality for some skinny schedules, but it does not delete the async copy, LDS stage, local read, barrier, or MFMA.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Static metric · 256×4096×4096</th><th>Raw B</th><th>Shuffled B</th><th>Difference</th></tr></thead>
+            <tbody>
+              <tr><td>VGPRs</td><td>81</td><td>83</td><td class="near">+2</td></tr>
+              <tr><td>SGPRs</td><td>100</td><td>100</td><td>none</td></tr>
+              <tr><td>Buffer loads</td><td>16 dword + 40 dwordx4</td><td>16 dword + 40 dwordx4</td><td>none</td></tr>
+              <tr><td>LDS reads</td><td>130</td><td>130</td><td>none</td></tr>
+              <tr><td>LDS writes</td><td>4</td><td>4</td><td>none</td></tr>
+              <tr><td>Scaled MFMA</td><td>32</td><td>32</td><td>none</td></tr>
+              <tr><td>Barriers</td><td>17</td><td>17</td><td>none</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Controlled performance: where packing helps</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>M × N × K</th><th>AITER asm</th><th>TLX raw B</th><th>TLX shuffled B</th><th>Shuffled vs raw</th></tr></thead>
+            <tbody>
+              <tr><td>256 × 4096 × 4096</td><td>13.24 µs</td><td>13.32 µs</td><td>13.04 µs</td><td class="win">+2.1%</td></tr>
+              <tr><td>256 × 8192 × 4096</td><td>16.68 µs</td><td>16.28 µs</td><td>16.12 µs</td><td class="win">+1.0%</td></tr>
+              <tr><td>512 × 4096 × 4096</td><td>15.00 µs</td><td>15.00 µs</td><td>15.08 µs</td><td class="near">−0.5%</td></tr>
+              <tr><td>512 × 8192 × 4096</td><td>21.08 µs</td><td>21.40 µs</td><td>21.48 µs</td><td class="near">−0.4%</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>On the non-spilling 128×256 medium/large path, the effect ranged from roughly −1.5% to +0.8%. The narrow best point was <code>1024×8192×4096</code> with <code>GROUP_SIZE_M=16</code>: 29.10 µs raw versus 28.88 µs shuffled, still about 0.7% behind the local AITER result.</p>
+
+        <div class="verdict-grid">
+          <div class="verdict" style="--verdict:var(--green)"><b>Use it</b><small>Cached/reused weights, exact AITER layout, measured M=256 skinny shapes.</small></div>
+          <div class="verdict" style="--verdict:var(--amber)"><b>Measure first</b><small>M=512 or medium shapes, where +2 VGPR and schedule movement can erase locality gains.</small></div>
+          <div class="verdict" style="--verdict:var(--red)"><b>Do not auto-pack</b><small>One-shot weights or large shapes: conversion cost and neutral kernel time cannot be amortized.</small></div>
+        </div>
+
+        <h3>Why shuffled B-scales lose badly</h3>
+        <p>It is tempting to pre-shuffle scales too. The experiment was correct, including an aligned four-byte packet version, but both variants remained around 22 µs versus roughly 13.5 µs for raw scales. The problem was not the width of the memory transaction; it was where the dependency landed.</p>
+
+        <div class="pipeline-compare">
+          <div class="pipe-lane">
+            <h3 class="hl-green">Raw B-scales</h3>
+            <div class="pipe-steps">
+              <div class="pipe-step" style="--step:var(--cyan)">async scale copy enters LDS ring early</div>
+              <div class="pipe-step" style="--step:var(--blue)">other operand work overlaps latency</div>
+              <div class="pipe-step" style="--step:var(--green)">local scale read is ready near MFMA</div>
+            </div>
+          </div>
+          <div class="pipe-lane">
+            <h3 class="hl-red">Shuffled direct B-scales</h3>
+            <div class="pipe-steps">
+              <div class="pipe-step" style="--step:var(--red)">direct global scale load</div>
+              <div class="pipe-step" style="--step:var(--red)">load result is immediately required</div>
+              <div class="pipe-step" style="--step:var(--red)">MFMA waits on the critical path</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout good"><strong>Final design:</strong> <code>matmul_preshuffled_b(a, packed_b, a_scales, raw_b_scales)</code> consumes the exact AITER weight layout but deliberately leaves both scale tensors in the existing raw/asynchronous pipeline.</div>
+        <div class="callout"><strong>General lesson:</strong> a permutation is valuable only when it removes work or relocates a dependency off the critical path. “More contiguous” is not a performance proof; the final instruction mix, live ranges, and wait placement decide.</div>
       </section>
 
       <section id="results">
@@ -685,6 +915,30 @@ scratch_load_dword  ... ; Folded Reload</span>
     const progress = document.getElementById('progress');
     const links = [...document.querySelectorAll('aside a')];
     const sections = [...document.querySelectorAll('main section')];
+    const traceButtons = [...document.querySelectorAll('.trace-button')];
+
+    function updateByteTrace(button) {
+      const n = Number(button.dataset.n);
+      const k = Number(button.dataset.k);
+      const nb = Math.floor(n / 16);
+      const nr = n % 16;
+      const kb = Math.floor(k / 32);
+      const kh = Math.floor((k % 32) / 16);
+      const k16 = k % 16;
+      const raw = n * 128 + k;
+      const packed = ((((nb * 4 + kb) * 2 + kh) * 16 + nr) * 16 + k16);
+
+      document.getElementById('trace-nb').textContent = nb;
+      document.getElementById('trace-kb').textContent = kb;
+      document.getElementById('trace-kh').textContent = kh;
+      document.getElementById('trace-nr').textContent = nr;
+      document.getElementById('trace-k16').textContent = k16;
+      document.getElementById('trace-raw').textContent = raw.toLocaleString();
+      document.getElementById('trace-packed').textContent = packed.toLocaleString();
+      traceButtons.forEach((candidate) => candidate.classList.toggle('active', candidate === button));
+    }
+
+    traceButtons.forEach((button) => button.addEventListener('click', () => updateByteTrace(button)));
 
     function updateProgress() {
       const max = document.documentElement.scrollHeight - innerHeight;
@@ -702,6 +956,7 @@ scratch_load_dword  ... ; Folded Reload</span>
 
     sections.forEach((section) => observer.observe(section));
     addEventListener('scroll', updateProgress, { passive: true });
+    if (traceButtons.length) updateByteTrace(traceButtons[0]);
     updateProgress();
   </script>
 </body>
