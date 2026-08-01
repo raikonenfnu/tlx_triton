@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>From 587 µs to 83 µs — Engineering A4W4 GEMM on gfx950</title>
+  <style>
+    :root {
+      --ink: #e9f1ff;
+      --muted: #9aabc3;
+      --paper: #09101c;
+      --paper-2: #0d1727;
+      --panel: rgba(18, 31, 51, 0.84);
+      --line: rgba(151, 181, 224, 0.18);
+      --blue: #71b7ff;
+      --cyan: #5ce1d0;
+      --amber: #ffc766;
+      --red: #ff7f8d;
+      --green: #79e59d;
+      --violet: #bd9cff;
+      --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
+      --radius: 20px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 15% 0%, rgba(92, 225, 208, 0.10), transparent 34rem),
+        radial-gradient(circle at 92% 16%, rgba(113, 183, 255, 0.13), transparent 36rem),
+        linear-gradient(180deg, #08101b 0%, #09111e 48%, #070d17 100%);
+      font: 16px/1.7 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.12;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(to bottom, black, transparent 75%);
+    }
+    a { color: var(--cyan); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: #a4fff4; }
+    code, pre, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-variant-ligatures: none;
+    }
+    code { color: #d8e8ff; }
+    .progress {
+      position: fixed;
+      inset: 0 auto auto 0;
+      z-index: 100;
+      width: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--blue), var(--violet));
+      box-shadow: 0 0 14px var(--cyan);
+    }
+    .shell { width: min(1440px, calc(100% - 36px)); margin: 0 auto; }
+    .hero {
+      min-height: 88vh;
+      display: grid;
+      align-items: center;
+      padding: 82px 0 64px;
+    }
+    .hero-grid { display: grid; grid-template-columns: 1.25fr 0.75fr; gap: 52px; align-items: center; }
+    .eyebrow {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      padding: 7px 12px;
+      border: 1px solid rgba(92, 225, 208, 0.28);
+      border-radius: 999px;
+      color: var(--cyan);
+      background: rgba(92, 225, 208, 0.06);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.12; text-wrap: balance; }
+    h1 { margin: 22px 0 20px; font-size: clamp(3rem, 7vw, 6.7rem); letter-spacing: -0.065em; }
+    h1 .gradient {
+      color: transparent;
+      background: linear-gradient(110deg, #fff 5%, var(--cyan) 48%, var(--blue) 80%);
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
+    .lede { max-width: 820px; color: #b8c7db; font-size: clamp(1.08rem, 2vw, 1.35rem); }
+    .hero-meta { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-top: 30px; color: var(--muted); font-size: 0.9rem; }
+    .hero-card, .card, .callout, .code-card, .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(21, 37, 60, 0.90), rgba(10, 19, 33, 0.88));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+    .hero-card { padding: 28px; position: relative; overflow: hidden; }
+    .hero-card::after {
+      content: "";
+      position: absolute;
+      width: 190px;
+      height: 190px;
+      right: -70px;
+      bottom: -70px;
+      border-radius: 50%;
+      background: rgba(92, 225, 208, 0.15);
+      filter: blur(20px);
+    }
+    .big-stat { font-size: clamp(4rem, 8vw, 7rem); font-weight: 900; letter-spacing: -0.08em; line-height: 0.95; color: var(--green); }
+    .big-stat-label { color: var(--muted); margin: 10px 0 26px; }
+    .meter { height: 11px; overflow: hidden; border-radius: 999px; background: #060b13; margin: 9px 0 20px; }
+    .meter > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--red), var(--amber)); }
+    .meter.good > span { background: linear-gradient(90deg, var(--cyan), var(--green)); }
+    .small-label { display: flex; justify-content: space-between; gap: 10px; color: #c8d5e7; font-size: 0.84rem; }
+    .layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 46px; align-items: start; }
+    aside {
+      position: sticky;
+      top: 28px;
+      max-height: calc(100vh - 56px);
+      overflow: auto;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(9, 17, 30, 0.86);
+      backdrop-filter: blur(12px);
+    }
+    aside strong { display: block; margin: 2px 10px 12px; font-size: 0.76rem; color: var(--cyan); letter-spacing: 0.12em; text-transform: uppercase; }
+    aside a { display: block; padding: 8px 10px; border-radius: 9px; color: var(--muted); text-decoration: none; font-size: 0.88rem; }
+    aside a:hover, aside a.active { color: white; background: rgba(113, 183, 255, 0.10); }
+    main { min-width: 0; padding-bottom: 100px; }
+    section { scroll-margin-top: 24px; margin-bottom: 100px; }
+    .section-no { color: var(--cyan); font-size: 0.78rem; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; }
+    h2 { margin: 9px 0 18px; font-size: clamp(2rem, 4.4vw, 4rem); letter-spacing: -0.045em; }
+    h3 { margin: 34px 0 12px; font-size: clamp(1.28rem, 2vw, 1.75rem); }
+    p { max-width: 900px; color: #bdcbe0; }
+    .thesis { color: #f1f7ff; font-size: 1.22rem; border-left: 3px solid var(--cyan); padding-left: 20px; }
+    .grid-2, .grid-3, .grid-4 { display: grid; gap: 18px; margin: 26px 0; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card { padding: 22px; box-shadow: none; }
+    .card h3 { margin-top: 0; font-size: 1.08rem; }
+    .card p { margin-bottom: 0; font-size: 0.94rem; }
+    .tag { display: inline-block; padding: 3px 8px; border-radius: 6px; color: var(--cyan); background: rgba(92, 225, 208, 0.08); font: 700 0.73rem/1.6 ui-monospace, monospace; }
+    .callout { margin: 28px 0; padding: 24px 26px; box-shadow: none; border-left: 4px solid var(--amber); }
+    .callout strong { color: var(--amber); }
+    .callout.good { border-left-color: var(--green); }
+    .callout.good strong { color: var(--green); }
+    .callout.danger { border-left-color: var(--red); }
+    .callout.danger strong { color: var(--red); }
+    .analogy {
+      display: grid;
+      grid-template-columns: 74px 1fr;
+      gap: 18px;
+      margin: 28px 0;
+      padding: 24px;
+      border-radius: var(--radius);
+      border: 1px dashed rgba(255, 199, 102, 0.45);
+      background: rgba(255, 199, 102, 0.055);
+    }
+    .analogy .icon { font-size: 2.6rem; line-height: 1; }
+    .analogy h3 { margin: 0 0 6px; color: var(--amber); }
+    .analogy p { margin: 0; }
+    pre {
+      margin: 0;
+      padding: 22px;
+      overflow: auto;
+      color: #dceaff;
+      background: #060c15;
+      border-radius: 14px;
+      font-size: 0.82rem;
+      line-height: 1.58;
+      tab-size: 2;
+    }
+    .code-card { margin: 22px 0; padding: 10px; box-shadow: none; }
+    .code-title { display: flex; justify-content: space-between; gap: 12px; padding: 7px 10px 12px; color: var(--muted); font-size: 0.77rem; }
+    .hl-red { color: var(--red); }
+    .hl-green { color: var(--green); }
+    .hl-amber { color: var(--amber); }
+    .hl-blue { color: var(--blue); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 12px;
+      align-items: stretch;
+      margin: 28px 0;
+    }
+    .flow .node { position: relative; padding: 18px 14px; text-align: center; border: 1px solid var(--line); border-radius: 14px; background: rgba(15, 28, 46, 0.9); }
+    .flow .node:not(:last-child)::after { content: "→"; position: absolute; right: -18px; top: 50%; z-index: 2; color: var(--cyan); font-weight: 900; transform: translateY(-50%); }
+    .flow b { display: block; color: white; }
+    .flow span { color: var(--muted); font-size: 0.78rem; }
+    .decision { margin: 30px 0; padding: 26px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(8, 16, 28, 0.75); }
+    .decision-root { width: fit-content; margin: 0 auto 22px; padding: 12px 20px; border-radius: 999px; color: #07111b; background: linear-gradient(100deg, var(--cyan), var(--blue)); font-weight: 900; }
+    .decision-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .decision-node { padding: 18px; border-top: 3px solid var(--blue); border-radius: 12px; background: var(--panel); text-align: center; }
+    .decision-node:nth-child(1) { border-color: var(--violet); }
+    .decision-node:nth-child(2) { border-color: var(--cyan); }
+    .decision-node:nth-child(3) { border-color: var(--green); }
+    .decision-node b { display: block; font-size: 1.08rem; }
+    .decision-node small { color: var(--muted); }
+    .table-wrap { overflow-x: auto; margin: 26px 0; box-shadow: none; }
+    table { width: 100%; border-collapse: collapse; min-width: 740px; }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child, th:last-child, td:last-child { text-align: left; }
+    th { position: sticky; top: 0; color: #eaf4ff; background: #111f33; font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    td { color: #bccbe0; font-variant-numeric: tabular-nums; }
+    tr:hover td { background: rgba(113, 183, 255, 0.035); }
+    .win { color: var(--green); font-weight: 800; }
+    .loss { color: var(--red); font-weight: 700; }
+    .near { color: var(--amber); }
+    .timeline { position: relative; margin: 34px 0; padding-left: 34px; }
+    .timeline::before { content: ""; position: absolute; top: 8px; bottom: 8px; left: 8px; width: 2px; background: linear-gradient(var(--red), var(--amber), var(--cyan), var(--green)); }
+    .event { position: relative; margin: 0 0 28px; padding: 2px 0 0 18px; }
+    .event::before { content: ""; position: absolute; width: 14px; height: 14px; left: -32px; top: 8px; border-radius: 50%; background: var(--paper); border: 3px solid var(--cyan); box-shadow: 0 0 0 5px rgba(92, 225, 208, 0.08); }
+    .event h3 { margin: 0 0 4px; font-size: 1.05rem; }
+    .event p { margin: 0; font-size: 0.92rem; }
+    .formula { margin: 24px 0; padding: 24px; text-align: center; border-radius: 14px; color: white; background: linear-gradient(120deg, rgba(113, 183, 255, 0.12), rgba(189, 156, 255, 0.10)); font: 700 clamp(1rem, 2vw, 1.3rem)/1.5 ui-monospace, monospace; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; margin: 10px 0; padding-left: 30px; color: #bdcbe0; }
+    .checklist li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 900; }
+    footer { padding: 52px 0 80px; border-top: 1px solid var(--line); color: var(--muted); }
+    .print-only { display: none; }
+    @media (max-width: 1050px) {
+      .hero-grid, .layout { grid-template-columns: 1fr; }
+      aside { position: relative; top: 0; max-height: none; columns: 2; }
+      aside strong { column-span: all; }
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+      .flow { grid-template-columns: 1fr; }
+      .flow .node:not(:last-child)::after { content: "↓"; right: 50%; top: auto; bottom: -20px; transform: translateX(50%); }
+    }
+    @media (max-width: 700px) {
+      .shell { width: min(100% - 22px, 1440px); }
+      .hero { min-height: auto; padding-top: 52px; }
+      .grid-2, .grid-3, .grid-4, .decision-grid { grid-template-columns: 1fr; }
+      aside { columns: 1; }
+      h1 { font-size: 3.25rem; }
+      .analogy { grid-template-columns: 1fr; }
+    }
+    @media print {
+      :root { --ink: #111; --muted: #444; --paper: #fff; --paper-2: #fff; --panel: #fff; --line: #bbb; }
+      body { color: #111; background: #fff; font-size: 10pt; }
+      body::before, .progress, aside { display: none; }
+      .hero { min-height: auto; padding: 20px 0; }
+      .hero-grid, .layout { grid-template-columns: 1fr; }
+      .hero-card, .card, .callout, .code-card, .table-wrap { color: #111; background: #fff; box-shadow: none; break-inside: avoid; }
+      p, td { color: #222; }
+      pre { color: #111; background: #f3f5f8; white-space: pre-wrap; }
+      section { margin-bottom: 35px; }
+      .print-only { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" id="progress"></div>
+
+  <header class="hero shell">
+    <div class="hero-grid">
+      <div>
+        <span class="eyebrow">AMDGPU · gfx950 · TLX · MXFP4</span>
+        <h1>From <span class="hl-red">587 µs</span> to <span class="gradient">83 µs</span></h1>
+        <p class="lede">A first-principles lecture on engineering A4W4 matrix multiplication: how tile geometry, physical layouts, asynchronous LDS pipelines, compiler scheduling, and register allocation turned a reproducible performance failure into one unified TLX compiler that matches or beats tuned AITER assembly on most locally measured shapes.</p>
+        <div class="hero-meta">
+          <span>Lecture note · August 2026</span>
+          <span>Target · AMD CDNA4 / gfx950</span>
+          <span>Unified branch · <code>raikonen/a4w4-mega</code></span>
+          <span>Tip · <code>62eaec278</code></span>
+        </div>
+      </div>
+      <div class="hero-card" aria-label="Summary statistics">
+        <div class="big-stat">7.0×</div>
+        <div class="big-stat-label">BM256 speedup after eliminating compiler-induced scratch traffic</div>
+        <div class="small-label"><span>Before · iterative-ILP</span><span>848 B scratch/thread</span></div>
+        <div class="meter"><span style="width:100%"></span></div>
+        <div class="small-label"><span>After · max-memory-clause</span><span>0 B scratch/thread</span></div>
+        <div class="meter good"><span style="width:12%"></span></div>
+        <div class="small-label"><span>Unified local matrix</span><span>7 wins / 13 shapes</span></div>
+        <div class="meter good"><span style="width:54%"></span></div>
+      </div>
+    </div>
+  </header>
+
+  <div class="shell layout">
+    <aside aria-label="Lecture navigation">
+      <strong>Contents</strong>
+      <a href="#question">1 · The question</a>
+      <a href="#model">2 · Mental model</a>
+      <a href="#machine">3 · The machine</a>
+      <a href="#baseline">4 · Baseline diagnosis</a>
+      <a href="#dispatch">5 · Shape-matched dispatch</a>
+      <a href="#small-m">6 · Small-M kernels</a>
+      <a href="#layouts">7 · Physical layouts</a>
+      <a href="#pipeline">8 · Async LDS pipeline</a>
+      <a href="#scheduler">9 · Scheduler and spills</a>
+      <a href="#preshuffle">10 · Pre-shuffled B</a>
+      <a href="#results">11 · Unified results</a>
+      <a href="#rejected">12 · Rejected ideas</a>
+      <a href="#remaining">13 · Remaining work</a>
+      <a href="#lessons">14 · General lessons</a>
+    </aside>
+
+    <main>
+      <section id="question">
+        <div class="section-no">Lecture 01 · The question</div>
+        <h2>What are we actually optimizing?</h2>
+        <p class="thesis">We are not optimizing “a matrix multiply” in the abstract. We are arranging data, work, and dependencies so that 256 compute units can continuously issue scaled MFMA instructions without waiting on memory, LDS ownership, synchronization, or spilled registers.</p>
+
+        <div class="formula">C[M,N] = dequantize(A<sub>MXFP4</sub>, S<sub>A</sub>) × dequantize(B<sub>MXFP4</sub>, S<sub>B</sub>)<sup>T</sup></div>
+
+        <div class="grid-4">
+          <div class="card"><span class="tag">A</span><h3>Activation operand</h3><p>Packed E2M1 values: two 4-bit elements per byte.</p></div>
+          <div class="card"><span class="tag">B</span><h3>Weight operand</h3><p>Packed E2M1 rows; the public TLX path accepts raw B.</p></div>
+          <div class="card"><span class="tag">SCALE</span><h3>Block scaling</h3><p>One E8M0 scale for every 32 logical K elements.</p></div>
+          <div class="card"><span class="tag">C</span><h3>Output</h3><p>FP32 accumulation narrowed to BF16 at the epilogue.</p></div>
+        </div>
+
+        <p>The starting point was <a href="https://github.com/facebookexperimental/triton/pull/2569">facebookexperimental/triton PR #2569</a>. It supplied a bit-exact AITER comparison and showed a large gap between tuned assembly and the original TLX paths. Our job was to explain the gap at each compiler layer and recover it without deleting synchronization that carries real correctness dependencies.</p>
+      </section>
+
+      <section id="model">
+        <div class="section-no">Lecture 02 · Feynman model</div>
+        <h2>A restaurant with 256 kitchens</h2>
+        <div class="analogy">
+          <div class="icon">🍳</div>
+          <div><h3>The GPU is not one fast cook</h3><p>Think of gfx950 as 256 kitchens. A tile is an order. If a kernel produces only 32 orders, most kitchens are idle. Split-K creates more orders, but also creates partial dishes that must be carried to a second station and combined. Smaller native tiles often fill the kitchens without that cleanup bill.</p></div>
+        </div>
+        <div class="analogy">
+          <div class="icon">🧺</div>
+          <div><h3>LDS buffers are ingredient baskets</h3><p>Two baskets let the cook consume one while a runner fills the other. Four baskets increase the distance before a basket is reused, giving memory more time to arrive. But every extra basket consumes LDS and registers; deeper is useful only when the loop is long enough and occupancy does not fall.</p></div>
+        </div>
+        <div class="analogy">
+          <div class="icon">🧾</div>
+          <div><h3>Registers are countertop space</h3><p>AGPRs hold accumulated dishes; VGPRs hold addresses, operands, scales, and temporary work. A 256×256 tile placed two large accumulator halves and too much surrounding work on the counter simultaneously. When the counter overflowed, LLVM put ingredients in “the basement”—scratch memory—and performance collapsed.</p></div>
+        </div>
+        <div class="callout good"><strong>Feynman check:</strong> If an optimization cannot be explained as “more kitchens working,” “ingredients arriving earlier,” “fewer unnecessary trips,” or “less countertop overflow,” we probably do not understand it yet.</div>
+      </section>
+
+      <section id="machine">
+        <div class="section-no">Lecture 03 · The machine</div>
+        <h2>The five-stage journey of one K tile</h2>
+        <div class="flow" aria-label="A4W4 tile pipeline">
+          <div class="node"><b>HBM</b><span>raw packed A/B + scales</span></div>
+          <div class="node"><b>Async copy</b><span>buffer load to local</span></div>
+          <div class="node"><b>LDS</b><span>swizzled shared tile</span></div>
+          <div class="node"><b>Registers</b><span>dot operands + scales</span></div>
+          <div class="node"><b>MFMA</b><span>FP32 accumulator</span></div>
+        </div>
+
+        <div class="grid-3">
+          <div class="card"><h3>VMEM</h3><p>Moves packed operands from HBM. Useful work requires enough independent requests and legal vector widths.</p></div>
+          <div class="card"><h3>LDS</h3><p>A software-managed rendezvous. Fast, but physical ownership, reuse, barriers, and bank behavior are visible to the kernel.</p></div>
+          <div class="card"><h3>MFMA</h3><p><code>v_mfma_scale_f32_*</code> consumes packed FP4 values and scales, accumulating into FP32 VGPR/AGPR state.</p></div>
+        </div>
+
+        <h3>Why waits and barriers are different</h3>
+        <p>A wait says, “my asynchronous memory operation has progressed far enough.” A barrier says, “all waves agree that a shared LDS phase is complete.” Removing either blindly can let one wave overwrite a basket another wave is still consuming. Several apparently faster barrier-deletion experiments were nondeterministically wrong.</p>
+      </section>
+
+      <section id="baseline">
+        <div class="section-no">Lecture 04 · Baseline diagnosis</div>
+        <h2>Start with evidence, not folklore</h2>
+        <p>The original large path used an eight-wave 256×256 inter-wave pipeline. ATT showed that it spent far more time stalled than AITER, especially at workgroup barriers and buffer loads.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ATT / static metric</th><th>AITER</th><th>Original TLX</th><th>Interpretation</th></tr></thead>
+            <tbody>
+              <tr><td>Overall stall fraction</td><td>38.4%</td><td class="loss">71.4%</td><td>TLX rarely sustains issue</td></tr>
+              <tr><td>Barrier stall share</td><td>7.3%</td><td class="loss">36.1%</td><td>Eight-wave phase structure dominates</td></tr>
+              <tr><td>Buffer-load stall share</td><td>5.4%</td><td class="loss">32.4%</td><td>Memory overlap is ineffective</td></tr>
+              <tr><td>MFMA utilization</td><td>52.0%</td><td class="loss">44.3%</td><td>Compute pipe is underfed</td></tr>
+              <tr><td>Static <code>s_barrier</code></td><td>10</td><td class="loss">34</td><td>More global phase boundaries</td></tr>
+              <tr><td>Static <code>s_waitcnt</code></td><td>12</td><td class="loss">71</td><td>More exposed dependencies</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout danger"><strong>Failed shortcut:</strong> deleting barriers reduced the static count but produced nondeterministic output. A legal dependency is not overhead merely because it is expensive.</div>
+
+        <div class="timeline">
+          <div class="event"><h3>PR #2569 · Reproduce</h3><p>Pin a kernel source, compare public APIs, flush L2, use GPU events, and require exact BF16 equality.</p></div>
+          <div class="event"><h3>Issue #6 · Medium and large shapes</h3><p>Replace the public eight-wave path with shape-matched four-wave 128×256 and 256×256 kernels.</p></div>
+          <div class="event"><h3>Issue #7 · Small M</h3><p>Add native 32×128, 64×128, and 128×128 ownership, measured split-K, buffer depth, schedule, and traversal.</p></div>
+          <div class="event"><h3>Mega branch · One compiler</h3><p>Combine small-M policy with the BM256 register-allocation fix and validate all 13 shapes from one build.</p></div>
+        </div>
+      </section>
+
+      <section id="dispatch">
+        <div class="section-no">Lecture 05 · Optimization I</div>
+        <h2>Match the tile to the amount of work</h2>
+        <p>A large tile reduces duplicated loads, but it also reduces the number of independent CTAs. The selector therefore asks how many 256×256 output tiles exist before choosing a kernel family.</p>
+        <div class="decision">
+          <div class="decision-root">grid<sub>256×256</sub> = ceil(M/256) × ceil(N/256)</div>
+          <div class="decision-grid">
+            <div class="decision-node"><b>≤ 64 CTAs</b><small>Native skinny family<br>32/64/128 × 128</small></div>
+            <div class="decision-node"><b>65–255 CTAs</b><small>Four-wave<br>128 × 256</small></div>
+            <div class="decision-node"><b>≥ 256 CTAs</b><small>Four-wave<br>256 × 256</small></div>
+          </div>
+        </div>
+        <div class="formula">tile benefit = less repeated data work &nbsp;—&nbsp; occupancy cost = fewer independent CTAs</div>
+        <p>The 128×256 layout was derived by removing only the M=128 basis from the proven 256×256 physical layout. That matters: changing logical dimensions without consistently changing lane, warp, shared, accumulator, and store ownership is an invitation to silent data-layout bugs.</p>
+        <div class="code-card">
+          <div class="code-title"><span>Physical layout projection</span><span>Shape:Stride notation</span></div>
+          <pre><span class="hl-blue"># 256×256 A-load ownership</span>
+shape  = ((8, 8, 4), (16, 4, 2))
+stride = ((16, 2048, 128), (1, 512, <span class="hl-amber">16384</span>))
+
+<span class="hl-blue"># 128×256: remove the basis that contributes the upper M half</span>
+shape  = ((8, 8, 4), (16, 4))
+stride = ((16, 2048, 128), (1, 512))</pre>
+        </div>
+      </section>
+
+      <section id="small-m">
+        <div class="section-no">Lecture 06 · Optimization II</div>
+        <h2>Small M needs native ownership</h2>
+        <p>Masking a large tile down to 32 or 64 useful rows still pays for a large ownership pattern. The accepted solution represents those shapes directly.</p>
+
+        <div class="grid-3">
+          <div class="card"><span class="tag">32×128</span><h3>Narrow specialization</h3><p>At 256×4096×4096, it creates exactly 256 CTAs without split-K. Elsewhere it repeats too much B work.</p></div>
+          <div class="card"><span class="tag">64×128</span><h3>Small-M workhorse</h3><p>Four waves, enough output tiles to fill gfx950, and shape-specific two- or four-buffer operand rings.</p></div>
+          <div class="card"><span class="tag">128×128</span><h3>Full-grid fallback</h3><p>Used where the larger skinny tile already exposes enough parallel work and duplication would dominate.</p></div>
+        </div>
+
+        <h3>Why split-K is not free occupancy</h3>
+        <div class="formula">split-K gain = more compute CTAs &nbsp;—&nbsp; FP32 workspace stores &nbsp;—&nbsp; reduction launch/read/write</div>
+        <p>The selector chooses a native tile first, then adds split-K only until the compute grid reaches the measured occupancy target and only when each split retains a viable K loop. Naturally full grids remain <code>SPLIT_K=1</code>.</p>
+
+        <h3>Four buffers: create distance, not decoration</h3>
+        <p>Source-level unrolling over two LDS objects still reuses those same two objects. Four actual allocations create four distinct SSA/LDS destinations, extending the true overwrite distance.</p>
+        <div class="code-card">
+          <div class="code-title"><span>Conceptual TTGIR</span><span>four physical stages</span></div>
+          <pre><span class="hl-blue">// Prologue: four distinct destinations</span>
+amdg.buffer_load_to_local ... into %a_lds_0
+amdg.buffer_load_to_local ... into %a_lds_1
+amdg.buffer_load_to_local ... into %a_lds_2
+amdg.buffer_load_to_local ... into %a_lds_3
+
+scf.for %k = ... step 4 {
+  ttg.async_wait {num = 3}
+  <span class="hl-green">// consume stage 0; refill it with K+4</span>
+  ... repeat for stages 1, 2, 3 ...
+}</pre>
+        </div>
+        <p>At the favorable 64×128 full-grid shapes, deeper buffering preserved one four-wave CTA per CU and reduced LDS-read/MFMA dependency stalls. A three-buffer experiment caused a GPU memory fault because the async group/slot reuse schedule was not legal for an odd ring depth.</p>
+      </section>
+
+      <section id="layouts">
+        <div class="section-no">Lecture 07 · Optimization III</div>
+        <h2>Logical shape is not physical ownership</h2>
+        <p>TLX layouts answer a concrete question: which register, lane, warp, and CTA owns each logical element? This is more precise than saying “row-major” or “contiguous.”</p>
+        <div class="grid-2">
+          <div class="card"><h3>Contiguity</h3><p>The number of consecutive elements a thread owns for a load. It enables legal wide memory operations. It does not claim that a gather-shaped logical tensor is globally contiguous.</p></div>
+          <div class="card"><h3>Divisibility / alignment</h3><p>A promise about pointer values or offsets. It is separate from adjacency. Confusing the two can make a hint invalid even when neighboring elements happen to be consecutive.</p></div>
+        </div>
+
+        <div class="code-card">
+          <div class="code-title"><span>Pinned layout through a helper</span><span>compiler correctness finding</span></div>
+          <pre>%offset = ... : tensor&lt;4x256xi32, <span class="hl-green">#physical_linear</span>&gt;
+%value = amdg.buffer_load %src[%offset] {contiguity = 4}
+    : tensor&lt;4x256xf8E4M3FN, <span class="hl-green">#physical_linear</span>&gt;
+
+<span class="hl-blue">// Restructuring the loaded value must not release %offset ownership.</span>
+%r0 = tt.reshape %value ...
+%r1 = tt.trans %r0 ...</pre>
+        </div>
+        <p>The small-M AITER-shaped experiment exposed a helper-boundary bug: reshape/trans/split/join in a helper could release all pinned arguments, even when the pinned offset itself never flowed through that transformation. The fix performs per-argument SSA-flow analysis and treats loads, stores, dots, and calls as ownership boundaries.</p>
+        <div class="callout good"><strong>Compiler principle:</strong> layout propagation must follow the value that changes shape, not erase physical promises merely because a neighboring value is transformed.</div>
+      </section>
+
+      <section id="pipeline">
+        <div class="section-no">Lecture 08 · Optimization IV</div>
+        <h2>Move scales directly to LDS</h2>
+        <p>The earlier scale path materialized a global load in registers and then stored it to LDS. The optimized path makes scales part of the direct asynchronous copy pipeline.</p>
+        <div class="grid-2">
+          <div class="code-card">
+            <div class="code-title"><span class="hl-red">Before</span><span>extra register stage</span></div>
+            <pre>global load scales
+        ↓
+temporary VGPR values
+        ↓
+local store to LDS
+        ↓
+local load for MFMA</pre>
+          </div>
+          <div class="code-card">
+            <div class="code-title"><span class="hl-green">After</span><span>direct async destination</span></div>
+            <pre>amdg.buffer_load_to_local
+        ↓
+scale LDS ring
+        ↓
+local load for MFMA
+
+<span class="hl-green">temporary VGPR stage removed</span></pre>
+          </div>
+        </div>
+        <p>At long K on the 128×256 path, this reduced intermediate register-to-LDS work and joined scales to the same wait-group structure as A and B. At K=4096, the larger LDS footprint was a small regression, so the compact register-staged scale path remains selected there. One policy does not need to fit every shape.</p>
+      </section>
+
+      <section id="scheduler">
+        <div class="section-no">Lecture 09 · Optimization V</div>
+        <h2>The 256×256 kernel was correct—and catastrophically scheduled</h2>
+        <p>The merged investigation found a striking result: TTGIR and LLVM IR computation were essentially unchanged, yet one LLVM function attribute moved runtime from hundreds of microseconds back to the expected range.</p>
+
+        <div class="grid-2">
+          <div class="card"><h3 class="hl-red">iterative-ilp</h3><p>256 VGPR + 256 AGPR, 848 B scratch/thread, roughly 130 spill stores and 134 reloads, 294–587 µs.</p></div>
+          <div class="card"><h3 class="hl-green">max-memory-clause</h3><p>256 VGPR + 220 AGPR, zero scratch, zero spill/reload instructions, 48–83 µs.</p></div>
+        </div>
+
+        <div class="code-card">
+          <div class="code-title"><span>LLVM IR: the meaningful pre-RA difference</span><span>per-function policy</span></div>
+          <pre><span class="hl-red">- "amdgpu-sched-strategy"="iterative-ilp"</span>
+<span class="hl-green">+ "amdgpu-sched-strategy"="max-memory-clause"</span></pre>
+        </div>
+
+        <div class="code-card">
+          <div class="code-title"><span>AMDGPU metadata and ISA</span><span>before → after</span></div>
+          <pre><span class="hl-red">; NumVgprs:      256
+; NumAgprs:      256
+; TotalNumVgprs: 512
+; ScratchSize:   848
+scratch_store_dword ... ; Folded Spill
+scratch_load_dword  ... ; Folded Reload</span>
+
+<span class="hl-green">; NumVgprs:      256
+; NumAgprs:      220
+; TotalNumVgprs: 476
+; ScratchSize:   0
+; no scratch_load / scratch_store</span></pre>
+        </div>
+
+        <div class="analogy">
+          <div class="icon">🪑</div>
+          <div><h3>Why can scheduling change register allocation?</h3><p>Imagine asking every guest to arrive early and leave late: more chairs are needed simultaneously. Instruction scheduling changes where values are born and when their last use occurs. The ILP schedule overlapped too many memory temporaries with two 128-column accumulator halves. The memory-clause schedule bounded those live ranges, so the same calculation fit on-chip.</p></div>
+        </div>
+
+        <h3>One compiler, different kernel policies</h3>
+        <p>This fix does not require another LLVM build. The scheduler strategy is attached per function. The unified compiler emits the best measured policy for skinny, 128×256, and 256×256 specializations from one installation.</p>
+      </section>
+
+      <section id="preshuffle">
+        <div class="section-no">Lecture 10 · Controlled negative result</div>
+        <h2>Pre-shuffling B is useful—but not magic</h2>
+        <p>AITER accepts pre-shuffled B and scales. We reproduced the weight permutation and exposed it through a separate cached-weight ABI rather than silently changing the raw API.</p>
+        <div class="code-card">
+          <div class="code-title"><span>Physical packed-B slab</span><span>metadata-only LDS view</span></div>
+          <pre>[8, 2048]
+  → reshape   [8, 4, 2, 16, 16]
+  → transpose [8, 16, 4, 2, 16]
+  → reshape   [128, 128]
+  → local_trans for the MFMA operand</pre>
+        </div>
+        <p>For M=256, packed B improved TLX by about 1–2%. For M=512 it was neutral or slightly slower. On medium and large kernels it usually moved performance by less than 1.5% and did not remove a load, LDS stage, barrier, or MFMA. Therefore:</p>
+        <ul class="checklist">
+          <li>Small-M packed B remains an explicit opt-in ABI for cached weights.</li>
+          <li>Raw B remains the public default and the basis of the unified 13-shape table.</li>
+          <li>Pre-shuffled B-scales were rejected: direct loads landed on the MFMA critical path and regressed to roughly 22 µs.</li>
+          <li>The large BM256 spill existed before packing; packed B merely enlarged the existing spill frame.</li>
+        </ul>
+        <div class="callout"><strong>Lesson:</strong> A permutation helps only if it removes work or relocates a dependency. A different address sequence with the same instruction families is usually a small, shape-dependent effect.</div>
+      </section>
+
+      <section id="results">
+        <div class="section-no">Lecture 11 · Final experiment</div>
+        <h2>One compiler, thirteen shapes</h2>
+        <p>The mega branch combines the complete small-M stack with the scratch-free BM256 fix. It was installed once as <code>triton 3.8.0+git62eaec27</code>. The table below is one cold-L2, alternating-runner experiment: 20 warmups, 120 samples per round, seven rounds, GPU-event timing around unchanged public APIs.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>M × N × K</th><th>AITER µs</th><th>TLX µs</th><th>TLX advantage</th><th>Selected TLX path</th></tr></thead>
+            <tbody>
+              <tr><td>256 × 4096 × 4096</td><td>13.20</td><td>13.28</td><td class="near">−0.6%</td><td>skinny</td></tr>
+              <tr><td>256 × 4096 × 8192</td><td>21.68</td><td>20.68</td><td class="win">+4.8%</td><td>skinny</td></tr>
+              <tr><td>256 × 8192 × 4096</td><td>16.56</td><td>16.24</td><td class="win">+2.0%</td><td>skinny</td></tr>
+              <tr><td>256 × 8192 × 8192</td><td>28.12</td><td>26.80</td><td class="win">+4.9%</td><td>skinny</td></tr>
+              <tr><td>512 × 4096 × 4096</td><td>15.08</td><td>15.12</td><td class="near">−0.3%</td><td>skinny</td></tr>
+              <tr><td>512 × 4096 × 8192</td><td>24.52</td><td>24.24</td><td class="win">+1.2%</td><td>skinny</td></tr>
+              <tr><td>512 × 8192 × 4096</td><td>20.92</td><td>21.44</td><td class="loss">−2.4%</td><td>skinny</td></tr>
+              <tr><td>512 × 8192 × 8192</td><td>35.48</td><td>35.04</td><td class="win">+1.3%</td><td>skinny</td></tr>
+              <tr><td>1024 × 4096 × 8192</td><td>32.48</td><td>32.92</td><td class="loss">−1.3%</td><td>skinny</td></tr>
+              <tr><td>1024 × 8192 × 4096</td><td>28.64</td><td>29.08</td><td class="loss">−1.5%</td><td>128 × 256</td></tr>
+              <tr><td>2048 × 4096 × 8192</td><td>46.40</td><td>47.00</td><td class="loss">−1.3%</td><td>128 × 256</td></tr>
+              <tr><td>2048 × 8192 × 4096</td><td>60.44</td><td>48.32</td><td class="win">+25.1%</td><td>256 × 256</td></tr>
+              <tr><td>2048 × 8192 × 8192</td><td>87.72</td><td>82.84</td><td class="win">+5.9%</td><td>256 × 256</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid-3">
+          <div class="card"><span class="tag">CORRECTNESS</span><h3>13 / 13 exact</h3><p>Deterministic and bit-exact BF16 against the FP32-dequantized reference.</p></div>
+          <div class="card"><span class="tag">PERFORMANCE</span><h3>7 wins / 13</h3><p>+2.7% unweighted geometric mean in this unified local run.</p></div>
+          <div class="card"><span class="tag">RESOURCES</span><h3>Zero scratch</h3><p>Every emitted skinny, 128×256, 256×256, and reduction specialization.</p></div>
+        </div>
+
+        <div class="callout"><strong>Benchmark boundary:</strong> AITER uses tuned assembly with pre-shuffled B; TLX uses raw packed B in this table. Packing time is excluded. AITER's large-shape local timing varies across runs, so the conservative claim is approximately +12% at 2048×8192×4096 and parity at 2048×8192×8192—not the largest single-run percentages above.</div>
+
+        <h3>Published PR baseline versus local AITER</h3>
+        <p>The AITER binary available locally is slower than the AITER numbers printed in PR #2569 on several small shapes. Against those published values, TLX remains 9–16% behind on representative small-M cases. GPU selection did not explain the difference, and the PR does not publish the loaded <code>.co</code> hashes or complete environment. Both facts belong in the conclusion.</p>
+      </section>
+
+      <section id="rejected">
+        <div class="section-no">Lecture 12 · Scientific method</div>
+        <h2>What did not work—and why that matters</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Experiment</th><th>Outcome</th><th>What it taught us</th></tr></thead>
+            <tbody>
+              <tr><td>Delete barriers</td><td class="loss">Nondeterministic</td><td>Some barriers protect real LDS overwrite dependencies.</td></tr>
+              <tr><td>Three-buffer ring</td><td class="loss">GPU memory fault</td><td>The existing async group/slot schedule is not odd-depth safe.</td></tr>
+              <tr><td>Four buffers everywhere</td><td class="loss">Shape regressions</td><td>Reuse distance helps only if resource pressure and loop length permit it.</td></tr>
+              <tr><td>Force MFMA16</td><td class="loss">Materially slower</td><td>Matching AITER's instruction does not match its operand pipeline.</td></tr>
+              <tr><td>Four-wave AITER-shaped clone</td><td class="loss">Still ~26 vs ~21 µs</td><td>Excess waits/barriers remain even after occupancy and instruction count match.</td></tr>
+              <tr><td>Generic scheduling groups</td><td class="loss">Regressed</td><td>They introduced just-in-time <code>lgkmcnt(0)</code> waits.</td></tr>
+              <tr><td>Pre-shuffle B at mid/large M</td><td class="near">−1.5% to +0.8%</td><td>No pipeline stage or instruction family was removed.</td></tr>
+              <tr><td>Pre-shuffle B-scales</td><td class="loss">~22 µs</td><td>Direct scale loads moved onto the MFMA critical path.</td></tr>
+              <tr><td><code>iterative-minreg</code> for BM256</td><td class="loss">~160 µs</td><td>A promising name is not a resource proof; inspect the ISA.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Negative experiments narrow the explanation. They tell future engineers which dimensions have already been controlled and prevent “obvious” but invalid fixes from cycling back into the investigation.</p>
+      </section>
+
+      <section id="remaining">
+        <div class="section-no">Lecture 13 · Open problems</div>
+        <h2>The last few percent have a different character</h2>
+        <h3>1. The 512×8192×4096 pocket</h3>
+        <p>TLX is reproducibly about 2–3% behind local AITER. Both launch 256 workgroups, but their execution shapes differ:</p>
+        <div class="grid-2">
+          <div class="card"><h3>AITER</h3><p>128×128, four waves, MFMA16, AGPR accumulator, direct A plus pre-shuffled B/scales, deeply hand-interleaved schedule.</p></div>
+          <div class="card"><h3>TLX</h3><p>128×128, eight waves, MFMA32, VGPR accumulator, operands/scales staged through LDS, generic wait/read/MFMA/refill ring.</p></div>
+        </div>
+        <p>The structurally corrected four-wave clone has the same 256 MFMAs and 136 <code>ds_read_b128</code> operations as AITER, but still emits 69 waits / 22 barriers versus AITER's 36 / 17. This is now a synchronization and interleaving problem, not a tile-count problem.</p>
+
+        <h3>2. Reproduce the published AITER baseline</h3>
+        <p>Future reports should record the actual AITER git SHA and dirty state, selected kernel/config, SHA256 of the loaded <code>.co</code>, ROCm/PyTorch versions, clocks/power state, public-wrapper latency, and preallocated kernel-only latency.</p>
+
+        <h3>3. Compiler opportunities</h3>
+        <ul class="checklist">
+          <li>Preserve user-pinned physical layouts robustly through all helper call/return patterns.</li>
+          <li>Make AGPR accumulator selection first-class for scaled MFMA.</li>
+          <li>Factor repeated non-contiguous register bases into legal cooperative transpose reads.</li>
+          <li>Represent LDS overwrite dependencies finely enough to reduce barriers without weakening correctness.</li>
+          <li>Build an instruction scheduler that understands async-copy age, LDS stage ownership, and MFMA consumption together.</li>
+        </ul>
+      </section>
+
+      <section id="lessons">
+        <div class="section-no">Lecture 14 · Transferable lessons</div>
+        <h2>A compact playbook for GPU compiler performance</h2>
+        <div class="grid-2">
+          <div class="card"><h3>1 · Reproduce before explaining</h3><p>Pin source and binaries, alternate runners, flush caches deliberately, and demand exact output.</p></div>
+          <div class="card"><h3>2 · Fix geometry before micro-scheduling</h3><p>An underfilled device cannot be repaired by prettier instruction order.</p></div>
+          <div class="card"><h3>3 · Treat layout as ownership</h3><p>Logical shape, pointer alignment, per-thread contiguity, and physical distribution are distinct contracts.</p></div>
+          <div class="card"><h3>4 · Inspect the final ISA</h3><p>TTGIR can look healthy while LLVM scheduling creates catastrophic scratch traffic.</p></div>
+          <div class="card"><h3>5 · Make policy local</h3><p>Tiles, buffer depth, traversal, and scheduler attributes can vary per kernel while one compiler serves all of them.</p></div>
+          <div class="card"><h3>6 · Preserve negative evidence</h3><p>A rejected experiment is valuable when it isolates a cause and records its correctness boundary.</p></div>
+        </div>
+        <div class="callout good"><strong>Final takeaway:</strong> AITER's assembly is not fast because it is assembly. It is fast because it encodes good geometry, physical ownership, dependency distance, and scheduling. TLX becomes competitive when those same ideas are made explicit—and when the compiler preserves them all the way to AMDGPU ISA.</div>
+
+        <h3>Source map</h3>
+        <ul class="checklist">
+          <li><a href="https://github.com/facebookexperimental/triton/pull/2569">Original A4W4 reproduction — facebookexperimental/triton #2569</a></li>
+          <li><a href="https://github.com/raikonenfnu/tlx_triton/issues/6">Medium/large investigation and prepacked-B follow-up — issue #6</a></li>
+          <li><a href="https://github.com/raikonenfnu/tlx_triton/issues/7">Small-M native kernels and packed-B follow-up — issue #7</a></li>
+          <li><a href="https://github.com/raikonenfnu/tlx_triton/tree/raikonen/a4w4-mega">Unified one-compiler implementation — mega branch</a></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="shell">
+      <strong>From 587 µs to 83 µs</strong><br>
+      A4W4 GEMM optimization notes for TLX on AMD gfx950. Standalone HTML; no external scripts, fonts, or assets.
+    </div>
+  </footer>
+
+  <script>
+    const progress = document.getElementById('progress');
+    const links = [...document.querySelectorAll('aside a')];
+    const sections = [...document.querySelectorAll('main section')];
+
+    function updateProgress() {
+      const max = document.documentElement.scrollHeight - innerHeight;
+      progress.style.width = `${max > 0 ? (scrollY / max) * 100 : 0}%`;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        links.forEach((link) => link.classList.toggle(
+          'active', link.getAttribute('href') === `#${entry.target.id}`
+        ));
+      });
+    }, { rootMargin: '-20% 0px -70% 0px' });
+
+    sections.forEach((section) => observer.observe(section));
+    addEventListener('scroll', updateProgress, { passive: true });
+    updateProgress();
+  </script>
+</body>
+</html>
