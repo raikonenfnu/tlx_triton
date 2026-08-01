@@ -643,6 +643,7 @@ def _a4w4_skinny_kernel(
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BUFFER_COUNT: tl.constexpr,
+    B_PRESHUFFLED: tl.constexpr,
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
     NG: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE
@@ -752,6 +753,13 @@ def _a4w4_skinny_kernel(
             shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
             stride=((8, 16, 32, 64, 128, 1, 256, 512), (2, 4)),
         )
+        # Physical AITER shuffle_weight tile: [8 N-blocks, 4 K-blocks,
+        # 2 half-blocks, 16 N rows, 16 packed-K bytes].  Four-wave kernels
+        # assign four 16-byte vectors to each thread.
+        g_load_layout_b_preshuffled: tl.constexpr = tlx.layout(
+            shape=((64, 2, 2), (16, 4)),
+            stride=((16, 1024, 8192), (1, 2048)),
+        )
     else:
         g_load_layout_b: tl.constexpr = tlx.layout(
             shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
@@ -764,6 +772,11 @@ def _a4w4_skinny_kernel(
         scale_b_layout: tl.constexpr = tlx.layout(
             shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
             stride=((8, 16, 32, 64, 128, 1, 256, 512, 0), (2, 4)),
+        )
+        # The eight-wave 128x128 kernel owns two 16-byte vectors per thread.
+        g_load_layout_b_preshuffled: tl.constexpr = tlx.layout(
+            shape=((64, 2, 2, 2), (16, 2)),
+            stride=((16, 1024, 8192, 4096), (1, 2048)),
         )
     shared_tile_b: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 16]], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0],
@@ -813,7 +826,13 @@ def _a4w4_skinny_kernel(
         pid_n = (pid % num_pid_in_group) // group_size_m
 
     smem_a = tlx.local_alloc((BLOCK_M, BKP), tlx.dtype_of(a_ptr), BUFFER_COUNT, layout=shared_tile_a)
-    smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), BUFFER_COUNT, layout=shared_tile_b)
+    if B_PRESHUFFLED:
+        # One logical [128,128] packed-B tile is eight physical 2048-byte
+        # slabs after shuffle_weight.  Keep that physical image in LDS and
+        # expose a transposed logical view only to the MFMA local load.
+        smem_b = tlx.local_alloc((8, 2048), tlx.dtype_of(b_ptr), BUFFER_COUNT)
+    else:
+        smem_b = tlx.local_alloc((BLOCK_N, BKP), tlx.dtype_of(b_ptr), BUFFER_COUNT, layout=shared_tile_b)
     if BLOCK_M == 32:
         smem_asc = tlx.local_alloc((BLOCK_M // 4, NG), tl.uint32, BUFFER_COUNT, layout=shared_scales)
     else:
@@ -825,8 +844,24 @@ def _a4w4_skinny_kernel(
     a_off = tlx.require_layout(offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak, g_load_layout_a)
     a_base = a_ptr + pid_m * BLOCK_M * stride_am + split_id * (KS // 2) * stride_ak
     offs_bn = tl.arange(0, BLOCK_N)
-    b_off = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk, g_load_layout_b)
-    b_base = b_ptr + pid_n * BLOCK_N * stride_bn + split_id * (KS // 2) * stride_bk
+    if B_PRESHUFFLED:
+        b_phys_row = tl.arange(0, 8)
+        b_phys_col = tl.arange(0, 2048)
+        b_off = tlx.require_layout(
+            b_phys_row[:, None] * ((K // 2) * 16) + b_phys_col[None, :],
+            g_load_layout_b_preshuffled,
+        )
+        b_base = (
+            b_ptr
+            + pid_n * BLOCK_N * (K // 2)
+            + split_id * (KS // 2) * 16
+        )
+    else:
+        b_off = tlx.require_layout(
+            offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk,
+            g_load_layout_b,
+        )
+        b_base = b_ptr + pid_n * BLOCK_N * stride_bn + split_id * (KS // 2) * stride_bk
     offs_sg = tl.arange(0, NG)
     if BLOCK_M == 32:
         # Scales are contiguous in M. Reinterpret each four-M byte group as a
@@ -852,7 +887,7 @@ def _a4w4_skinny_kernel(
     b_scales_ptr += split_id * (KS // SCALE_GROUP_SIZE) * stride_bsk
 
     ak = BKP * stride_ak
-    bk = BKP * stride_bk
+    bk: tl.constexpr = 2048 if B_PRESHUFFLED else BKP * stride_bk
     sck_a = NG * stride_ask // (4 if BLOCK_M == 32 else 1)
     sck_b = NG * stride_bsk
 
@@ -882,7 +917,13 @@ def _a4w4_skinny_kernel(
         for stage in tl.static_range(0, BUFFER_COUNT):
             tlx.async_load_wait_group(BUFFER_COUNT - 1)
             a = tlx.local_load(smem_a[stage], relaxed=True)
-            b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
+            if B_PRESHUFFLED:
+                b_view = tlx.local_reshape(smem_b[stage], [8, 4, 2, 16, 16])
+                b_view = tlx.local_trans(b_view, (1, 2, 4, 0, 3))
+                b_view = tlx.local_reshape(b_view, [BKP, BLOCK_N])
+                b = tlx.local_load(b_view, relaxed=True)
+            else:
+                b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
             if BLOCK_M == 32:
                 asc_view = tlx.local_reinterpret(
                     smem_asc[stage],
@@ -927,7 +968,13 @@ def _a4w4_skinny_kernel(
     for stage in tl.static_range(0, BUFFER_COUNT):
         tlx.async_load_wait_group(BUFFER_COUNT - 1 - stage)
         a = tlx.local_load(smem_a[stage], relaxed=True)
-        b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
+        if B_PRESHUFFLED:
+            b_view = tlx.local_reshape(smem_b[stage], [8, 4, 2, 16, 16])
+            b_view = tlx.local_trans(b_view, (1, 2, 4, 0, 3))
+            b_view = tlx.local_reshape(b_view, [BKP, BLOCK_N])
+            b = tlx.local_load(b_view, relaxed=True)
+        else:
+            b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
         if BLOCK_M == 32:
             asc_view = tlx.local_reinterpret(
                 smem_asc[stage],
@@ -1007,11 +1054,26 @@ def choose_skinny_buffer_count(M, N, K):
     } else 2
 
 
-def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
-    """32/64/128x128 TLX path for occupancy-starved shapes."""
+def _matmul_skinny(
+    a,
+    b,
+    a_scales,
+    b_scales,
+    SPLIT_K=None,
+    BLOCK_M=None,
+    B_PRESHUFFLED=False,
+):
+    """32/64/128x128 TLX path for occupancy-starved shapes.
+
+    The preshuffled flag describes a cacheable weight ABI.  Conversion is
+    intentionally outside this function so repeated GEMMs amortize it.
+    """
     M = a.shape[0]
     K = a.shape[1] * 2
     N = b.shape[0]
+    if B_PRESHUFFLED:
+        assert b.is_contiguous(), "pre-shuffled B must use its contiguous physical view"
+        assert N % 16 == 0 and (K // 2) % 32 == 0
     BM = choose_skinny_block_m(M, N, K) if BLOCK_M is None else BLOCK_M
     if BM == SKINNY_TINY_BLOCK_M:
         # The dword view requires four contiguous, aligned M-scale bytes and a
@@ -1081,6 +1143,7 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
         BUFFER_COUNT=buffer_count,
+        B_PRESHUFFLED=B_PRESHUFFLED,
         num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=32,
@@ -1099,6 +1162,27 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
                                                                      BLOCK_SIZE_M=rbm, BLOCK_SIZE_N=rbn,
                                                                      OUTPUT_DTYPE=tl.bfloat16, num_warps=rw)
     return c
+
+
+def matmul_preshuffled_b(a, b, a_scales, b_scales):
+    """Small-M A4W4 GEMM consuming AITER-compatible shuffled B data.
+
+    ``b`` is produced by ``aiter.ops.shuffle.shuffle_weight``.  A, A scales,
+    and B scales retain TLX's raw input ABI.  Keeping B scales raw is
+    intentional: direct shuffled-scale loads serialize on the MFMA critical
+    path and are substantially slower than the existing async LDS pipeline.
+    """
+    M = a.shape[0]
+    K = a.shape[1] * 2
+    N = b.shape[0]
+    assert select_matmul_path(M, N, K) == "skinny"
+    return _matmul_skinny(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        B_PRESHUFFLED=True,
+    )
 
 
 def select_matmul_path(M, N, K):

@@ -45,6 +45,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     choose_skinny_buffer_count as _a4w4_choose_skinny_buffer_count,
     choose_split_k_skinny as _a4w4_choose_split_k_skinny,
     matmul as _a4w4_inter_wave_matmul,
+    matmul_preshuffled_b as _a4w4_inter_wave_preshuffled_b_matmul,
     select_matmul_path as _a4w4_select_matmul_path,
 )
 
@@ -1331,6 +1332,26 @@ def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
         BLOCK_M=32,
     )
     torch.testing.assert_close(tiny, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_preshuffled_b_correctness_gfx950(device):
+    m = n = 256
+    k = 1536
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    # AITER shuffle_weight(layout=(16, 16)): tile packed K by 32 bytes,
+    # split it into two 16-byte vectors, then put the N-row index inside.
+    b_preshuffled = (
+        b.view(n // 16, 16, (k // 2) // 32, 2, 16)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+        .view_as(b)
+    )
+    actual = _a4w4_inter_wave_preshuffled_b_matmul(
+        a, b_preshuffled, a_scales, b_scales
+    )
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
 def test_a4w4_gfx950_dispatch_policy():
