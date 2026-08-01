@@ -1261,6 +1261,9 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert amdgcn.count("ds_write") == 44
     assert amdgcn.count("ds_read") == 176
     assert "buffer_store_dwordx4" in amdgcn
+    assert "; ScratchSize: 0" in amdgcn
+    assert "scratch_load" not in amdgcn
+    assert "scratch_store" not in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

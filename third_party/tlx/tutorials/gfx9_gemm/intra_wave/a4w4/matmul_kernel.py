@@ -577,8 +577,12 @@ def matmul(a, b, a_scales, b_scales, BLOCK_M=256):
     # generated wait/barrier count. At K=4096 the extra LDS footprint is a
     # small regression, so retain the compact register-staged path there.
     async_scale_lds = K >= 8192 and BLOCK_M == 128
+    # The 256x256 tile carries two 128-column accumulator halves. LLVM's
+    # iterative-ILP scheduler overlaps enough surrounding memory work to fill
+    # both the VGPR and AGPR banks and spill. The memory-clause scheduler keeps
+    # those live ranges bounded and produces a scratch-free kernel.
     sched_strategy = (
-        "max-memory-clause" if async_scale_lds else "iterative-ilp"
+        "max-memory-clause" if async_scale_lds or BLOCK_M == 256 else "iterative-ilp"
     )
 
     _a4w4_kernel[(grid_mn, )](
