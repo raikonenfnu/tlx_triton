@@ -731,6 +731,10 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, int32_t mask) {
              self.create<ROCDL::SchedBarrier>(mask);
            })
+      .def("create_amd_iglp_opt",
+           [](TritonOpBuilder &self, int32_t strategy) {
+             self.create<ROCDL::IglpOpt>(strategy);
+           })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
               Value pred) -> void {

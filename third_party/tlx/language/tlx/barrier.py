@@ -227,3 +227,14 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_iglp_opt(strategy: tl.constexpr, _semantic=None):
+    """Select an AMD instruction-group-level scheduling strategy (0 through 3)."""
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_iglp_opt is only supported on AMD (HIP) backends")
+    strategy = tl._unwrap_if_constexpr(strategy)
+    assert isinstance(strategy, int), f"strategy must be a constexpr integer, got {type(strategy).__name__}"
+    assert 0 <= strategy <= 3, f"strategy must be in [0, 3], got {strategy}"
+    _semantic.builder.create_amd_iglp_opt(strategy)
