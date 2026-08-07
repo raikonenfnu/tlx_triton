@@ -265,6 +265,7 @@ def compile_shape(shape, cache_root):
             "num_warps": 4,
             "num_stages": 1,
             "matrix_instr_nonkdim": 16,
+            "llvm_fn_attrs": (("amdgpu-sched-strategy", "max-memory-clause"), ),
             "grid": (grid_mn, ),
         }
         _a4w4_kernel.warmup(

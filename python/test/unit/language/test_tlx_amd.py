@@ -35,8 +35,14 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import 
     launch_matmul as _launch_a4w4,
     torch_reference as _a4w4_reference,
 )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.matmul_kernel import (
+    matmul as _a4w4_intra_wave_matmul,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
-    matmul as _a4w4_inter_wave_matmul, )
+    _matmul_256tile as _a4w4_inter_wave_256tile,
+    matmul as _a4w4_inter_wave_matmul,
+    select_matmul_path as _a4w4_select_matmul_path,
+)
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -2755,6 +2761,9 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert amdgcn.count("ds_write") == 44
     assert amdgcn.count("ds_read") == 176
     assert "buffer_store_dwordx4" in amdgcn
+    assert "; ScratchSize: 0" in amdgcn
+    assert "scratch_load" not in amdgcn
+    assert "scratch_store" not in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -2769,12 +2778,12 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
-    # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
-    # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
+    # Exercise the explicit 8-wave kernel even though measured public dispatch
+    # now prefers shape-matched 4-wave kernels.
     m = n = 768
     k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    actual = _a4w4_inter_wave_256tile(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
@@ -2807,3 +2816,38 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+@triton.jit
+def _amd_iglp_opt_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_iglp_opt(2)
+    tl.store(y_ptr + offsets, values)
+
+
+def test_amd_iglp_opt_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_iglp_opt_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 64},
+    )
+    assert "llvm.amdgcn.iglp.opt(i32 2)" in compiled.asm["llir"]
+
+
+def test_a4w4_gfx950_dispatch_policy():
+    assert _a4w4_select_matmul_path(256, 4096, 4096) == "intra_wave_128x256"
+    assert _a4w4_select_matmul_path(512, 256, 1536) == "skinny"
+    assert _a4w4_select_matmul_path(2048, 4096, 8192) == "intra_wave_128x256"
+    assert _a4w4_select_matmul_path(2048, 8192, 4096) == "intra_wave_256x256"
+    assert _a4w4_select_matmul_path(2048, 8192, 8192) == "intra_wave_256x256"
+    assert _a4w4_select_matmul_path(2048, 4096, 1024) == "intra_wave_128x256"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_intra_wave_128x256_correctness_gfx950(device):
+    m, n, k = 128, 256, 1024
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_intra_wave_matmul(a, b, a_scales, b_scales, BLOCK_M=128)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
