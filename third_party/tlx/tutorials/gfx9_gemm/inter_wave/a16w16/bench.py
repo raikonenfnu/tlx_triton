@@ -65,6 +65,10 @@ def main():
     )
     parser.add_argument("--seed", type=nonnegative_int, default=DEFAULT_INPUT_SEED,
                         help=f"deterministic input seed; default: {DEFAULT_INPUT_SEED}")
+    parser.add_argument("--atol", type=float, default=1e-1,
+                        help="absolute correctness tolerance; default: 0.1")
+    parser.add_argument("--rtol", type=float, default=1e-3,
+                        help="relative correctness tolerance; default: 0.001 (split-K changes reduction order)")
     args = parser.parse_args()
 
     sizes = [tuple(s) for s in args.shape] if args.shape else get_x_vals()
@@ -90,7 +94,7 @@ def main():
         )
         ref = torch.matmul(a, b)
         c = matmul(a, b)
-        ok = torch.allclose(c, ref, atol=1e-1, rtol=0)
+        ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
         print(f"[{KERNEL_NAME}] M={M} N={N} K={K}: {'OK' if ok else 'FAIL'}")
         if not ok:
             continue

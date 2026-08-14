@@ -18,9 +18,16 @@ Adapted from ROCm/gfx950-gluon-tutorials `kernels/gemm/inter_wave/a16w16`
 Split-K: for skinny / small-tile-count shapes the M/N tile grid can't fill the
 256 CUs (e.g. N=256 -> 8 tiles -> 8 workgroups), so `matmul` auto-selects a
 SPLIT_K that partitions the K reduction across more workgroups. Partials land in
-an fp32 workspace and a separate fp32 reduce kernel sums them into C -- keeping
-the result numerically identical to the non-split-K path. `choose_split_k`
+an fp32 workspace and a separate fp32 reduce kernel sums them into C. This keeps
+full accumulator precision, though the changed reduction order can change the
+final fp16 rounding by a small amount. `choose_split_k`
 returns 1 for shapes that already fill the machine, making split-K a no-op there.
+
+Hybrid Stream-K: a grid just over one 256-CU wave normally pays for a nearly
+empty second wave. When N can be partitioned into an exact 256-workgroup head and
+an exact 256-workgroup split-K tail, `matmul` launches those two balanced waves
+and reduces only the tail. This retains the efficient 256x256 hot loop while
+avoiding the short 64-workgroup wave at (M,N,K)=(1024,20480,6144).
 """
 
 import os
@@ -107,6 +114,8 @@ def a16w16_8wave(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_wm,
+    stride_wn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -427,13 +436,13 @@ def a16w16_8wave(
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
         # row offset is added only to the store index.
         rb = split_id * M
-        tl.store(workspace_ptr + stride_cm * (rb + offs_cm_top)[:, None] + stride_cn * offs_cn_left[None, :], acc_tl,
+        tl.store(workspace_ptr + stride_wm * (rb + offs_cm_top)[:, None] + stride_wn * offs_cn_left[None, :], acc_tl,
                  mask=m_top & n_left)
-        tl.store(workspace_ptr + stride_cm * (rb + offs_cm_bot)[:, None] + stride_cn * offs_cn_left[None, :], acc_bl,
+        tl.store(workspace_ptr + stride_wm * (rb + offs_cm_bot)[:, None] + stride_wn * offs_cn_left[None, :], acc_bl,
                  mask=m_bot & n_left)
-        tl.store(workspace_ptr + stride_cm * (rb + offs_cm_top)[:, None] + stride_cn * offs_cn_right[None, :], acc_tr,
+        tl.store(workspace_ptr + stride_wm * (rb + offs_cm_top)[:, None] + stride_wn * offs_cn_right[None, :], acc_tr,
                  mask=m_top & n_right)
-        tl.store(workspace_ptr + stride_cm * (rb + offs_cm_bot)[:, None] + stride_cn * offs_cn_right[None, :], acc_br,
+        tl.store(workspace_ptr + stride_wm * (rb + offs_cm_bot)[:, None] + stride_wn * offs_cn_right[None, :], acc_br,
                  mask=m_bot & n_right)
 
 
@@ -441,7 +450,8 @@ _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.fl
 
 
 @triton.jit
-def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
+def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, stride_wm, stride_wn, stride_cm, stride_cn,
+                     SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                      BLOCK_SIZE_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr):
     # Sum the SPLIT_K partials (each a contiguous (M, N) slab in workspace) into
     # C with fp32 accumulation. Small tiles (32x32) so small outputs still spawn
@@ -451,12 +461,13 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    base_offs = offs_m[:, None] * N + offs_n[None, :]
+    workspace_offs = offs_m[:, None] * stride_wm + offs_n[None, :] * stride_wn
+    c_offs = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range(SPLIT_K):
-        partial = tl.load(workspace_ptr + base_offs + s * M * N, mask=mask, other=0.0)
+        partial = tl.load(workspace_ptr + workspace_offs + s * M * stride_wm, mask=mask, other=0.0)
         acc += partial.to(tl.float32)
-    tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
+    tl.store(c_ptr + c_offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
@@ -522,39 +533,41 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
-def matmul(a, b, SPLIT_K=None):
-    """C = A @ B. `a` is (M, K), `b` is (K, N).
+def _choose_hybrid_n_split(M, N, K, BM, BN):
+    """Return ``(head_n, tail_split_k)`` for an exactly balanced two-wave grid.
 
-    SPLIT_K partitions the K reduction across SPLIT_K programs per output tile
-    (grid = GRID_MN*SPLIT_K), landing fp32 partials in a (SPLIT_K*M, N) workspace
-    that a separate fp32 reduce kernel sums into C. This fills the CUs on small-N /
-    small-tile-count shapes where the M/N tile grid alone can't. SPLIT_K is chosen
-    automatically from the shape (pass an int to override); SPLIT_K=1 launches the
-    plain kernel (no workspace, no reduce). The fp32 workspace keeps the result
-    numerically identical to the non-split-K kernel; only an int-free fp32 sum is
-    added, so there is no precision loss and the result is deterministic.
+    A grid just over one CU wave is pathological for a large, efficient tile: the
+    short second wave takes nearly as long as the full first wave.  Keep the same
+    hot loop, but partition N so the head is exactly one spatial CU wave and split
+    the tail along K so it is exactly one CU wave too.  This is a launch-level
+    approximation of Stream-K; unlike a smaller M/N tile, it preserves the tuned
+    256x256 MFMA/LDS workgroup.
+
+    The exact-fill requirements deliberately keep this a general scheduling rule,
+    not a shape table.  Shapes without two exact waves stay on the normal path.
     """
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    M, K = a.shape
-    K, N = b.shape
-    if SPLIT_K is None:
-        BM, BN, SPLIT_K = choose_tile(M, N, K)
-    else:
-        BM, BN = BLOCK_M, BLOCK_N  # explicit SPLIT_K override keeps the default tile
+    if M % BM or N % BN:
+        return None
+    num_m = M // BM
+    num_n = N // BN
+    grid_mn = num_m * num_n
+    if not (NUM_CU < grid_mn < 2 * NUM_CU):
+        return None
+
+    head_n_tiles = NUM_CU // num_m
+    if head_n_tiles <= 0 or head_n_tiles >= num_n or num_m * head_n_tiles != NUM_CU:
+        return None
+    tail_grid = num_m * (num_n - head_n_tiles)
+    tail_split_k = _split_k_for(tail_grid, K)
+    if tail_split_k == 1 or tail_grid * tail_split_k != NUM_CU:
+        return None
+    return head_n_tiles * BN, tail_split_k
+
+
+def _launch_matmul(a, b, c, workspace, M, N, K, BM, BN, SPLIT_K):
+    """Launch one spatial partition, optionally split along K."""
     KS = K // SPLIT_K
-    # Each split is a whole number of K-tiles, big enough for the 2-tile prologue.
-    assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
-    assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
-    assert KS % BLOCK_K == 0, f"K/SPLIT_K={KS} must be a multiple of BLOCK_K={BLOCK_K} (split base alignment)"
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
-    if SPLIT_K > 1:
-        # fp32 workspace: partials are stored without a rounding step, so the
-        # split-K result matches a single fp32-accumulated GEMM (an fp16 workspace
-        # would lose ~1e-1 near cancellation). The reduce sums in fp32 too.
-        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
-    else:
-        workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
@@ -570,6 +583,8 @@ def matmul(a, b, SPLIT_K=None):
         b.stride(1),
         c.stride(0),
         c.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_K=BLOCK_K,
@@ -584,22 +599,84 @@ def matmul(a, b, SPLIT_K=None):
         # v_accvgpr moves around each mfma). Essential to match the reference perf.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
+
+
+def _reduce_split_k(workspace, c, M, N, SPLIT_K, block=128, num_warps=8):
+    reduce_grid = (triton.cdiv(M, block), triton.cdiv(N, block))
+    _reduce_k_kernel[reduce_grid](
+        workspace,
+        c,
+        M,
+        N,
+        workspace.stride(0),
+        workspace.stride(1),
+        c.stride(0),
+        c.stride(1),
+        SPLIT_K=SPLIT_K,
+        BLOCK_SIZE_M=block,
+        BLOCK_SIZE_N=block,
+        OUTPUT_DTYPE=_TORCH_TO_TL[c.dtype],
+        num_warps=num_warps,
+    )
+
+
+def matmul(a, b, SPLIT_K=None):
+    """C = A @ B. `a` is (M, K), `b` is (K, N).
+
+    SPLIT_K partitions the K reduction across SPLIT_K programs per output tile
+    (grid = GRID_MN*SPLIT_K), landing fp32 partials in a (SPLIT_K*M, N) workspace
+    that a separate fp32 reduce kernel sums into C. This fills the CUs on small-N /
+    small-tile-count shapes where the M/N tile grid alone can't. SPLIT_K is chosen
+    automatically from the shape (pass an int to override); SPLIT_K=1 launches the
+    plain kernel (no workspace, no reduce). The workspace and reduction stay in
+    fp32 and are deterministic; as with any split reduction, reassociation can
+    change the final fp16 rounding slightly.
+    """
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    M, K = a.shape
+    K, N = b.shape
+    auto_schedule = SPLIT_K is None
+    if auto_schedule:
+        BM, BN, SPLIT_K = choose_tile(M, N, K)
+    else:
+        BM, BN = BLOCK_M, BLOCK_N  # explicit SPLIT_K override keeps the default tile
+    KS = K // SPLIT_K
+    # Each split is a whole number of K-tiles, big enough for the 2-tile prologue.
+    assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
+    assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
+    assert KS % BLOCK_K == 0, f"K/SPLIT_K={KS} must be a multiple of BLOCK_K={BLOCK_K} (split base alignment)"
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # Hybrid Stream-K for a grid with one full wave and a short tail wave.  Both
+    # launches contain exactly NUM_CU workgroups: the head uses spatial tiles and
+    # the tail uses split-K.  Independent workspace strides let the reduction land
+    # directly in the strided tail view of C (no temporary output/copy kernel).
+    hybrid = _choose_hybrid_n_split(M, N, K, BM, BN) if auto_schedule and SPLIT_K == 1 else None
+    if hybrid is not None:
+        head_n, tail_split_k = hybrid
+        tail_n = N - head_n
+        b_head, b_tail = b[:, :head_n], b[:, head_n:]
+        c_head, c_tail = c[:, :head_n], c[:, head_n:]
+        workspace = torch.empty((tail_split_k * M, tail_n), device=a.device, dtype=torch.float32)
+        _launch_matmul(a, b_head, c_head, c_head, M, head_n, K, BM, BN, 1)
+        _launch_matmul(a, b_tail, c_tail, workspace, M, tail_n, K, BM, BN, tail_split_k)
+        # The tail here is large enough to fill the machine with 64x64 reduce
+        # tiles; this was modestly faster than the generic 128x128 bandwidth tile.
+        _reduce_split_k(workspace, c_tail, M, tail_n, tail_split_k, block=64, num_warps=8)
+        return c
+
+    if SPLIT_K > 1:
+        # Keep partials and the reduction in fp32. An fp16 workspace is a little
+        # faster but introduces materially larger errors near cancellation.
+        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
+    else:
+        workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
+    _launch_matmul(a, b, c, workspace, M, N, K, BM, BN, SPLIT_K)
     if SPLIT_K > 1:
         # Adaptive reduce tile: small outputs need many small CTAs to fill the CUs;
         # large outputs are BW-bound and prefer big tiles for burst efficiency
         # (measured: 32x32 -> 4.5 TB/s vs 128x128 -> 5.4 TB/s on Pooler).
         big = (M * N) >= (2048 * 2048)
         rbm, rbn, rw = (128, 128, 8) if big else (32, 32, 4)
-        reduce_grid = (triton.cdiv(M, rbm), triton.cdiv(N, rbn))
-        _reduce_k_kernel[reduce_grid](
-            workspace,
-            c,
-            M,
-            N,
-            SPLIT_K=SPLIT_K,
-            BLOCK_SIZE_M=rbm,
-            BLOCK_SIZE_N=rbn,
-            OUTPUT_DTYPE=_TORCH_TO_TL[a.dtype],
-            num_warps=rw,
-        )
+        _reduce_split_k(workspace, c, M, N, SPLIT_K, block=rbm, num_warps=rw)
     return c
