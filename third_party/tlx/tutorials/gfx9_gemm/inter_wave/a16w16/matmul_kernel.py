@@ -20,7 +20,7 @@ Split-K: for skinny / small-tile-count shapes the M/N tile grid can't fill the
 SPLIT_K that partitions the K reduction across more workgroups. Partials land in
 an fp32 workspace and a separate fp32 reduce kernel sums them into C. This keeps
 full accumulator precision, though the changed reduction order can change the
-final fp16 rounding by a small amount. `choose_split_k`
+final FP16/BF16 rounding by a small amount. `choose_split_k`
 returns 1 for shapes that already fill the machine, making split-K a no-op there.
 
 Hybrid Stream-K: a grid just over one 256-CU wave normally pays for a nearly
@@ -195,10 +195,10 @@ def a16w16_8wave(
     b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
-    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
 
     # The direct-to-LDS buffer_load write is coalesced only when each offset
     # tensor's #linear layout matches the swizzled LDS layout above. We pin only
@@ -630,9 +630,11 @@ def matmul(a, b, SPLIT_K=None):
     automatically from the shape (pass an int to override); SPLIT_K=1 launches the
     plain kernel (no workspace, no reduce). The workspace and reduction stay in
     fp32 and are deterministic; as with any split reduction, reassociation can
-    change the final fp16 rounding slightly.
+    change the final FP16/BF16 rounding slightly.
     """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.bfloat16), "A and B must be FP16 or BF16"
     M, K = a.shape
     K, N = b.shape
     auto_schedule = SPLIT_K is None

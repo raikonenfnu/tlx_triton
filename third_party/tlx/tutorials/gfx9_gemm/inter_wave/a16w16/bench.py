@@ -56,6 +56,8 @@ def main():
     parser.add_argument("--rep", type=positive_int, default=200, help="timed duration in milliseconds; default: 200")
     parser.add_argument("--warmup", type=nonnegative_int, default=25,
                         help="warmup duration in milliseconds; default: 25")
+    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16",
+                        help="input/output dtype; default: fp16")
     parser.add_argument(
         "--input-mode",
         choices=INPUT_MODES,
@@ -65,10 +67,10 @@ def main():
     )
     parser.add_argument("--seed", type=nonnegative_int, default=DEFAULT_INPUT_SEED,
                         help=f"deterministic input seed; default: {DEFAULT_INPUT_SEED}")
-    parser.add_argument("--atol", type=float, default=1e-1,
-                        help="absolute correctness tolerance; default: 0.1")
-    parser.add_argument("--rtol", type=float, default=1e-3,
-                        help="relative correctness tolerance; default: 0.001 (split-K changes reduction order)")
+    parser.add_argument("--atol", type=float, default=None,
+                        help="absolute correctness tolerance; default: 0.1 (FP16), 1.0 (BF16)")
+    parser.add_argument("--rtol", type=float, default=None,
+                        help="relative correctness tolerance; default: 0.001 (FP16), 0.01 (BF16)")
     args = parser.parse_args()
 
     sizes = [tuple(s) for s in args.shape] if args.shape else get_x_vals()
@@ -92,9 +94,13 @@ def main():
             input_mode=args.input_mode,
             seed=args.seed,
         )
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+        a, b = a.to(dtype), b.to(dtype)
         ref = torch.matmul(a, b)
         c = matmul(a, b)
-        ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
+        atol = args.atol if args.atol is not None else (1.0 if dtype == torch.bfloat16 else 1e-1)
+        rtol = args.rtol if args.rtol is not None else (1e-2 if dtype == torch.bfloat16 else 1e-3)
+        ok = torch.allclose(c, ref, atol=atol, rtol=rtol)
         print(f"[{KERNEL_NAME}] M={M} N={N} K={K}: {'OK' if ok else 'FAIL'}")
         if not ok:
             continue
@@ -112,7 +118,7 @@ def main():
         )
         measurements.append((M, N, K, ms_ref, ms_tlx))
 
-    print(f"\n{KERNEL_NAME} (LLVM, input={args.input_mode}, seed={args.seed}; "
+    print(f"\n{KERNEL_NAME} (LLVM, dtype={args.dtype}, input={args.input_mode}, seed={args.seed}; "
           f"triton median, {args.warmup}ms warmup/{args.rep}ms timed):")
     print(f"{'M':>6s} {'N':>6s} {'K':>6s}  {'rocBLAS':>8s}  {'TLX':>8s}")
     for M, N, K, ms_ref, ms_tlx in measurements:
