@@ -337,7 +337,7 @@ void init_triton_tlx_ir(py::module_ &m) {
             return self.create<ttg::LocalLoadOp>(newType, subView,
                                                  asyncToken.value_or(Value()));
           },
-          py::arg("subView"), py::arg("asyncToken"),
+          py::arg("subView"), py::arg("asyncToken").none(),
           py::arg("layoutEncoding") = std::nullopt)
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
@@ -815,7 +815,9 @@ void init_triton_tlx_ir(py::module_ &m) {
                                                                  *storageAlias);
              else
                return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
-           })
+           },
+           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
+           py::arg("alias").none(), py::arg("storageAlias").none())
       .def(
           "create_tmem_load",
           [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
@@ -1037,7 +1039,9 @@ void init_triton_tlx_ir(py::module_ &m) {
                                                                  *storageAlias);
              else
                return self.create<ttg::LocalAllocOp>(memDesc);
-           })
+           },
+           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
+           py::arg("alias").none(), py::arg("storageAlias").none())
       .def("create_storage_alias_spec",
            [](TritonOpBuilder &self, const std::string &storage,
               std::optional<int64_t> bufferSizeBytes) -> mlir::Value {
@@ -1306,7 +1310,12 @@ void init_triton_tlx_ir(py::module_ &m) {
                  other.value_or(Value()), bulkSize.value_or(Value()),
                  barrier.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile, useBulk);
-           })
+           },
+           py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
+           py::arg("other").none(), py::arg("cacheModifier"),
+           py::arg("evictionPolicy"), py::arg("isVolatile"),
+           py::arg("bulkSize").none(), py::arg("barrier").none(),
+           py::arg("useBulk"))
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<triton::gpu::Clock64Op>(
@@ -1414,7 +1423,9 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask.value_or(Value()),
                  other.value_or(Value()), Value() /*stride*/, cache);
-           })
+           },
+           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
+           py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);
