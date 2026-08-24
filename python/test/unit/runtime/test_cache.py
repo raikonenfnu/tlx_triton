@@ -822,8 +822,9 @@ def test_hooks(device, fresh_triton_cache) -> None:
 def test_within_2gb(device, fresh_triton_cache) -> None:
     with triton.knobs.amd.scope():
         use_buffer_ops_opts = [True, False]
-        # The ranges should only be available when buffer ops are enabled
-        pointer_ranges = [[(0, )], []]
+        # Pointer-range specialization also enables the i32 address path for
+        # direct-to-LDS loads, so it is independent of buffer-op selection.
+        pointer_ranges = [[(0, )], [(0, )]]
         for use_buffer_ops, pointer_range in zip(use_buffer_ops_opts, pointer_ranges):
             triton.knobs.amd.use_buffer_ops = use_buffer_ops
 
@@ -851,24 +852,26 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
 
-        with triton.knobs.runtime.scope():
-            # The C cache must distinguish HIP's storage-size specializations.
-            triton.knobs.runtime.jit_cache_hook = None
-            triton.knobs.amd.use_buffer_ops = True
+        for use_buffer_ops in use_buffer_ops_opts:
+            with triton.knobs.runtime.scope():
+                # The C cache must distinguish HIP's storage-size
+                # specializations in either addressing mode.
+                triton.knobs.runtime.jit_cache_hook = None
+                triton.knobs.amd.use_buffer_ops = use_buffer_ops
 
-            @triton.jit(c_cache=True)
-            def kernel_add_with_c_cache(a):
-                tl.load(a)
+                @triton.jit(c_cache=True)
+                def kernel_add_with_c_cache(a):
+                    tl.load(a)
 
-            launch = kernel_add_with_c_cache[(1, 0)]
-            launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
-            assert kernel_add_with_c_cache.c_cache is True
-            device_id = getattr(torch, device).current_device()
-            kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
-            assert len(kernel_cache) == 1
+                launch = kernel_add_with_c_cache[(1, 0)]
+                launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
+                assert kernel_add_with_c_cache.c_cache is True
+                device_id = getattr(torch, device).current_device()
+                kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
+                assert len(kernel_cache) == 1
 
-            launch(torch.empty(2**31, dtype=torch.int8, device=device))
-            assert len(kernel_cache) == 2
+                launch(torch.empty(2**31, dtype=torch.int8, device=device))
+                assert len(kernel_cache) == 2
 
 
 def test_function_arguments(device):

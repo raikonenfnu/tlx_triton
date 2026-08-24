@@ -75,6 +75,28 @@ if has_tlx():
         t = tl.load(a_ptr + offs, mask=offs_k[None, :] < VALID_K, other=0.0)
         tl.store(out_ptr + offs, t)
 
+    @triton.jit
+    def _async_load_int64_offset_kernel(
+        a_ptr,
+        begin_ptr,
+        out_ptr,
+        VALID_M: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, BLOCK_K)
+        begin = tl.load(begin_ptr)
+        ptrs = a_ptr + (begin + offs_m[:, None]) * BLOCK_K + offs_k[None, :]
+        mask = offs_m[:, None] < VALID_M
+        smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
+        tok = tlx.async_load(ptrs, tlx.local_view(smem, 0), mask=mask)
+        tlx.async_load_commit_group([tok])
+        tlx.async_load_wait_group(0)
+        value = tlx.local_load(tlx.local_view(smem, 0))
+        out_offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
+        tl.store(out_ptr + out_offs, value)
+
 
 @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
 @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -141,6 +163,30 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])
+
+    def test_async_load_int64_offset_without_buffer_ops(self):
+        # Jagged kernels commonly load a 64-bit row offset before forming the
+        # pointer tensor consumed by a direct-to-LDS copy.
+        begin = 7
+        valid_m = 19
+        a = torch.randn(begin + self.BLOCK_M, self.BLOCK_K, device=GPU_TYPE, dtype=torch.float16)
+        begin_tensor = torch.tensor(begin, device=GPU_TYPE, dtype=torch.int64)
+        out = torch.empty(self.BLOCK_M, self.BLOCK_K, device=GPU_TYPE, dtype=torch.float16)
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_buffer_ops = False
+            kernel = _async_load_int64_offset_kernel[(1, )](
+                a,
+                begin_tensor,
+                out,
+                VALID_M=valid_m,
+                BLOCK_M=self.BLOCK_M,
+                BLOCK_K=self.BLOCK_K,
+                num_warps=4,
+            )
+        torch.testing.assert_close(out[:valid_m], a[begin:begin + valid_m])
+        torch.testing.assert_close(out[valid_m:], torch.zeros_like(out[valid_m:]))
+        self.assertIn("tt.pointer_range = 32", kernel.asm["ttir"])
+        self.assertIn("global_load_lds", kernel.asm["amdgcn"])
 
 
 if __name__ == "__main__":
