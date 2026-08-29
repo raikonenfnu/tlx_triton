@@ -8,6 +8,10 @@ description: Search, correctness-check, and report the best TLX gfx9 BF16 GEMM o
 Use `scripts/benchmark_gfx9_bf16_gemm.py` as the source of truth for candidate
 eligibility, correctness, timing, output schema, and issue formatting. Keep named
 workloads in `targets/*.json`; do not hard-code production shapes into the script.
+Keep incomplete or not-yet-runnable workload inventories in `datasets/*.json`.
+Dataset entries may retain baseline measurements and frequency metadata, but must
+use `null` for unknown layouts instead of guessing. Promote an entry into a target
+suite only after its layouts are verified and the harness supports its operation.
 
 ## Workflow
 
