@@ -34,13 +34,14 @@ def _swz_offset_bases(shape, contig_dim):
     contig_bits = int(shape[contig_dim]).bit_length() - 1
     free_bits = int(shape[free_dim]).bit_length() - 1
     contig = [basis(contig_dim, i) for i in range(contig_bits)]
-    free = ([basis(free_dim, i) for i in range(4, free_bits)] +
-            [basis(free_dim, i) for i in range(min(4, free_bits))])
+    free = ([basis(free_dim, i) for i in range(4, free_bits)] + [basis(free_dim, i) for i in range(min(4, free_bits))])
     return contig + free
 
 
 _A_LDS_BASES = tl.constexpr(_swz_offset_bases([256, 64], 1))
+_A_COLUMN_MAJOR_LDS_BASES = tl.constexpr(_swz_offset_bases([256, 64], 0))
 _B_LDS_BASES = tl.constexpr(_swz_offset_bases([64, 128], 0))
+_B_ROW_MAJOR_LDS_BASES = tl.constexpr(_swz_offset_bases([64, 128], 1))
 _C_STORE_SIMD_LAYOUT = tlx.layout(
     shape=((16, 4, 8), (8, 8)),
     stride=((8, 128, 512), (1, 4096)),
@@ -75,6 +76,8 @@ def v9_beyond_hotloop(
     GROUP_SIZE_M: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
+    A_COLUMN_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -114,13 +117,13 @@ def v9_beyond_hotloop(
     # Pin the padded-shared offset bases instead of relying on layout inference.
     # The explicit row/column bit permutation avoids LDS bank conflicts and keeps
     # the direct-to-LDS buffer loads coalesced for the fixed 256x256x64 tile.
-    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _A_LDS_BASES, [BLOCK_M, BLOCK_K])
-    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _B_LDS_BASES, [BLOCK_K, HALF_N])
-    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    a_bases: tl.constexpr = _A_COLUMN_MAJOR_LDS_BASES if A_COLUMN_MAJOR else _A_LDS_BASES
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [BLOCK_M, BLOCK_K])
+    b_bases: tl.constexpr = _B_ROW_MAJOR_LDS_BASES if B_ROW_MAJOR else _B_LDS_BASES
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
+    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
 
     offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
@@ -234,7 +237,8 @@ def v9_beyond_hotloop(
     store_layout: tl.constexpr = _C_STORE_SIMD_LAYOUT
     acc_layout: tl.constexpr = _ACCUMULATOR_LAYOUT
     acc_left = tlx.require_layout(acc_left, acc_layout)
-    c_left = tlx.require_layout(acc_left.to(tl.float16), store_layout)
+    output_ty = c_ptr.dtype.element_ty
+    c_left = tlx.require_layout(acc_left.to(output_ty), store_layout)
     tlx.assert_same_layout(c_left, store_layout)
     c_left_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :])
     tl.store(c_left_ptrs, c_left, mask=(offs_cm[:, None] < M) & (offs_cn_left[None, :] < N))
@@ -243,7 +247,7 @@ def v9_beyond_hotloop(
 
     # Store right half
     acc_right = tlx.require_layout(acc_right, acc_layout)
-    c_right = tlx.require_layout(acc_right.to(tl.float16), store_layout)
+    c_right = tlx.require_layout(acc_right.to(output_ty), store_layout)
     c_right_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :])
     tl.store(
         c_right_ptrs,
@@ -251,16 +255,21 @@ def v9_beyond_hotloop(
         mask=(offs_cm[:, None] < M) & (offs_cn_right[None, :] < N),
     )
 
+
 def matmul(a, b):
+    assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    if K < 2 * BLOCK_K or K % BLOCK_K != 0 or grid_mn < 128:
+        from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import matmul as interwave
+        return interwave(a, b)
     NUM_XCDS = 8
     GROUP_SIZE_M = 4
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    GRID_MN = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    v9_beyond_hotloop[(GRID_MN, )](
+    v9_beyond_hotloop[(grid_mn, )](
         a,
         b,
         c,
@@ -278,10 +287,12 @@ def matmul(a, b):
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
         NUM_XCDS=NUM_XCDS,
-        GRID_MN=GRID_MN,
+        GRID_MN=grid_mn,
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=8,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return c

@@ -1,0 +1,4 @@
+interface:
+  display_name: "gfx9 BF16 GEMM Benchmarker"
+  short_description: "Find and report the best TLX gfx9 BF16 GEMM per shape"
+  default_prompt: "Benchmark the maintained gfx9 BF16 GEMM shapes, verify every candidate, and produce a reproducible comparison against PyTorch."

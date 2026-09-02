@@ -21,11 +21,13 @@ SPLIT_K that partitions the K reduction across more workgroups. Partials land in
 an fp32 workspace and a separate fp32 reduce kernel sums them into C -- keeping
 the result numerically identical to the non-split-K path. `choose_split_k`
 returns 1 for shapes that already fill the machine, making split-K a no-op there.
+For an indivisible K, an aligned prefix is split and its fp32 reduction is fused
+with a short masked tail, avoiding the underoccupied 128x128 fallback.
 
 The additive FP16/BF16 `streamk_matmul` schedule uses an extracted `matmul_tile`
 load/LDS/MFMA pipeline with persistent full tiles plus a TritonBLAS-style
-variable-work Stream-K tail, including an even-work fast path for the two
-performance-critical production shapes.
+variable-work Stream-K tail. Its wrapper dispatches to the plain/split path when
+the persistent publication and fixup cannot amortize.
 """
 
 import torch
@@ -230,8 +232,12 @@ _HALF_256 = 256 // 2  # half of the 256x256 tile
 _HALF_128 = 128 // 2  # half of the 128x128 tile
 _A_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 1))
 _A_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 1))
+_A_COLUMN_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 0))
+_A_COLUMN_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 0))
 _B_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 0))
 _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
+_B_ROW_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 1))
+_B_ROW_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 1))
 # Direct-to-LDS offset layouts inferred by the aligned 256x256 path. Pinning
 # these keeps a merely 16-byte-aligned leading stride from falling back to a
 # blocked layout that the AMD buffer-load lowering cannot consume.
@@ -597,6 +603,8 @@ def a16w16_8wave(
     USE_I64_C_OFFSETS: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    A_COLUMN_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
@@ -653,8 +661,10 @@ def a16w16_8wave(
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
     if PIN_OFFSET_LAYOUT:
-        stride_am = tl.multiple_of(stride_am, 8)
-        stride_bn = tl.multiple_of(stride_bn, 8)
+        if not A_COLUMN_MAJOR:
+            stride_am = tl.multiple_of(stride_am, 8)
+        if not B_ROW_MAJOR:
+            stride_bn = tl.multiple_of(stride_bn, 8)
 
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -674,8 +684,14 @@ def a16w16_8wave(
     # (gfx950 has no direct-to-LDS scattering -> extra write swizzle). Net: this
     # padded layout is the fastest option and still beats vendor -- the stall is the
     # price of the cheap direct-to-LDS write on a small square tile.
-    a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
-    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    if A_COLUMN_MAJOR:
+        a_bases: tl.constexpr = _A_COLUMN_MAJOR_BASES_256 if BLOCK_M == 256 else _A_COLUMN_MAJOR_BASES_128
+    else:
+        a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
+    if B_ROW_MAJOR:
+        b_bases: tl.constexpr = _B_ROW_MAJOR_BASES_256 if BLOCK_N == 256 else _B_ROW_MAJOR_BASES_128
+    else:
+        b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
     smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
@@ -1082,7 +1098,8 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                    NUM_XCDS: tl.constexpr, NUM_CU: tl.constexpr, NUM_PROGRAMS: tl.constexpr, HAS_STREAMK: tl.constexpr,
                    NUM_FULL_TILES: tl.constexpr, HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr,
                    NUM_PID_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                   K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr):
+                   K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr,
+                   A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
@@ -1096,8 +1113,14 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
     HALF_N: tl.constexpr = BLOCK_N // 2
     acc_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                    warps_per_cta=[2, 4])
-    a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
-    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    if A_COLUMN_MAJOR:
+        a_bases: tl.constexpr = _A_COLUMN_MAJOR_BASES_256 if BLOCK_M == 256 else _A_COLUMN_MAJOR_BASES_128
+    else:
+        a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
+    if B_ROW_MAJOR:
+        b_bases: tl.constexpr = _B_ROW_MAJOR_BASES_256 if BLOCK_N == 256 else _B_ROW_MAJOR_BASES_128
+    else:
+        b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
     et: tl.constexpr = a_ptr.dtype.element_ty
@@ -1324,6 +1347,43 @@ def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride
     tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
+_TAIL_CONFIGS = [
+    triton.Config({"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn}, num_warps=warps)
+    for bm, bn, warps in ((64, 64, 4), (64, 128, 4), (128, 64, 4), (128, 128, 8))
+]
+
+
+@triton.autotune(configs=_TAIL_CONFIGS, key=["M", "N", "K_TAIL", "SPLIT_K"])
+@triton.jit
+def _reduce_k_tail_kernel(a_ptr, b_ptr, workspace_ptr, c_ptr, M: tl.constexpr, N: tl.constexpr, K_OFFSET: tl.constexpr,
+                          K_TAIL: tl.constexpr, stride_am: tl.constexpr, stride_ak: tl.constexpr,
+                          stride_bk: tl.constexpr, stride_bn: tl.constexpr, SPLIT_K: tl.constexpr,
+                          TAIL_BLOCK_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    """Reduce aligned split-K partials and accumulate the short, masked K tail."""
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c_offsets = offs_m[:, None] * N + offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    offs_k = tl.arange(0, TAIL_BLOCK_K)
+    for kk in tl.range(0, K_TAIL, TAIL_BLOCK_K, num_stages=1):
+        k = kk + offs_k
+        k_mask = k < K_TAIL
+        a = tl.load(a_ptr + offs_m[:, None] * stride_am + (K_OFFSET + k[None, :]) * stride_ak,
+                    mask=(offs_m[:, None] < M) & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptr + (K_OFFSET + k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+                    mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
+        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+    for split in range(SPLIT_K):
+        acc += tl.load(workspace_ptr + split * M * N + c_offsets, mask=mask, other=0.0)
+    tl.store(c_ptr + c_offsets, acc.to(c_ptr.dtype.element_ty), mask=mask)
+
+
 NUM_CU = 256  # gfx950 (CDNA4) compute units
 # Minimum K-tiles per split. Two forces set this floor: (1) below it the per-split
 # prologue/epilogue overhead dominates the shrinking K work; (2) more splits means
@@ -1333,6 +1393,9 @@ NUM_CU = 256  # gfx950 (CDNA4) compute units
 # (e.g. K=12288 wants SPLIT_K=12 (16 tiles) not 16 (12 tiles); the latter fills the
 # CUs but its extra reduce traffic makes it net slower).
 MIN_KTILES_PER_SPLIT = 16
+# Stream-K's publication/fixup loses below this much work per output tile. At
+# 64 pairs it starts beating the plain schedule on partially filled final waves.
+MIN_STREAMK_PIPE_PAIRS = 64
 
 # Tile candidates, largest first. The big tile is the tuned default; the smaller
 # one is used only when the big tile can't fill the CUs (see choose_tile).
@@ -1342,19 +1405,25 @@ TILE_CANDIDATES = ((256, 256), (128, 128))
 
 
 def _split_k_for(grid_mn, K):
-    """Largest SPLIT_K keeping grid_mn*SK within one CU wave and each split a whole,
-    BLOCK_K-aligned chunk of >= MIN_KTILES_PER_SPLIT tiles.
+    """Choose SPLIT_K within one CU wave using a compute/reduction cost model.
 
     All divisors of K are considered, not just powers of two: for K with odd factors
     (e.g. 22272 = 64*348) a non-pow2 SPLIT_K divides K and fills the CUs far more
-    precisely than the nearest pow2 (SPLIT_K=12 -> 192 CUs vs SPLIT_K=4 -> 64 CUs).
-    The scan is <= NUM_CU/grid_mn (~20) iterations, negligible at compile time."""
+    precisely than the nearest pow2. More splits shorten each GEMM CTA but increase
+    the fp32 workspace traffic consumed by the reduction. On gfx950, one reduction
+    program costs about 3/16 of one K tile, giving the integer score below. This
+    selects 64-way splitting for 512x256x98304 and 56-way splitting for
+    768x256x114688 instead of over-splitting both to the largest legal divisor.
+    The scan is <= NUM_CU/grid_mn iterations, negligible at launch time."""
     min_ks = MIN_KTILES_PER_SPLIT * BLOCK_K
     best = 1
+    best_cost = 16 * (K // BLOCK_K) + 3 * grid_mn
     for sk in range(2, NUM_CU // grid_mn + 1):  # grid_mn*sk <= NUM_CU
         ks = K // sk
         if K % sk == 0 and ks >= min_ks and ks % BLOCK_K == 0:
-            best = sk  # fill = grid_mn*sk grows with sk, so the last valid sk wins
+            cost = 16 * (ks // BLOCK_K) + 3 * grid_mn * sk
+            if cost < best_cost:
+                best, best_cost = sk, cost
     return best
 
 
@@ -1396,6 +1465,28 @@ def _needs_i64_offsets(tensor):
     return max_byte_offset > (1 << 31) - 1
 
 
+def _aligned_split_tail_plan(M, N, K):
+    """Return an aligned (prefix, split) plan for a large, indivisible K."""
+    grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    if K % (2 * BLOCK_K) == 0 or grid_mn >= NUM_CU // 2:
+        return None
+    best = None
+    for split in range(2, NUM_CU // grid_mn + 1):
+        quantum = split * 2 * BLOCK_K
+        prefix = K // quantum * quantum
+        ks = prefix // split
+        if ks < MIN_KTILES_PER_SPLIT * BLOCK_K:
+            continue
+        tail = K - prefix
+        # Compare the longest prefix CTA, fp32 reduction traffic, and masked-tail
+        # work in the same units used by _split_k_for. A smaller tail can beat a
+        # perfectly full CU wave because the tail is intentionally not split.
+        cost = 16 * (ks // BLOCK_K) + 3 * grid_mn * split + 16 * triton.cdiv(tail, BLOCK_K)
+        if best is None or cost < best[0]:
+            best = cost, prefix, split
+    return None if best is None else best[1:]
+
+
 def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -1426,7 +1517,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     # the masked register tail in the kernel.
     assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
     assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
-    assert KS * a.element_size() % 16 == 0, f"K/SPLIT_K={KS} must preserve 16-byte split alignment"
+    if SPLIT_K > 1:
+        assert KS * a.element_size() % 16 == 0, f"K/SPLIT_K={KS} must preserve 16-byte split alignment"
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1 or DEFER_EPILOGUE:
@@ -1477,8 +1569,10 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         USE_I64_A_OFFSETS=_needs_i64_offsets(a),
         USE_I64_B_OFFSETS=_needs_i64_offsets(b),
         USE_I64_C_OFFSETS=use_i64_c_offsets,
-        PIN_OFFSET_LAYOUT=K_LIMIT is not None,
+        PIN_OFFSET_LAYOUT=K_LIMIT is not None and a.stride(0) != 1 and b.stride(1) != 1,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -1487,7 +1581,7 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         enable_sched_group_barrier_scheduler=True,
     )
-    if SPLIT_K > 1:
+    if SPLIT_K > 1 and not DEFER_EPILOGUE:
         # Adaptive reduce tile: small outputs need many small CTAs to fill the CUs;
         # large outputs are BW-bound and prefer big tiles for burst efficiency
         # (measured: 32x32 -> 4.5 TB/s vs 128x128 -> 5.4 TB/s on Pooler).
@@ -1514,6 +1608,17 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     return c
 
 
+def _launch_aligned_split_tail(a, b, prefix, split):
+    """Split an aligned K prefix and fuse its fp32 reduction with the K tail."""
+    M, K = a.shape
+    N = b.shape[1]
+    workspace, c = _launch(a, b, SPLIT_K=split, TILE=(BLOCK_M, BLOCK_N), K_LIMIT=prefix, DEFER_EPILOGUE=True)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+    _reduce_k_tail_kernel[grid](a, b, workspace, c, M, N, prefix, K - prefix, a.stride(0), a.stride(1), b.stride(0),
+                                b.stride(1), SPLIT_K=split, TAIL_BLOCK_K=BLOCK_K)
+    return c
+
+
 def matmul(a, b, SPLIT_K=None):
     """C = A @ B. `a` is (M, K), `b` is (K, N).
 
@@ -1526,6 +1631,10 @@ def matmul(a, b, SPLIT_K=None):
     numerically identical to the non-split-K kernel; only an int-free fp32 sum is
     added, so there is no precision loss and the result is deterministic.
     """
+    if SPLIT_K is None:
+        plan = _aligned_split_tail_plan(a.shape[0], b.shape[1], a.shape[1])
+        if plan is not None:
+            return _launch_aligned_split_tail(a, b, *plan)
     return _launch(a, b, SPLIT_K=SPLIT_K)
 
 
@@ -1536,10 +1645,6 @@ def _validate_streamk(a, b):
     assert a.ndim == 2 and b.ndim == 2 and a.shape[1] == b.shape[0]
     M, K = a.shape
     _, N = b.shape
-    assert M % BLOCK_M == 0 and N % BLOCK_N == 0, \
-        f"M and N must be multiples of {BLOCK_M}"
-    assert K >= MIN_K, f"K must be at least {MIN_K}"
-    assert K % (2 * BLOCK_K) == 0, f"K must be a multiple of {2 * BLOCK_K}"
     return M, N, K
 
 
@@ -1558,22 +1663,25 @@ def _choose_streamk_tile(M, N):
 def streamk_matmul(a, b):
     """Run one persistent kernel with a variable-work Stream-K tail when profitable."""
     M, N, K = _validate_streamk(a, b)
+    if M % BLOCK_M != 0 or N % BLOCK_N != 0 or K < MIN_K or K % (2 * BLOCK_K) != 0:
+        return matmul(a, b)
     BM, BN = _choose_streamk_tile(M, N)
     schedule = _streamk_schedule(M, N, K, block_m=BM, block_n=BN)
-    # Keep the extracted async pipeline out of an outer multi-wave tile loop;
-    # the AMD warp-pipeline pass cannot nest its waits in that region. The
-    # data-centric kernel keeps the same pipeline inline for this case.
-    if not schedule["HAS_STREAMK"] and schedule["NUM_FULL_TILES"] > schedule["NUM_PROGRAMS"]:
+    # Persistent scheduling only pays for a genuine tail with enough K work to
+    # amortize its partial publication and owner fixup. The plain path already
+    # split-K fills underoccupied grids and is substantially cheaper otherwise.
+    if not schedule["HAS_STREAMK"] or schedule["K_PIPE_PAIRS"] < MIN_STREAMK_PIPE_PAIRS:
         return matmul(a, b)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     if schedule["HAS_STREAMK"]:
         partials = torch.empty((NUM_CU, BM, BN), device=a.device, dtype=torch.float32)
-        locks = torch.empty((NUM_CU, ), device=a.device, dtype=torch.int32)
+        locks = torch.zeros((NUM_CU, ), device=a.device, dtype=torch.int32)
     else:
         partials = locks = c
     streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1),
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS)
+                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
+                                                 A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1)
     return c

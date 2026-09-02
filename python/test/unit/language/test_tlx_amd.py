@@ -62,6 +62,12 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     preshuffle_mxfp4_scales as _preshuffle_a4w4_scales,
     select_matmul_path as _select_a4w4_inter_wave_path,
 )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    matmul as _a16w16_inter_wave_matmul,
+    streamk_matmul as _a16w16_inter_wave_streamk_matmul,
+)
+from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
+    matmul as _a16w16_v9_matmul, )
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -5144,6 +5150,37 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert ".sgpr_count:     58" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn
+
+
+@pytest.mark.parametrize("column_major_a", [False, True], ids=["row-a", "column-a"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a16w16_inter_wave_bf16_row_major_b_gfx950(device, column_major_a):
+    # 128 output tiles keep v9 on its native path instead of its underfill fallback.
+    m, n, k = 32768, 256, 512
+    torch.manual_seed(0)
+    if column_major_a:
+        a = torch.randn((k, m), device=device, dtype=torch.bfloat16).T
+    else:
+        a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b = torch.randn((k, n), device=device, dtype=torch.bfloat16)
+    expected = torch.matmul(a, b)
+
+    for impl in (_a16w16_inter_wave_matmul, _a16w16_inter_wave_streamk_matmul, _a16w16_v9_matmul):
+        actual = impl(a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a16w16_inter_wave_bf16_arbitrary_k_gfx950(device):
+    m, n, k = 512, 512, 4351
+    torch.manual_seed(0)
+    a = torch.randn((k, m), device=device, dtype=torch.bfloat16).T
+    b = torch.randn((k, n), device=device, dtype=torch.bfloat16)
+
+    expected = torch.matmul(a, b)
+    for impl in (_a16w16_inter_wave_matmul, _a16w16_inter_wave_streamk_matmul, _a16w16_v9_matmul):
+        actual = impl(a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
