@@ -63,6 +63,9 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     select_matmul_path as _select_a4w4_inter_wave_path,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    MIN_STREAMK_PIPE_PAIRS as _A16W16_MIN_STREAMK_PIPE_PAIRS,
+    _choose_streamk_tile as _choose_a16w16_streamk_tile,
+    _streamk_schedule as _a16w16_streamk_schedule,
     matmul as _a16w16_inter_wave_matmul,
     streamk_matmul as _a16w16_inter_wave_streamk_matmul,
 )
@@ -5182,6 +5185,20 @@ def test_a16w16_inter_wave_bf16_arbitrary_k_gfx950(device):
     for impl in (_a16w16_inter_wave_matmul, _a16w16_inter_wave_streamk_matmul, _a16w16_v9_matmul):
         actual = impl(a, b)
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("n, tail_tiles, units_per_program", [(20480, 64, 12), (24576, 128, 24)])
+def test_a16w16_streamk_pr2850_schedule_gfx950(n, tail_tiles, units_per_program):
+    m, k = 1024, 6144
+    bm, bn = _choose_a16w16_streamk_tile(m, n)
+    schedule = _a16w16_streamk_schedule(m, n, k, block_m=bm, block_n=bn)
+
+    assert (bm, bn) == (256, 256)
+    assert schedule["HAS_STREAMK"]
+    assert schedule["K_PIPE_PAIRS"] >= _A16W16_MIN_STREAMK_PIPE_PAIRS
+    assert schedule["NUM_FULL_TILES"] == 256
+    assert m // bm * (n // bn) - schedule["NUM_FULL_TILES"] == tail_tiles
+    assert schedule["UNITS_PER_PROGRAM"] == units_per_program
 
 
 def test_amd_addmm_large_operand_paths():

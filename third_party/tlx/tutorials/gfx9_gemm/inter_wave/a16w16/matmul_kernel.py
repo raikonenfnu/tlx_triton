@@ -1393,9 +1393,10 @@ NUM_CU = 256  # gfx950 (CDNA4) compute units
 # (e.g. K=12288 wants SPLIT_K=12 (16 tiles) not 16 (12 tiles); the latter fills the
 # CUs but its extra reduce traffic makes it net slower).
 MIN_KTILES_PER_SPLIT = 16
-# Stream-K's publication/fixup loses below this much work per output tile. At
-# 64 pairs it starts beating the plain schedule on partially filled final waves.
-MIN_STREAMK_PIPE_PAIRS = 64
+# Stream-K's publication/fixup needs enough work per output tile to amortize
+# synchronization and partial traffic. The PR #2850 production shapes reach
+# that crossover at 48 pairs; shorter tails stay on the plain schedule.
+MIN_STREAMK_PIPE_PAIRS = 48
 
 # Tile candidates, largest first. The big tile is the tuned default; the smaller
 # one is used only when the big tile can't fill the CUs (see choose_tile).

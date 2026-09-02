@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "problem_set3_pr2850_bf16_streamk",
+  "source": "https://github.com/facebookexperimental/triton/pull/2850",
+  "layout_convention": {
+    "mm": "row-major A and row-major B, matching PR #2850 bench.py"
+  },
+  "shapes": [
+    {"name": "pr2850_bf16_1024x20480x6144", "op": "mm", "m": 1024, "n": 20480, "k": 6144, "layout_a": "row", "layout_b": "row", "weight": 1},
+    {"name": "pr2850_bf16_1024x24576x6144", "op": "mm", "m": 1024, "n": 24576, "k": 6144, "layout_a": "row", "layout_b": "row", "weight": 1}
+  ]
+}
