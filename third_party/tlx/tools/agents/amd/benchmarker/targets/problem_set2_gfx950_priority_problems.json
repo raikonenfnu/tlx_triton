@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "problem_set2_gfx950_priority_problems",
+  "source": "datasets/gfx950_priority_problems.json@9e60aaafbd2abc418d8c7647de380bfb87cb91ee",
+  "layout_convention": {
+    "addmm": "row-major A and column-major B, required by amd_addmm_gfx950",
+    "bmm": "shared row-major A and row-major B, matching the source baseline and standard torch.bmm"
+  },
+  "shapes": [
+    {"name": "priority_addmm_1024x20480x6144", "op": "addmm", "m": 1024, "n": 20480, "k": 6144, "layout_a": "row", "layout_b": "column", "weight": 9},
+    {"name": "priority_addmm_262144x262x294", "op": "addmm", "m": 262144, "n": 262, "k": 294, "layout_a": "row", "layout_b": "column", "weight": 9},
+    {"name": "priority_bmm_b3072_448x160x931", "op": "bmm", "m": 448, "n": 160, "k": 931, "batch": 3072, "layout_a": "shared-row", "layout_b": "row", "weight": 1},
+    {"name": "priority_addmm_2252800x256x512", "op": "addmm", "m": 2252800, "n": 256, "k": 512, "layout_a": "row", "layout_b": "column", "weight": 1},
+    {"name": "priority_addmm_3072x15360x4096", "op": "addmm", "m": 3072, "n": 15360, "k": 4096, "layout_a": "row", "layout_b": "column", "weight": 3},
+    {"name": "priority_addmm_3072x4096x25344", "op": "addmm", "m": 3072, "n": 4096, "k": 25344, "layout_a": "row", "layout_b": "column", "weight": 1},
+    {"name": "priority_addmm_1024x4096x6144", "op": "addmm", "m": 1024, "n": 4096, "k": 6144, "layout_a": "row", "layout_b": "column", "weight": 20},
+    {"name": "priority_addmm_3072x3072x11800", "op": "addmm", "m": 3072, "n": 3072, "k": 11800, "layout_a": "row", "layout_b": "column", "weight": 1}
+  ]
+}

@@ -1,0 +1,13 @@
+[
+  {"name": "gemm_addmm_768x851968x256", "op": "addmm", "m": 768, "n": 851968, "k": 256, "layout_a": "row", "layout_b": "column", "weight": 480},
+  {"name": "gemm_768x256x851968", "op": "mm", "m": 768, "n": 256, "k": 851968, "layout_a": "row", "layout_b": "row", "weight": 960},
+  {"name": "gemm_851968x256x768", "op": "mm", "m": 851968, "n": 256, "k": 768, "layout_a": "column", "layout_b": "row", "weight": 480},
+  {"name": "gemm_512x256x98304", "op": "mm", "m": 512, "n": 256, "k": 98304, "layout_a": "column", "layout_b": "row", "weight": 960},
+  {"name": "gemm_98304x256x512", "op": "mm", "m": 98304, "n": 256, "k": 512, "layout_a": "row", "layout_b": "row", "weight": 480},
+  {"name": "gemm_768x256x114688", "op": "mm", "m": 768, "n": 256, "k": 114688, "layout_a": "row", "layout_b": "row", "weight": 960},
+  {"name": "gemm_addmm_768x114688x256", "op": "addmm", "m": 768, "n": 114688, "k": 256, "layout_a": "row", "layout_b": "column", "weight": 480},
+  {"name": "gemm_114688x256x768", "op": "mm", "m": 114688, "n": 256, "k": 768, "layout_a": "column", "layout_b": "row", "weight": 480},
+  {"name": "gemm_addmm_98304x512x256", "op": "addmm", "m": 98304, "n": 512, "k": 256, "layout_a": "row", "layout_b": "column", "weight": 480},
+  {"name": "gemm_43500x1024x1024", "op": "mm", "m": 43500, "n": 1024, "k": 1024, "layout_a": "row", "layout_b": "row", "weight": 400},
+  {"name": "gemm_1024x1024x43500", "op": "mm", "m": 1024, "n": 1024, "k": 43500, "layout_a": "column", "layout_b": "row", "weight": 480}
+]

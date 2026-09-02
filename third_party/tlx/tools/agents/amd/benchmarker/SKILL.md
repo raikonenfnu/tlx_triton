@@ -8,6 +8,10 @@ description: Search, correctness-check, and report the best TLX gfx9 BF16 GEMM o
 Use `scripts/benchmark_gfx9_bf16_gemm.py` as the source of truth for candidate
 eligibility, correctness, timing, output schema, and issue formatting. Keep named
 workloads in `targets/*.json`; do not hard-code production shapes into the script.
+`problem_set1_bf16_gemm_shapes.json` names the original issue-20 suite;
+`problem_set2_gfx950_priority_problems.json` is the runnable projection of the
+priority-problem dataset, including its explicit operand-layout conventions.
+Preserve the source inventory in `datasets/` when its layouts are unknown.
 
 ## Workflow
 
@@ -36,7 +40,7 @@ Recommended command from the Triton repository root:
 ROCR_VISIBLE_DEVICES=0 \
 TRITON_CACHE_DIR=/tmp/tlx-gfx9-bf16-$(git rev-parse --short HEAD) \
 python third_party/tlx/tools/agents/amd/benchmarker/scripts/benchmark_gfx9_bf16_gemm.py \
-  --suite third_party/tlx/tools/agents/amd/benchmarker/targets/bf16_gemm_shapes.json \
+  --suite third_party/tlx/tools/agents/amd/benchmarker/targets/problem_set1_bf16_gemm_shapes.json \
   --output-dir /tmp/tlx-gfx9-bf16-results
 ```
 

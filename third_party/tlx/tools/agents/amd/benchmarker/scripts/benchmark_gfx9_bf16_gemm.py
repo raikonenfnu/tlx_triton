@@ -18,10 +18,15 @@ from typing import Callable
 
 import torch
 import triton
+from triton.compiler.errors import CompilationError
 
 from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as tlx_addmm,
     available_paths as addmm_paths,
+)
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    bmm as shared_a_row_bmm,
+    make_bmm_inputs as make_shared_a_row_bmm_inputs,
 )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import matmul as pipelined_matmul
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul as warp_pipeline_matmul
@@ -48,6 +53,7 @@ class Shape:
     layout_a: str
     layout_b: str
     weight: int | float = 1
+    batch: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +105,8 @@ def _addmm_path_support(path: str) -> Callable[[Shape], tuple[bool, str]]:
             return False, "fused addmm candidate"
         if shape.layout_a != "row" or shape.layout_b != "column":
             return False, "gfx950 addmm requires row-major A and column-major B"
+        if path != "register" and max(shape.m * shape.k, shape.k * shape.n) * 2 >= 2**31:
+            return False, "inter-wave direct-to-LDS operands must each fit signed 32-bit byte offsets"
         if path == "inter_wave_tail":
             valid = (shape.k > 1536 and shape.k % 64 != 0 and shape.k * 2 % 16 == 0
                      and 2 * 1024 * 1024 < shape.m * shape.n <= 16 * 1024 * 1024)
@@ -135,6 +143,12 @@ ADDMM_CANDIDATES = (
     Candidate("addmm_interwave", _addmm_path_support("inter_wave"), _addmm_builder("inter_wave")),
     Candidate("addmm_interwave_tail", _addmm_path_support("inter_wave_tail"), _addmm_builder("inter_wave_tail")),
 )
+BMM_CANDIDATES = (
+    Candidate("bmm_shared_a_row", lambda shape: (shape.op == "bmm" and shape.layout_a == "shared-row"
+                                                  and shape.layout_b == "row",
+                                                  "requires shared row-major A and row-major B"),
+              lambda _bias, a, b: lambda: shared_a_row_bmm(a, b)),
+)
 
 
 def _run(command: list[str]) -> str:
@@ -157,8 +171,12 @@ def _make_matrix(rows: int, cols: int, layout: str, device: torch.device, seed: 
 def _reference(shape: Shape, bias, a, b):
     if shape.op == "mm":
         return torch.matmul(a, b)
-    assert bias is not None
-    return torch.addmm(bias, a, b)
+    if shape.op == "addmm":
+        assert bias is not None
+        return torch.addmm(bias, a, b)
+    if shape.op == "bmm":
+        return torch.bmm(a, b)
+    raise ValueError(f"unknown operation {shape.op!r}")
 
 
 def _timing_samples(fn, warmup_ms: int, rep_ms: int, repeats: int, max_warmup_launches: int,
@@ -193,7 +211,7 @@ def _error_metrics(actual: torch.Tensor, expected: torch.Tensor, rtol: float) ->
 
 
 def _tflops(shape: Shape, ms: float) -> float:
-    return 2.0 * shape.m * shape.n * shape.k / (ms * 1e9)
+    return 2.0 * shape.batch * shape.m * shape.n * shape.k / (ms * 1e9)
 
 
 def _candidate_config(name: str, shape: Shape) -> dict | None:
@@ -228,6 +246,9 @@ def _candidate_config(name: str, shape: Shape) -> dict | None:
                 "num_warps": 8}
     if name == "v9":
         return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "num_warps": 8}
+    if name == "bmm_shared_a_row":
+        return {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "NUM_BUFFERS": 3, "num_warps": 8,
+                "path": "direct" if shape.k % 32 == 0 else "register"}
     if kernel is None:
         return None
     value = getattr(kernel, "best_config", None)
@@ -242,17 +263,23 @@ def _candidate_config(name: str, shape: Shape) -> dict | None:
 
 
 def benchmark_shape(shape: Shape, args, device: torch.device) -> dict:
-    print(f"\n[{shape.name}] {shape.op} {shape.m}x{shape.n}x{shape.k} {shape.layout_a}/{shape.layout_b}", flush=True)
-    a = _make_matrix(shape.m, shape.k, shape.layout_a, device, args.seed)
+    batch = f" batch={shape.batch}" if shape.op == "bmm" else ""
+    print(f"\n[{shape.name}] {shape.op} {shape.m}x{shape.n}x{shape.k}{batch} "
+          f"{shape.layout_a}/{shape.layout_b}", flush=True)
+    if shape.op == "bmm":
+        a, b = make_shared_a_row_bmm_inputs(shape.batch, shape.m, shape.n, shape.k, device,
+                                             dtype=torch.bfloat16, seed=args.seed)
+    else:
+        a = _make_matrix(shape.m, shape.k, shape.layout_a, device, args.seed)
+        b = _make_matrix(shape.k, shape.n, shape.layout_b, device, args.seed + 1)
     print(f"  inputs: A shape={tuple(a.shape)} stride={a.stride()}", flush=True)
-    b = _make_matrix(shape.k, shape.n, shape.layout_b, device, args.seed + 1)
     print(f"  inputs: B shape={tuple(b.shape)} stride={b.stride()}", flush=True)
     bias = (_make_matrix(1, shape.n, "row", device, args.seed + 2).reshape(shape.n) if shape.op == "addmm" else None)
     ref_fn = lambda: _reference(shape, bias, a, b)
     expected = ref_fn()
     torch.cuda.synchronize(device)
     print("  reference: correctness output ready", flush=True)
-    candidates = ADDMM_CANDIDATES if shape.op == "addmm" else MM_CANDIDATES
+    candidates = {"mm": MM_CANDIDATES, "addmm": ADDMM_CANDIDATES, "bmm": BMM_CANDIDATES}[shape.op]
     if args.providers:
         requested = set(args.providers)
         candidates = tuple(candidate for candidate in candidates if candidate.name in requested)
@@ -262,7 +289,7 @@ def benchmark_shape(shape: Shape, args, device: torch.device) -> dict:
         ref_fn, args.warmup_ms, args.rep_ms, args.repeats, args.max_warmup_launches, args.max_timed_launches)
     torch_ms = statistics.median(torch_samples)
     torch_result = {
-        "name": "torch.addmm" if shape.op == "addmm" else "torch.matmul",
+        "name": {"mm": "torch.matmul", "addmm": "torch.addmm", "bmm": "torch.bmm"}[shape.op],
         "status": "correct",
         "samples_ms": torch_samples,
         "warmup_launches": torch_warmup_launches,
@@ -309,7 +336,7 @@ def benchmark_shape(shape: Shape, args, device: torch.device) -> dict:
             )
             print(f"  {candidate.name:<22} {median_ms:9.4f} ms  {result['tflops']:8.2f} TF/s  "
                   f"{result['speedup_vs_torch']:.3f}x", flush=True)
-        except (AssertionError, NotImplementedError, RuntimeError, ValueError) as error:
+        except (AssertionError, CompilationError, NotImplementedError, RuntimeError, ValueError) as error:
             result.update(status="failed", reason=f"{type(error).__name__}: {error}")
             if args.tracebacks:
                 result["traceback"] = traceback.format_exc()
@@ -331,6 +358,7 @@ def benchmark_shape(shape: Shape, args, device: torch.device) -> dict:
 
 def _markdown(report: dict, command: str) -> str:
     env = report["environment"]
+    suite_metadata = report.get("suite_metadata", {})
     weighted_torch = sum(item["weight"] * item["torch"]["median_ms"] for item in report["results"])
     weighted_tlx = sum(item["weight"] * item["best"]["median_ms"] for item in report["results"] if item["best"])
     decisive_tlx_wins = sum(1 for item in report["results"] if item["best"] and item["best"]["speedup_vs_torch"] >= 1.01)
@@ -357,16 +385,16 @@ def _markdown(report: dict, command: str) -> str:
         f"L2 is flushed before each timed launch and warmup is capped at "
         f"{report['policy']['max_warmup_launches']} launches",
         f"- Correctness: BF16 `torch.allclose(atol={report['policy']['atol']}, rtol={report['policy']['rtol']})`",
-        "",
-        "## Recommendation",
-        "",
-        recommendation,
-        "",
-        "## Best result per shape",
-        "",
-        "| Shape | Op/layout | PyTorch ms | PyTorch TF/s | Best TLX path | TLX ms | TLX TF/s | Speedup |",
-        "|---|---:|---:|---:|---|---:|---:|---:|",
     ]
+    if source := suite_metadata.get("source"):
+        lines.append(f"- Suite source: `{source}`")
+    if conventions := suite_metadata.get("layout_convention"):
+        lines.extend(f"- {op} layout convention: {description}" for op, description in conventions.items())
+    lines.extend([
+        "", "## Recommendation", "", recommendation, "", "## Best result per shape", "",
+        "| Shape | Op/layout | PyTorch ms | PyTorch TF/s | Best TLX path | TLX ms | TLX TF/s | Speedup |",
+        "|---|---:|---:|---:|---|---:|---:|---:|"
+    ])
     for item in report["results"]:
         best = item["best"]
         if best is None:
@@ -374,8 +402,9 @@ def _markdown(report: dict, command: str) -> str:
         else:
             best_cols = (best["name"], f"{best['median_ms']:.4f}", f"{best['tflops']:.2f}",
                          f"{best['speedup_vs_torch']:.3f}x")
+        batch = f" b={item['batch']}" if item["op"] == "bmm" else ""
         lines.append(
-            f"| `{item['name']}` | {item['op']} {item['layout_a']}/{item['layout_b']} | "
+            f"| `{item['name']}` | {item['op']}{batch} {item['layout_a']}/{item['layout_b']} | "
             f"{item['torch']['median_ms']:.4f} | {item['torch']['tflops']:.2f} | {best_cols[0]} | "
             f"{best_cols[1]} | {best_cols[2]} | {best_cols[3]} |")
     lines.extend(["", "## Best TLX configurations", "",
@@ -442,6 +471,13 @@ def main() -> int:
     if args.quick:
         args.warmup_ms, args.rep_ms, args.repeats = 5, 20, 1
     payload = json.loads(args.suite.read_text())
+    if isinstance(payload, dict):
+        suite_name = payload.get("name", args.suite.stem)
+        suite_metadata = {key: value for key, value in payload.items() if key != "shapes"}
+        payload = payload["shapes"]
+    else:
+        suite_name = args.suite.stem
+        suite_metadata = {}
     shapes = [Shape(**item) for item in payload]
     if args.shape:
         selected = set(args.shape)
@@ -463,7 +499,8 @@ def main() -> int:
                         sys.executable, *sys.argv])
     report = {
         "schema_version": 1,
-        "suite_name": args.suite.stem,
+        "suite_name": suite_name,
+        "suite_metadata": suite_metadata,
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "environment": {
             "gpu": torch.cuda.get_device_name(device),

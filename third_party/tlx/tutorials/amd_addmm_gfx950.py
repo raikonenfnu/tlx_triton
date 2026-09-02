@@ -19,8 +19,9 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kern
 _PATH_AUTOTUNE_WARMUP = 25
 _PATH_AUTOTUNE_REP = 100
 _PATH_CACHE: dict[tuple[object, ...], str] = {}
-_TAIL_BLOCK_K = 2 * BLOCK_K
+_TAIL_BLOCK_K = tl.constexpr(2 * BLOCK_K)
 _MAX_DEFERRED_EPILOGUE_ELEMENTS = 16 * 1024 * 1024
+_MAX_BUFFER_BYTES = 2**31 - 1
 _TAIL_CONFIGS = [
     triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps) for block_m, block_n, num_warps in (
         (64, 64, 4),
@@ -31,8 +32,11 @@ _TAIL_CONFIGS = [
 ]
 
 
-def _can_use_inter_wave(a: torch.Tensor) -> bool:
-    return a.shape[1] >= 2 * BLOCK_K and a.shape[1] % BLOCK_K == 0
+def _can_use_inter_wave(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # The direct-to-LDS buffer resource uses signed 32-bit byte offsets. Keep the
+    # whole operand addressable; wrapping above 2 GiB silently corrupts later rows.
+    addressable = max(a.numel() * a.element_size(), b.numel() * b.element_size()) <= _MAX_BUFFER_BYTES
+    return addressable and a.shape[1] >= 2 * BLOCK_K and a.shape[1] % BLOCK_K == 0
 
 
 def _can_use_inter_wave_tail(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -145,7 +149,7 @@ def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tup
     it already agrees with `register`, so a genuinely wrong `inter_wave` would
     be dropped from the timing pool and the suite would still pass green.
     """
-    if _can_use_inter_wave(a):
+    if _can_use_inter_wave(a, b):
         return ("register", "inter_wave")
     if _can_use_inter_wave_tail(a, b):
         return ("register", "inter_wave_tail")
@@ -176,7 +180,7 @@ def _autotune_path(
     register = lambda: _launch_register(a, b, bias=bias)
     register_output = register()
     candidates = {"register": register}
-    if _can_use_inter_wave(a):
+    if _can_use_inter_wave(a, b):
         inter_wave = lambda: _launch(a, b, bias=bias, SPLIT_K=split_k)
         inter_wave_output = inter_wave()
         if torch.allclose(register_output, inter_wave_output, rtol=1e-2, atol=1e-2):
@@ -226,7 +230,7 @@ def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None, pa
     except RuntimeError as error:
         raise ValueError(f"Bias shape {tuple(bias.shape)} is not broadcastable to ({M}, {N})") from error
     if SPLIT_K not in (None, 1):
-        if not _can_use_inter_wave(a):
+        if not _can_use_inter_wave(a, b):
             raise ValueError("SPLIT_K is only supported by the inter-wave kernel")
         if path not in (None, "inter_wave"):
             raise ValueError(f"SPLIT_K > 1 requires the inter_wave path, got {path!r}")

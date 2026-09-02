@@ -68,6 +68,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kern
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
     matmul as _a16w16_v9_matmul, )
+from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import available_paths as _amd_addmm_paths
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -5181,6 +5182,15 @@ def test_a16w16_inter_wave_bf16_arbitrary_k_gfx950(device):
     for impl in (_a16w16_inter_wave_matmul, _a16w16_inter_wave_streamk_matmul, _a16w16_v9_matmul):
         actual = impl(a, b)
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_amd_addmm_large_operand_paths():
+    # Direct-to-LDS buffer offsets are signed 32-bit byte offsets. Meta tensors
+    # exercise the >2 GiB gate without allocating the production-size operand.
+    a = torch.empty((2252800, 512), device="meta", dtype=torch.bfloat16)
+    b = torch.empty((256, 512), device="meta", dtype=torch.bfloat16).T
+    bias = torch.empty((256, ), device="meta", dtype=torch.bfloat16)
+    assert _amd_addmm_paths(bias, a, b) == ("register", )
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
