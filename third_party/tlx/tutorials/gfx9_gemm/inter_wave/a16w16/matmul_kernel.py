@@ -1378,7 +1378,6 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
             acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
             acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
-
             if start_unit != tile_start:
                 # A contributor publishes one partial. Its range can then start
                 # the next tile, so continue instead of returning immediately.
@@ -1467,12 +1466,14 @@ _TAIL_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_TAIL_CONFIGS, key=["M", "N", "K_TAIL", "SPLIT_K"])
+@triton.autotune(configs=_TAIL_CONFIGS, key=["M", "N", "K_TAIL", "SPLIT_K", "ADD_BIAS"])
 @triton.jit
-def _reduce_k_tail_kernel(a_ptr, b_ptr, workspace_ptr, c_ptr, M: tl.constexpr, N: tl.constexpr, K_OFFSET: tl.constexpr,
-                          K_TAIL: tl.constexpr, stride_am: tl.constexpr, stride_ak: tl.constexpr,
-                          stride_bk: tl.constexpr, stride_bn: tl.constexpr, SPLIT_K: tl.constexpr,
-                          TAIL_BLOCK_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+def _reduce_k_tail_kernel(a_ptr, b_ptr, workspace_ptr, bias_ptr, c_ptr, M: tl.constexpr, N: tl.constexpr,
+                          K_OFFSET: tl.constexpr, K_TAIL: tl.constexpr, stride_am: tl.constexpr,
+                          stride_ak: tl.constexpr, stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+                          stride_bias_m: tl.constexpr, stride_bias_n: tl.constexpr, SPLIT_K: tl.constexpr,
+                          TAIL_BLOCK_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                          ADD_BIAS: tl.constexpr):
     """Reduce aligned split-K partials and accumulate the short, masked K tail."""
     pid = tl.program_id(0)
     grid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1495,6 +1496,9 @@ def _reduce_k_tail_kernel(a_ptr, b_ptr, workspace_ptr, c_ptr, M: tl.constexpr, N
         acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
     for split in range(SPLIT_K):
         acc += tl.load(workspace_ptr + split * M * N + c_offsets, mask=mask, other=0.0)
+    if ADD_BIAS:
+        bias_offsets = offs_m[:, None] * stride_bias_m + offs_n[None, :] * stride_bias_n
+        acc += tl.load(bias_ptr + bias_offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(c_ptr + c_offsets, acc.to(c_ptr.dtype.element_ty), mask=mask)
 
 
@@ -1580,13 +1584,13 @@ def _needs_i64_offsets(tensor):
     return max_byte_offset > (1 << 31) - 1
 
 
-def _aligned_split_tail_plan(M, N, K):
-    """Return an aligned (prefix, split) plan for a large, indivisible K."""
+def _aligned_split_tail_plan(M, N, K, program_budget=NUM_CU):
+    """Return an aligned (prefix, split) plan within a CTA program budget."""
     grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    if K % (2 * BLOCK_K) == 0 or grid_mn >= NUM_CU // 2:
+    if K % (2 * BLOCK_K) == 0 or grid_mn >= program_budget // 2:
         return None
     best = None
-    for split in range(2, NUM_CU // grid_mn + 1):
+    for split in range(2, program_budget // grid_mn + 1):
         quantum = split * 2 * BLOCK_K
         prefix = K // quantum * quantum
         ks = prefix // split
@@ -1735,14 +1739,17 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     return c
 
 
-def _launch_aligned_split_tail(a, b, prefix, split):
+def _launch_aligned_split_tail(a, b, prefix, split, bias=None):
     """Split an aligned K prefix and fuse its fp32 reduction with the K tail."""
     M, K = a.shape
     N = b.shape[1]
     workspace, c = _launch(a, b, SPLIT_K=split, TILE=(BLOCK_M, BLOCK_N), K_LIMIT=prefix, DEFER_EPILOGUE=True)
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
-    _reduce_k_tail_kernel[grid](a, b, workspace, c, M, N, prefix, K - prefix, a.stride(0), a.stride(1), b.stride(0),
-                                b.stride(1), SPLIT_K=split, TAIL_BLOCK_K=BLOCK_K)
+    bias_ptr = c if bias is None else bias
+    stride_bias_m, stride_bias_n = (0, 0) if bias is None else bias.stride()
+    _reduce_k_tail_kernel[grid](a, b, workspace, bias_ptr, c, M, N, prefix, K - prefix, a.stride(0), a.stride(1),
+                                b.stride(0), b.stride(1), stride_bias_m, stride_bias_n, SPLIT_K=split,
+                                TAIL_BLOCK_K=BLOCK_K, ADD_BIAS=bias is not None)
     return c
 
 

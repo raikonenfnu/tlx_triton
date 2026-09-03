@@ -248,6 +248,15 @@ def _candidate_config(name: str, shape: Shape) -> dict | None:
         block_m, block_n, split_k = choose_tile(shape.m, shape.n, shape.k)
         return {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": 64, "SPLIT_K": split_k,
                 "num_warps": 8}
+    if name == "addmm_interwave_tail":
+        from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+            NUM_CU,
+            _aligned_split_tail_plan,
+        )
+        plan = _aligned_split_tail_plan(shape.m, shape.n, shape.k, program_budget=2 * NUM_CU)
+        prefix, split_k = plan or (shape.k // 128 * 128, 1)
+        return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "SPLIT_K": split_k,
+                "K_PREFIX": prefix, "K_TAIL": shape.k - prefix, "num_warps": 8}
     if name == "v9":
         return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "num_warps": 8}
     if name == "bmm_shared_a_row":

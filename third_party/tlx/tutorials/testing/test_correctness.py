@@ -2478,6 +2478,26 @@ def test_amd_addmm_streamk_bias(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_addmm_oversubscribed_k_tail(dtype):
+    # A 12x12 output grid uses three K splits to occupy more than one CU wave.
+    M = N = 3072
+    K = 11800
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=DEVICE, dtype=dtype) / K
+    b = (torch.randn((N, K), device=DEVICE, dtype=dtype) / K).T
+    bias = torch.randn((N, ), device=DEVICE, dtype=dtype)
+
+    assert _amd_gemm._aligned_split_tail_plan(M, N, K, program_budget=2 * _amd_gemm.NUM_CU) == (11520, 3)
+    torch.testing.assert_close(
+        _amd_addmm(bias, a, b, path="inter_wave_tail"),
+        torch.addmm(bias, a, b),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
     "bias_2d,split_k,N",
     [(False, 1, 256), (True, 2, 256), (False, 1, 384)],
