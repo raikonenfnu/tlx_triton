@@ -1584,6 +1584,17 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         SPLIT_K = _split_k_for(grid_mn, K) if SPLIT_K is None else SPLIT_K
     elif SPLIT_K is None:
         BM, BN, SPLIT_K = choose_tile(M, N, K)
+        grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
+        narrow_m, narrow_n = 256, 128
+        narrow_grid = triton.cdiv(M, narrow_m) * triton.cdiv(N, narrow_n)
+        narrow_split = _split_k_for(narrow_grid, K)
+        # A four-wave thin-N tile is profitable when its denser output grid both
+        # fills more CUs and needs fewer fp32 workspace slices. Bound the K slice
+        # so duplicating A across the two N tiles remains cache-local.
+        if (a.stride(1) == 1 and b.stride(1) == 1 and M % narrow_m == 0 and N % narrow_n == 0
+                and narrow_grid * narrow_split > grid_mn * SPLIT_K and narrow_split < SPLIT_K
+                and K // narrow_split <= 64 * BLOCK_K):
+            BM, BN, SPLIT_K = narrow_m, narrow_n, narrow_split
     else:
         BM, BN = BLOCK_M, BLOCK_N  # explicit SPLIT_K override keeps the default tile
     KS = K // SPLIT_K
@@ -1633,7 +1644,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=4 if M == N and K >= 8192 else (2 if M <= 1024 and N >= 16384 else GROUP_SIZE_M),
+        GROUP_SIZE_M=(1 if BN == 128 else 4 if M == N and K >= 8192 else
+                      (2 if M <= 1024 and N >= 16384 else GROUP_SIZE_M)),
         NUM_XCDS=1 if M == N and K >= 8192 else NUM_XCDS,
         GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
@@ -1646,13 +1658,13 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
-        num_warps=NUM_WARPS,
+        num_warps=4 if BN == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
         # v_accvgpr moves around each mfma). Essential to match the reference perf.
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
-        enable_sched_group_barrier_scheduler=True,
+        llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-ilp"), ) if BN == 128 else (("amdgpu-agpr-alloc", "0,0"), ),
+        enable_sched_group_barrier_scheduler=BN != 128,
     )
     if SPLIT_K > 1 and not DEFER_EPILOGUE:
         # Adaptive reduce tile: small outputs need many small CTAs to fill the CUs;
@@ -1759,13 +1771,11 @@ def streamk_matmul(a, b):
         locks = torch.zeros((NUM_CU, ), device=a.device, dtype=torch.int32)
     else:
         partials = locks = c
-    streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1),
-                                                 b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
-                                                 BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
-                                                 GROUP_SIZE_M=GROUP_SIZE_M, **schedule,
-                                                 num_warps=4 if use_short_k_persistent else NUM_WARPS,
-                                                 waves_per_eu=2 if use_short_k_persistent else 0,
-                                                 num_stages=1, matrix_instr_nonkdim=16,
-                                                 llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS,
-                                                 A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1)
+    streamk_kernel[(schedule["NUM_PROGRAMS"], )](
+        a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
+        c.stride(1), BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
+        GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=4 if use_short_k_persistent else NUM_WARPS,
+        waves_per_eu=2 if use_short_k_persistent else 0, num_stages=1, matrix_instr_nonkdim=16,
+        llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS, A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1)
     return c
