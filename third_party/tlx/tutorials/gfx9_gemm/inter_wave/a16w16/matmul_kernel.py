@@ -605,6 +605,7 @@ def a16w16_8wave(
     USE_I64_B_OFFSETS: tl.constexpr,
     USE_I64_C_OFFSETS: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
+    FULL_MN_TILES: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
     A_COLUMN_MAJOR: tl.constexpr,
     B_ROW_MAJOR: tl.constexpr,
@@ -736,21 +737,28 @@ def a16w16_8wave(
         a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
         b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
         b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
-    a_k_mask = offs_k[None, :] < BLOCK_K
-    a_top_mask = (offs_am[:, None] < M) & a_k_mask
-    a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
-    b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
-    b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
-    if PIN_OFFSET_LAYOUT:
-        a_top_mask = tlx.require_layout(a_top_mask, _A_OFFSET_LAYOUT_256)
-        a_bot_mask = tlx.require_layout(a_bot_mask, _A_OFFSET_LAYOUT_256)
-        b_left_mask = tlx.require_layout(b_left_mask, _B_OFFSET_LAYOUT_256)
-        b_right_mask = tlx.require_layout(b_right_mask, _B_OFFSET_LAYOUT_256)
-        a_other = tlx.require_layout(tl.full(a_top_off.shape, 0.0, tlx.dtype_of(a_ptr)), _A_OFFSET_LAYOUT_256)
-        b_other = tlx.require_layout(tl.full(b_left_off.shape, 0.0, tlx.dtype_of(b_ptr)), _B_OFFSET_LAYOUT_256)
+    if FULL_MN_TILES:
+        a_top_mask = None
+        a_bot_mask = None
+        b_left_mask = None
+        b_right_mask = None
+        a_other = None
+        b_other = None
     else:
-        a_other = 0.0
-        b_other = 0.0
+        a_top_mask = offs_am[:, None] < M
+        a_bot_mask = (offs_am[:, None] + HALF_M) < M
+        b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
+        b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
+        if PIN_OFFSET_LAYOUT:
+            a_top_mask = tlx.require_layout(a_top_mask, _A_OFFSET_LAYOUT_256)
+            a_bot_mask = tlx.require_layout(a_bot_mask, _A_OFFSET_LAYOUT_256)
+            b_left_mask = tlx.require_layout(b_left_mask, _B_OFFSET_LAYOUT_256)
+            b_right_mask = tlx.require_layout(b_right_mask, _B_OFFSET_LAYOUT_256)
+            a_other = tlx.require_layout(tl.full(a_top_off.shape, 0.0, tlx.dtype_of(a_ptr)), _A_OFFSET_LAYOUT_256)
+            b_other = tlx.require_layout(tl.full(b_left_off.shape, 0.0, tlx.dtype_of(b_ptr)), _B_OFFSET_LAYOUT_256)
+        else:
+            a_other = 0.0
+            b_other = 0.0
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -779,43 +787,43 @@ def a16w16_8wave(
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, mask=b_left_mask, other=b_other)
     else:
-        tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+        tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+        tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+        tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, mask=b_right_mask, other=b_other)
     else:
-        tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+        tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, mask=b_left_mask, other=b_other)
     else:
-        tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+        tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+        tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+        tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, mask=b_right_mask, other=b_other)
     else:
-        tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+        tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -834,7 +842,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, mask=b_left_mask, other=b_other)
             else:
-                tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+                tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -845,7 +853,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+                tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -856,7 +864,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+                tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -867,7 +875,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, mask=b_right_mask, other=b_other)
             else:
-                tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+                tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -878,7 +886,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, mask=b_left_mask, other=b_other)
             else:
-                tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+                tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -889,7 +897,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+                tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -900,7 +908,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+                tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -911,7 +919,7 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, mask=b_right_mask, other=b_other)
             else:
-                tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+                tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
@@ -1508,10 +1516,10 @@ def choose_tile(M, N, K):
     """Pick (BLOCK_M, BLOCK_N, SPLIT_K) by CU fill -- no shape hardcoding.
 
     Prefer the tuned 256x256 tile; it is more MFMA-efficient per work-group than the
-    128x128 tile. Fall back to the smaller tile only when the 256 grid leaves most of
-    the machine idle even after split-K (fill < NUM_CU/2) -- the genuinely thin-N /
+    128x128 tile. Fall back to the smaller tile only when the 256 grid leaves at least
+    half the machine idle even after split-K (fill <= NUM_CU/2) -- the genuinely thin-N /
     small-tile-count shapes (e.g. N=256, gmn=8): the 4x-denser MN grid then reaches
-    occupancy the big tile can't. When the big tile fills at least half the CUs, its
+    occupancy the big tile can't. When the big tile fills more than half the CUs, its
     efficiency beats a full grid of small tiles, so it is kept (comparing raw
     work-group counts across tile sizes is apples-to-oranges -- a 128 tile does 1/4
     the work -- so a bigger small-tile count does not mean it is faster)."""
@@ -1519,7 +1527,7 @@ def choose_tile(M, N, K):
     gmn = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     sk = _split_k_for(gmn, K)
     best_fill = gmn * sk
-    if best_fill < NUM_CU // 2:  # big tile leaves most CUs idle even with split-K
+    if best_fill <= NUM_CU // 2:  # half-full or worse: prefer a denser, unsplit tile grid
         for cbm, cbn in TILE_CANDIDATES[1:]:
             g = triton.cdiv(M, cbm) * triton.cdiv(N, cbn)
             s = _split_k_for(g, K)
@@ -1623,6 +1631,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     stride_bias_m = bias.stride(0) if bias is not None else 0
     stride_bias_n = bias.stride(1) if bias is not None else 0
     use_i64_c_offsets = _needs_i64_offsets(c)
+    full_mn_tiles = M % BM == 0 and N % BN == 0
+    one_wave_128 = BN == 128 and GRID_MN == NUM_CU and SPLIT_K == 1
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
@@ -1655,10 +1665,12 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         USE_I64_B_OFFSETS=_needs_i64_offsets(b),
         USE_I64_C_OFFSETS=use_i64_c_offsets,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None and a.stride(0) != 1 and b.stride(1) != 1,
+        FULL_MN_TILES=full_mn_tiles,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=4 if BN == 128 else NUM_WARPS,
+        waves_per_eu=2 if one_wave_128 else 0,
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
