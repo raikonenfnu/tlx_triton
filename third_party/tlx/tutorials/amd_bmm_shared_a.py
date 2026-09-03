@@ -199,7 +199,8 @@ def bmm(a, b):
     NT = Bs * GMN
     c = torch.empty((Bs, M, N), device=a.device, dtype=a.dtype)
     attrs = (("amdgpu-agpr-alloc", "0,0"), )
-    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
+    matrix_instr_nonkdim = 16 if K % BLOCK_K != 0 and M >= 384 else 32
+    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=matrix_instr_nonkdim, llvm_fn_attrs=attrs)
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
     # The direct path cannot mask its final LDS transfer, so it requires full K32 tiles.
