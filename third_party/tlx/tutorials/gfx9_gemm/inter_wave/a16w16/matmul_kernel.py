@@ -196,6 +196,9 @@ _REGISTER_CONFIGS += [
 # OptimizeEpilogue leaves it alone (it only rewrites #blocked stores) -- keeping the
 # wide coalesced store instead of the narrow MMA-accumulator (dwordx2) fallback.
 _C_STORE_SIMD_LAYOUT = tlx.layout(shape=((16, 4, 8), (8, 4)), stride=((8, 128, 512), (1, 4096)))
+_C_STORE_128X64_LAYOUT = tlx.layout(shape=((8, 32), (8, 4)), stride=((8, 64), (1, 2048)))
+# Four waves cooperatively store one 64x64 accumulator quadrant as dwordx4.
+_C_STORE_64X64_LAYOUT = tlx.layout(shape=((8, 32), (8, 2)), stride=((8, 64), (1, 2048)))
 
 
 def _swz_offset_bases(shape, contig_dim):
@@ -1169,8 +1172,12 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                                        and (contributors_per_tile == 2 or contributors_per_tile == 4))
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
-    acc_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
-                                                   warps_per_cta=[2, 4])
+    acc_layout: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 4 if BLOCK_N == 256 else 2],
+    )
     if A_COLUMN_MAJOR:
         a_bases: tl.constexpr = _A_COLUMN_MAJOR_BASES_256 if BLOCK_M == 256 else _A_COLUMN_MAJOR_BASES_128
     else:
@@ -1189,7 +1196,9 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
     offs_m = tl.arange(0, HALF_M)
     offs_n = tl.arange(0, HALF_N)
     offs_k = tl.arange(0, BLOCK_K)
-    C: tl.constexpr = _C_STORE_SIMD_LAYOUT if BLOCK_M == 256 and BLOCK_N == 256 else acc_layout
+    C: tl.constexpr = (_C_STORE_SIMD_LAYOUT if BLOCK_M == 256 and BLOCK_N == 256 else
+                       _C_STORE_128X64_LAYOUT if BLOCK_M == 256 and BLOCK_N == 128 else
+                       _C_STORE_64X64_LAYOUT if BLOCK_M == 128 and BLOCK_N == 128 else acc_layout)
     tile_elems: tl.constexpr = BLOCK_M * BLOCK_N
     partial_tl_off = offs_m[:, None] * BLOCK_N + offs_n[None, :]
     partial_bl_off = partial_tl_off + HALF_M * BLOCK_N
@@ -1210,6 +1219,15 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
         _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
                           head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M,
                           BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+    elif not HAS_STREAMK and NUM_FULL_TILES == 3 * NUM_PROGRAMS:
+        # Short-K persistent path: each resident program owns three adjacent tiles.
+        remapped_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
+        for tile_offset in tl.static_range(0, 3):
+            tile_id = remapped_pid * 3 + tile_offset
+            pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
+            _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
+                              stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M, BLOCK_N,
+                              BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1703,10 +1721,13 @@ def _validate_streamk(a, b):
     return M, N, K
 
 
-def _choose_streamk_tile(M, N):
-    """Use a smaller persistent tile only when the default grid underfills the GPU."""
+def _choose_streamk_tile(M, N, K):
+    """Choose a smaller tile for underfilled grids or a two-resident-wave short-K schedule."""
     BM, BN = TILE_CANDIDATES[0]
     grid_mn = (M // BM) * (N // BN)
+    short_k_grid = (M // 128) * (N // 128)
+    if K <= 8 * BLOCK_K and short_k_grid == 6 * NUM_CU:
+        return 128, 128
     if grid_mn < NUM_CU // 2:
         for candidate_m, candidate_n in TILE_CANDIDATES[1:]:
             candidate_grid = (M // candidate_m) * (N // candidate_n)
@@ -1720,12 +1741,17 @@ def streamk_matmul(a, b):
     M, N, K = _validate_streamk(a, b)
     if M % BLOCK_M != 0 or N % BLOCK_N != 0 or K < MIN_K or K % (2 * BLOCK_K) != 0:
         return matmul(a, b)
-    BM, BN = _choose_streamk_tile(M, N)
+    BM, BN = _choose_streamk_tile(M, N, K)
     schedule = _streamk_schedule(M, N, K, block_m=BM, block_n=BN)
+    use_short_k_persistent = (BM, BN) == (128, 128) and schedule["NUM_FULL_TILES"] == 6 * NUM_CU
+    if use_short_k_persistent:
+        # Two resident CTA waves, with three complete output tiles per CTA.
+        schedule["NUM_PROGRAMS"] = 2 * NUM_CU
     # Persistent scheduling only pays for a genuine tail with enough K work to
     # amortize its partial publication and owner fixup. The plain path already
     # split-K fills underoccupied grids and is substantially cheaper otherwise.
-    if not schedule["HAS_STREAMK"] or schedule["K_PIPE_PAIRS"] < MIN_STREAMK_PIPE_PAIRS:
+    if ((not schedule["HAS_STREAMK"] and not use_short_k_persistent)
+            or (schedule["HAS_STREAMK"] and schedule["K_PIPE_PAIRS"] < MIN_STREAMK_PIPE_PAIRS)):
         return matmul(a, b)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     if schedule["HAS_STREAMK"]:
@@ -1736,7 +1762,10 @@ def streamk_matmul(a, b):
     streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1),
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
-                                                 GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
+                                                 GROUP_SIZE_M=GROUP_SIZE_M, **schedule,
+                                                 num_warps=4 if use_short_k_persistent else NUM_WARPS,
+                                                 waves_per_eu=2 if use_short_k_persistent else 0,
+                                                 num_stages=1, matrix_instr_nonkdim=16,
+                                                 llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS,
                                                  A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1)
     return c
