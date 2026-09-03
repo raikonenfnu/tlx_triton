@@ -64,6 +64,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
     MIN_STREAMK_PIPE_PAIRS as _A16W16_MIN_STREAMK_PIPE_PAIRS,
+    _aligned_split_tail_plan as _a16w16_aligned_split_tail_plan,
     _choose_streamk_tile as _choose_a16w16_streamk_tile,
     _streamk_schedule as _a16w16_streamk_schedule,
     choose_tile as _choose_a16w16_tile,
@@ -5207,6 +5208,13 @@ def test_a16w16_half_full_tile_selection_gfx950():
     # operand reuse of the 256 tile once split-K already fills half the CUs.
     assert _choose_a16w16_tile(2048, 2048, 2048) == (128, 128, 1)
     assert _choose_a16w16_tile(512, 256, 98304) == (256, 256, 64)
+
+
+def test_a16w16_balanced_split_tail_plan_gfx950():
+    assert _a16w16_aligned_split_tail_plan(3072, 3072, 11800, program_budget=512) == (11776, 3)
+    # Larger split counts keep equal K slices because their runtime-varying
+    # loop bounds cost more than shrinking the masked tail.
+    assert _a16w16_aligned_split_tail_plan(1024, 1024, 43500) == (43264, 13)
 
 
 def test_amd_addmm_large_operand_paths():

@@ -600,6 +600,8 @@ def a16w16_8wave(
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    BALANCED_SPLIT: tl.constexpr,
+    TOTAL_K_PIPE_PAIRS: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     HAS_REGISTER_TAIL: tl.constexpr,
     USE_I64_A_OFFSETS: tl.constexpr,
@@ -613,7 +615,8 @@ def a16w16_8wave(
     B_ROW_MAJOR: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
-    # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
+    # the XCD/group remap below. Each split owns a contiguous K-slice; balanced
+    # split-K assigns the remainder in whole pairs of pipeline steps.
     # We do NOT shift a_ptr/b_ptr (AMD buffer_load builds its resource descriptor
     # from the raw kernel-arg pointer, so an arith'd base fails to lower); instead
     # the split's K byte-offset is folded into the running ka/kb offset (used by
@@ -628,14 +631,23 @@ def a16w16_8wave(
     # keeps enough divisibility for #linear.
     split_id = tl.program_id(0) // GRID_MN
     pid = tl.program_id(0) % GRID_MN
+    if BALANCED_SPLIT:
+        pairs_per_split: tl.constexpr = TOTAL_K_PIPE_PAIRS // SPLIT_K
+        extra_pairs: tl.constexpr = TOTAL_K_PIPE_PAIRS % SPLIT_K
+        split_pairs = pairs_per_split + (split_id < extra_pairs)
+        split_start = split_id * pairs_per_split + min(split_id, extra_pairs)
+        KS = split_pairs * 2 * BLOCK_K
+        split_k_offset = split_start * 2 * BLOCK_K
+    else:
+        split_k_offset = split_id * KS
     if USE_I64_A_OFFSETS:
-        ak_split = split_id.to(tl.int64) * KS * stride_ak
+        ak_split = split_k_offset.to(tl.int64) * stride_ak
     else:
-        ak_split = split_id * KS * stride_ak
+        ak_split = split_k_offset * stride_ak
     if USE_I64_B_OFFSETS:
-        bk_split = split_id.to(tl.int64) * KS * stride_bk
+        bk_split = split_k_offset.to(tl.int64) * stride_bk
     else:
-        bk_split = split_id * KS * stride_bk
+        bk_split = split_k_offset * stride_bk
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
 
@@ -1535,6 +1547,10 @@ NUM_CU = 256  # gfx950 (CDNA4) compute units
 # (e.g. K=12288 wants SPLIT_K=12 (16 tiles) not 16 (12 tiles); the latter fills the
 # CUs but its extra reduce traffic makes it net slower).
 MIN_KTILES_PER_SPLIT = 16
+# Unequal aligned slices avoid a large masked tail for small split counts. At
+# larger counts, the runtime-varying loop bound disrupts the producer pipeline
+# more than the shorter tail saves.
+MAX_BALANCED_SPLIT = 4
 # Stream-K's publication/fixup needs enough work per output tile to amortize
 # synchronization and partial traffic. The PR #2850 production shapes reach
 # that crossover at 48 pairs; shorter tails stay on the plain schedule.
@@ -1613,28 +1629,29 @@ def _needs_i64_offsets(tensor):
 
 
 def _aligned_split_tail_plan(M, N, K, program_budget=NUM_CU):
-    """Return an aligned (prefix, split) plan within a CTA program budget."""
+    """Return a K128-aligned (prefix, split) plan within a CTA program budget."""
     grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     if K % (2 * BLOCK_K) == 0 or grid_mn >= program_budget // 2:
         return None
     best = None
     for split in range(2, program_budget // grid_mn + 1):
-        quantum = split * 2 * BLOCK_K
+        quantum = 2 * BLOCK_K if split <= MAX_BALANCED_SPLIT else split * 2 * BLOCK_K
         prefix = K // quantum * quantum
-        ks = prefix // split
-        if ks < MIN_KTILES_PER_SPLIT * BLOCK_K:
+        prefix_pairs = prefix // (2 * BLOCK_K)
+        longest_split_pairs = triton.cdiv(prefix_pairs, split)
+        if longest_split_pairs * 2 < MIN_KTILES_PER_SPLIT:
             continue
         tail = K - prefix
         # Compare the longest prefix CTA, fp32 reduction traffic, and masked-tail
         # work in the same units used by _split_k_for. A smaller tail can beat a
         # perfectly full CU wave because the tail is intentionally not split.
-        cost = 16 * (ks // BLOCK_K) + 3 * grid_mn * split + 16 * triton.cdiv(tail, BLOCK_K)
+        cost = 16 * (longest_split_pairs * 2) + 3 * grid_mn * split + 16 * triton.cdiv(tail, BLOCK_K)
         if best is None or cost < best[0]:
             best = cost, prefix, split
     return None if best is None else best[1:]
 
 
-def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
+def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False, BALANCED_SPLIT=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
     b_k, N = b.shape
@@ -1667,11 +1684,17 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
             BM, BN, SPLIT_K = narrow_m, narrow_n, narrow_split
     else:
         BM, BN = BLOCK_M, BLOCK_N  # explicit SPLIT_K override keeps the default tile
-    KS = K // SPLIT_K
+    if BALANCED_SPLIT:
+        assert K % (2 * BLOCK_K) == 0, "balanced split-K requires a K128-aligned prefix"
+        total_k_pipe_pairs = K // (2 * BLOCK_K)
+        KS = total_k_pipe_pairs // SPLIT_K * (2 * BLOCK_K)
+    else:
+        total_k_pipe_pairs = 0
+        KS = K // SPLIT_K
     # Each split is big enough for the 2-tile prologue and starts on a 16-byte
     # boundary. Full BLOCK_K tiles use direct-to-LDS; the remainder is handled by
     # the masked register tail in the kernel.
-    assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
+    assert BALANCED_SPLIT or K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
     assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
     if SPLIT_K > 1:
         assert KS * a.element_size() % 16 == 0, f"K/SPLIT_K={KS} must preserve 16-byte split alignment"
@@ -1721,6 +1744,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         NUM_XCDS=1 if M == N and K >= 8192 else NUM_XCDS,
         GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
+        BALANCED_SPLIT=BALANCED_SPLIT,
+        TOTAL_K_PIPE_PAIRS=total_k_pipe_pairs,
         ADD_BIAS=bias is not None,
         HAS_REGISTER_TAIL=KS % (2 * BLOCK_K) != 0,
         USE_I64_A_OFFSETS=_needs_i64_offsets(a),
@@ -1774,13 +1799,15 @@ def _launch_aligned_split_tail(a, b, prefix, split, bias=None):
     """Split an aligned K prefix and fuse its fp32 reduction with the K tail."""
     M, K = a.shape
     N = b.shape[1]
-    workspace, c = _launch(a, b, SPLIT_K=split, TILE=(BLOCK_M, BLOCK_N), K_LIMIT=prefix, DEFER_EPILOGUE=True)
+    balanced = prefix % (split * 2 * BLOCK_K) != 0
+    workspace, c = _launch(a, b, SPLIT_K=split, TILE=(BLOCK_M, BLOCK_N), K_LIMIT=prefix, DEFER_EPILOGUE=True,
+                           BALANCED_SPLIT=balanced)
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
     bias_ptr = c if bias is None else bias
     stride_bias_m, stride_bias_n = (0, 0) if bias is None else bias.stride()
     _reduce_k_tail_kernel[grid](a, b, workspace, bias_ptr, c, M, N, prefix, K - prefix, a.stride(0), a.stride(1),
                                 b.stride(0), b.stride(1), stride_bias_m, stride_bias_n, SPLIT_K=split,
-                                TAIL_BLOCK_K=BLOCK_K, ADD_BIAS=bias is not None)
+                                TAIL_BLOCK_K=32 if K - prefix <= 32 else BLOCK_K, ADD_BIAS=bias is not None)
     return c
 
 

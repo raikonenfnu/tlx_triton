@@ -2490,7 +2490,7 @@ def test_amd_addmm_oversubscribed_k_tail(dtype):
     b = (torch.randn((N, K), device=DEVICE, dtype=dtype) / K).T
     bias = torch.randn((N, ), device=DEVICE, dtype=dtype)
 
-    assert _amd_gemm._aligned_split_tail_plan(M, N, K, program_budget=2 * _amd_gemm.NUM_CU) == (11520, 3)
+    assert _amd_gemm._aligned_split_tail_plan(M, N, K, program_budget=2 * _amd_gemm.NUM_CU) == (11776, 3)
     torch.testing.assert_close(
         _amd_addmm(bias, a, b, path="inter_wave_tail"),
         torch.addmm(bias, a, b),
