@@ -607,6 +607,7 @@ def a16w16_8wave(
     PIN_OFFSET_LAYOUT: tl.constexpr,
     FULL_MN_TILES: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    STREAM_A: tl.constexpr,
     A_COLUMN_MAJOR: tl.constexpr,
     B_ROW_MAJOR: tl.constexpr,
 ):
@@ -770,6 +771,7 @@ def a16w16_8wave(
 
     ka = ak_split
     kb = bk_split
+    a_cache_modifier: tl.constexpr = ".cg" if STREAM_A else ""
 
     acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
@@ -792,12 +794,14 @@ def a16w16_8wave(
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
+        tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other,
+                       cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
+        tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other,
+                       cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, mask=b_right_mask, other=b_other)
@@ -813,12 +817,14 @@ def a16w16_8wave(
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
+        tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other,
+                       cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
     else:
-        tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
+        tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other,
+                       cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     if PIN_OFFSET_LAYOUT:
         tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, mask=b_right_mask, other=b_other)
@@ -853,7 +859,8 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
+                tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other,
+                               cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -864,7 +871,8 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
+                tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other,
+                               cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -897,7 +905,8 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
+                tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other,
+                               cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -908,7 +917,8 @@ def a16w16_8wave(
             if PIN_OFFSET_LAYOUT:
                 tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
             else:
-                tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
+                tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other,
+                               cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1715,6 +1725,9 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         PIN_OFFSET_LAYOUT=K_LIMIT is not None and a.stride(0) != 1 and b.stride(1) != 1,
         FULL_MN_TILES=full_mn_tiles,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        # With a single N tile, column-major A is a one-pass stream while B is
+        # reused by every M tile. Bypass L1 for A so it cannot evict hot B data.
+        STREAM_A=a.stride(0) == 1 and N <= BN,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=4 if BN == 128 else NUM_WARPS,
