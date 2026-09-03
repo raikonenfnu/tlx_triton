@@ -99,6 +99,10 @@ from triton.language.extra.tlx.tutorials.amd_bmm import (
     bmm as _amd_bmm,
     make_bmm_inputs as _amd_bmm_inputs,
 )
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    bmm as _amd_bmm_shared_a,
+    make_bmm_inputs as _amd_bmm_shared_a_inputs,
+)
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_gemm_tdm_pipelined,
     pack_scale as _amd_mxfp_pack_scale,
@@ -120,8 +124,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     available_paths as _amd_addmm_paths,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
-    matmul_kernel as _amd_gemm,
-)
+    matmul_kernel as _amd_gemm, )
 from triton.tools.mxfp import MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
@@ -2303,6 +2306,15 @@ def test_amd_bmm(dtype):
         out = _amd_bmm(a, b)
         ref = torch.bmm(a, b)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires AMD gfx950 (CDNA4)")
+def test_amd_bmm_shared_a_row(dtype):
+    # Exercise one- and two-K16 tails, including the one-full-K32-tile fallback.
+    for K in (33, 63, 81, 931):
+        a, b = _amd_bmm_shared_a_inputs(4, 128, 160, K, DEVICE, dtype=dtype)
+        torch.testing.assert_close(_amd_bmm_shared_a(a, b), torch.bmm(a, b), atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================
