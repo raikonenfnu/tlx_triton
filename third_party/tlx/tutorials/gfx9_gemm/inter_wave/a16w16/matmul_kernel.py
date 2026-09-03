@@ -379,7 +379,7 @@ def _launch_register(a, b, bias=None, config=None):
 @triton.jit
 def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, a_top_off, a_bot_off, b_left_off,
                 b_right_off, ka, kb, n_steps, stride_ak, stride_bk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                BLOCK_K: tl.constexpr):
+                BLOCK_K: tl.constexpr, STREAM_A: tl.constexpr):
     """Compute one output tile over an even contiguous range of K64 steps.
 
     ``ka`` and ``kb`` are the initial element offsets along K. ``n_steps`` must
@@ -388,6 +388,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     """
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
+    a_cache_modifier: tl.constexpr = ".cg" if STREAM_A else ""
 
     # Keep the direct-to-LDS producer contract local to this extracted helper.
     # K is contiguous in A's second tensor dimension and B's first tensor
@@ -413,18 +414,18 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
     tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
     tlx.async_load_commit_group()
@@ -452,7 +453,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -460,7 +461,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -485,7 +486,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -493,7 +494,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1084,7 +1085,8 @@ def a16w16_8wave(
 def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
                       stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm, stride_cn,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                      HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr, REBASE_A: tl.constexpr, c_layout: tl.constexpr):
+                      HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr, REBASE_A: tl.constexpr, STREAM_A: tl.constexpr,
+                      c_layout: tl.constexpr):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -1108,7 +1110,7 @@ def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, sme
     b_right_off = offs_k[:, None] * stride_bk + offs_n_right[None, :] * stride_bn
     acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                  a_top_off, a_bot_off, b_left_off, b_right_off, 0, 0, K_PIPE_STEPS,
-                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K, STREAM_A)
     if HAS_K_TAIL:
         # Mask odd full and/or partial K64 steps left after the even pipelined prefix.
         for kk in tl.range(K_PIPE_STEPS * BLOCK_K, K, BLOCK_K, num_stages=1):
@@ -1199,7 +1201,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
                    HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr, NUM_PID_N: tl.constexpr,
                    GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr, K_PIPE_PAIRS: tl.constexpr,
                    UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr, ADD_BIAS: tl.constexpr,
-                   REBASE_A: tl.constexpr, A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
+                   REBASE_A: tl.constexpr, STREAM_A: tl.constexpr, A_COLUMN_MAJOR: tl.constexpr,
+                   B_ROW_MAJOR: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
@@ -1257,7 +1260,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
         _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
                           head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
                           stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, REBASE_A,
-                          C)
+                          STREAM_A, C)
     elif not HAS_STREAMK and NUM_FULL_TILES == 3 * NUM_PROGRAMS:
         # Short-K persistent path: each resident program owns three adjacent tiles.
         remapped_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
@@ -1267,7 +1270,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
                               pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
                               stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS,
-                              REBASE_A, C)
+                              REBASE_A, STREAM_A, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1284,7 +1287,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
                               pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
                               stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS,
-                              REBASE_A, C)
+                              REBASE_A, STREAM_A, C)
     if not HAS_STREAMK:
         return
 
@@ -1310,7 +1313,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
         acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                      tail_a_top_off, tail_a_bot_off, tail_b_left_off, tail_b_right_off,
                                                      segment_k_offset * stride_ak, segment_k_offset * stride_bk,
-                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K,
+                                                     STREAM_A)
 
         # Pin and publish all four partial quadrants before any contributor waits.
         # This avoids cyclic dependencies and lets the MFMA accumulators die before
@@ -1393,7 +1397,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
                                                          smem_b_right, tile_a_top_off, tile_a_bot_off, tile_b_left_off,
                                                          tile_b_right_off, k_step * stride_ak, k_step * stride_bk,
                                                          (segment_end - start_unit) * 2, stride_ak, stride_bk, BLOCK_M,
-                                                         BLOCK_N, BLOCK_K)
+                                                         BLOCK_N, BLOCK_K, STREAM_A)
             acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
             acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
             acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
@@ -1877,7 +1881,7 @@ def streamk_matmul(a, b, bias=None):
                                                  matrix_instr_nonkdim=16,
                                                  llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS,
                                                  ADD_BIAS=bias is not None, A_COLUMN_MAJOR=a.stride(0) == 1,
-                                                 B_ROW_MAJOR=b.stride(1) == 1, REBASE_A=False)
+                                                 B_ROW_MAJOR=b.stride(1) == 1, REBASE_A=False, STREAM_A=False)
     return c
 
 
@@ -1921,6 +1925,7 @@ def _launch_rebased_persistent(a, b, bias=None):
         llvm_fn_attrs=_LLVM_ATTRS,
         ADD_BIAS=bias is not None,
         REBASE_A=True,
+        STREAM_A=True,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
     )
