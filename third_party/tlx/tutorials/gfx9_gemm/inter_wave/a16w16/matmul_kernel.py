@@ -1729,9 +1729,9 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         PIN_OFFSET_LAYOUT=K_LIMIT is not None and a.stride(0) != 1 and b.stride(1) != 1,
         FULL_MN_TILES=full_mn_tiles,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
-        # With a single N tile, column-major A is a one-pass stream while B is
-        # reused by every M tile. Bypass L1 for A so it cannot evict hot B data.
-        STREAM_A=a.stride(0) == 1 and N <= BN,
+        # With one N tile, column-major A is a one-pass stream. Short-K
+        # row-major A has the same property while its entire B tile stays hot.
+        STREAM_A=N <= BN and (a.stride(0) == 1 or K <= 8 * BLOCK_K),
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=4 if BN == 128 else NUM_WARPS,
