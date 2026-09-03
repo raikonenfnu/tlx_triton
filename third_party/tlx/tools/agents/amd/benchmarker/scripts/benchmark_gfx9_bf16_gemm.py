@@ -31,6 +31,7 @@ from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import matmul as pipelined_matmul
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import matmul as warp_pipeline_matmul
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    _has_streamk_schedule,
     _launch_register,
     matmul as interwave_matmul,
     streamk_matmul,
@@ -111,6 +112,8 @@ def _addmm_path_support(path: str) -> Callable[[Shape], tuple[bool, str]]:
             valid = (shape.k > 1536 and shape.k % 64 != 0 and shape.k * 2 % 16 == 0
                      and 2 * 1024 * 1024 < shape.m * shape.n <= 16 * 1024 * 1024)
             return valid, "inter-wave tail path is reserved for large partial-K outputs"
+        if path == "stream_k":
+            return _has_streamk_schedule(shape.m, shape.n, shape.k), "requires a profitable Stream-K tail"
         if path == "inter_wave" and not (shape.k >= 128 and shape.k % 64 == 0):
             return False, "inter-wave path requires K >= 128 and divisible by 64"
         return True, f"path {path} must be listed by available_paths"
@@ -141,6 +144,7 @@ MM_CANDIDATES = (
 ADDMM_CANDIDATES = (
     Candidate("addmm_register", _addmm_path_support("register"), _addmm_builder("register")),
     Candidate("addmm_interwave", _addmm_path_support("inter_wave"), _addmm_builder("inter_wave")),
+    Candidate("addmm_streamk", _addmm_path_support("stream_k"), _addmm_builder("stream_k")),
     Candidate("addmm_interwave_tail", _addmm_path_support("inter_wave_tail"), _addmm_builder("inter_wave_tail")),
 )
 BMM_CANDIDATES = (

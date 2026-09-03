@@ -2466,6 +2466,18 @@ def _check_addmm_default_matches_register_exact(bias, a, b, split_k):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_addmm_streamk_bias(dtype):
+    # 16x20 output tiles: one 256-CTA full wave plus 64 distributed tail tiles.
+    M, N, K = 4096, 5120, 6144
+    a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+    b = torch.randn((N, K), device=DEVICE, dtype=dtype).T
+    bias = torch.randn((N, ), device=DEVICE, dtype=dtype)
+    assert "stream_k" in _amd_addmm_paths(torch.broadcast_to(bias, (M, N)), a, b)
+    torch.testing.assert_close(_amd_addmm(bias, a, b, path="stream_k"), torch.addmm(bias, a, b), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
     "bias_2d,split_k,N",
     [(False, 1, 256), (True, 2, 256), (False, 1, 384)],

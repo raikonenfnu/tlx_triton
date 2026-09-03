@@ -12,8 +12,10 @@ import triton.language as tl
 
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
     BLOCK_K,
+    _has_streamk_schedule,
     _launch,
     _launch_register,
+    streamk_matmul,
 )
 
 _PATH_AUTOTUNE_WARMUP = 25
@@ -45,6 +47,13 @@ def _can_use_inter_wave_tail(a: torch.Tensor, b: torch.Tensor) -> bool:
     output_elements = M * N
     return (K > 1536 and K % BLOCK_K != 0 and K * a.element_size() % 16 == 0 and a.element_size() == 2
             and 2 * 1024 * 1024 < output_elements <= _MAX_DEFERRED_EPILOGUE_ELEMENTS)
+
+
+def _can_use_streamk(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> bool:
+    M, K = a.shape
+    N = b.shape[1]
+    # N-contiguous bias loads preserve the accumulator layout without extra LDS.
+    return bias.stride(1) == 1 and _can_use_inter_wave(a, b) and _has_streamk_schedule(M, N, K)
 
 
 def _path_key(
@@ -150,13 +159,15 @@ def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tup
     be dropped from the timing pool and the suite would still pass green.
     """
     if _can_use_inter_wave(a, b):
-        return ("register", "inter_wave")
+        return (("register", "inter_wave", "stream_k") if _can_use_streamk(bias, a, b) else ("register", "inter_wave"))
     if _can_use_inter_wave_tail(a, b):
         return ("register", "inter_wave_tail")
     return ("register", )
 
 
 def _dispatch(path: str, bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, split_k, config=None):
+    if path == "stream_k":
+        return streamk_matmul(a, b, bias)
     if path == "inter_wave":
         return _launch(a, b, bias=bias, SPLIT_K=split_k)
     if path == "inter_wave_tail":
@@ -185,6 +196,11 @@ def _autotune_path(
         inter_wave_output = inter_wave()
         if torch.allclose(register_output, inter_wave_output, rtol=1e-2, atol=1e-2):
             candidates["inter_wave"] = inter_wave
+        if _can_use_streamk(bias, a, b):
+            stream_k = lambda: streamk_matmul(a, b, bias)
+            stream_k_output = stream_k()
+            if torch.allclose(register_output, stream_k_output, rtol=1e-2, atol=1e-2):
+                candidates["stream_k"] = stream_k
     elif _can_use_inter_wave_tail(a, b):
         inter_wave_tail = lambda: _launch_inter_wave_with_tail(bias, a, b)
         inter_wave_tail_output = inter_wave_tail()

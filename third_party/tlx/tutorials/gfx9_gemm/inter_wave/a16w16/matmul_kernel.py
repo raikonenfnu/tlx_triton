@@ -1071,10 +1071,10 @@ def a16w16_8wave(
 
 
 @triton.jit
-def _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
-                      stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M: tl.constexpr,
-                      BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                      HAS_K_TAIL: tl.constexpr, c_layout: tl.constexpr):
+def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
+                      stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm, stride_cn,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
+                      HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr, c_layout: tl.constexpr):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -1109,6 +1109,15 @@ def _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, 
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
             acc_tr = tl.dot(a_top, b_right, acc_tr)
             acc_br = tl.dot(a_bot, b_right, acc_br)
+    if ADD_BIAS:
+        acc_tl += tl.load(bias_ptr + offs_m_top[:, None] * stride_bias_m + offs_n_left[None, :] * stride_bias_n).to(
+            tl.float32)
+        acc_bl += tl.load(bias_ptr + offs_m_bot[:, None] * stride_bias_m + offs_n_left[None, :] * stride_bias_n).to(
+            tl.float32)
+        acc_tr += tl.load(bias_ptr + offs_m_top[:, None] * stride_bias_m + offs_n_right[None, :] * stride_bias_n).to(
+            tl.float32)
+        acc_br += tl.load(bias_ptr + offs_m_bot[:, None] * stride_bias_m + offs_n_right[None, :] * stride_bias_n).to(
+            tl.float32)
     et: tl.constexpr = c_ptr.dtype.element_ty
     tl.store(c_ptr + offs_m_top[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
              tlx.require_layout(acc_tl.to(et), c_layout))
@@ -1143,6 +1152,7 @@ def _wait_for_streamk_partial(locks_ptr, slot, ready_value):
 @triton.jit
 def _reduce_and_store_streamk_quadrant(
     partials_ptr,
+    bias_ptrs,
     c_ptrs,
     first_contributor,
     num_contributors: tl.constexpr,
@@ -1150,24 +1160,28 @@ def _reduce_and_store_streamk_quadrant(
     tile_elems: tl.constexpr,
     acc_layout: tl.constexpr,
     c_layout: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
-    """Reduce one quadrant across a tile's contributors and store it."""
+    """Reduce one quadrant, add its bias once, and store it."""
     acc = tlx.require_layout(tl.load(partials_ptr + first_contributor * tile_elems + partial_off, cache_modifier=".cv"),
                              acc_layout, pin=False)
     for peer in range(1, num_contributors):
         acc += tlx.require_layout(
             tl.load(partials_ptr + (first_contributor + peer) * tile_elems + partial_off, cache_modifier=".cv"),
             acc_layout, pin=False)
+    if ADD_BIAS:
+        acc += tlx.require_layout(tl.load(bias_ptrs).to(tl.float32), acc_layout, pin=False)
     tl.store(c_ptrs, tlx.require_layout(acc.to(c_ptrs.dtype.element_ty), c_layout))
 
 
 @triton.jit
-def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K, stride_am, stride_ak, stride_bk,
-                   stride_bn, stride_cm, stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                   NUM_XCDS: tl.constexpr, NUM_CU: tl.constexpr, NUM_PROGRAMS: tl.constexpr, HAS_STREAMK: tl.constexpr,
-                   NUM_FULL_TILES: tl.constexpr, HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr,
-                   NUM_PID_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                   K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr,
+def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K, stride_am, stride_ak,
+                   stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm, stride_cn, BLOCK_M: tl.constexpr,
+                   BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, NUM_XCDS: tl.constexpr, NUM_CU: tl.constexpr,
+                   NUM_PROGRAMS: tl.constexpr, HAS_STREAMK: tl.constexpr, NUM_FULL_TILES: tl.constexpr,
+                   HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr, NUM_PID_N: tl.constexpr,
+                   GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr, K_PIPE_PAIRS: tl.constexpr,
+                   UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr, ADD_BIAS: tl.constexpr,
                    A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
@@ -1222,20 +1236,19 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
 
     if HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS:
         # Fast path: each Stream-K program owns one full tile, so no loop is needed.
-        head_pid_m = stream_pid % NUM_PID_M
-        head_pid_n = stream_pid // NUM_PID_M
-        _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
-                          head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M,
-                          BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+        head_pid_m, head_pid_n = _grouped_tile_coords(stream_pid, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
+        _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
+                          head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
+                          stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
     elif not HAS_STREAMK and NUM_FULL_TILES == 3 * NUM_PROGRAMS:
         # Short-K persistent path: each resident program owns three adjacent tiles.
         remapped_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
         for tile_offset in tl.static_range(0, 3):
             tile_id = remapped_pid * 3 + tile_offset
             pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
-            _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
-                              stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M, BLOCK_N,
-                              BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+            _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
+                              pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
+                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1249,9 +1262,9 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
             else:
                 tile_id = (tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
             pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
-            _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
-                              stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M, BLOCK_N,
-                              BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+            _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
+                              pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
+                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
     if not HAS_STREAMK:
         return
 
@@ -1311,20 +1324,28 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
         bottom_right_owner: tl.constexpr = 1 if contributors_per_tile == 2 else 3
         if contributor_id == 0:
             _reduce_and_store_streamk_quadrant(
-                partials_ptr, c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
-                first_contributor, contributors_per_tile, partial_tl_off, tile_elems, acc_layout, C)
+                partials_ptr,
+                bias_ptr + tail_offs_m_top[:, None] * stride_bias_m + tail_offs_n_left[None, :] * stride_bias_n,
+                c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn, first_contributor,
+                contributors_per_tile, partial_tl_off, tile_elems, acc_layout, C, ADD_BIAS)
         if contributor_id == bottom_left_owner:
             _reduce_and_store_streamk_quadrant(
-                partials_ptr, c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
-                first_contributor, contributors_per_tile, partial_bl_off, tile_elems, acc_layout, C)
+                partials_ptr,
+                bias_ptr + tail_offs_m_bot[:, None] * stride_bias_m + tail_offs_n_left[None, :] * stride_bias_n,
+                c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn, first_contributor,
+                contributors_per_tile, partial_bl_off, tile_elems, acc_layout, C, ADD_BIAS)
         if contributor_id == top_right_owner:
             _reduce_and_store_streamk_quadrant(
-                partials_ptr, c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
-                first_contributor, contributors_per_tile, partial_tr_off, tile_elems, acc_layout, C)
+                partials_ptr,
+                bias_ptr + tail_offs_m_top[:, None] * stride_bias_m + tail_offs_n_right[None, :] * stride_bias_n,
+                c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_tr_off, tile_elems, acc_layout, C, ADD_BIAS)
         if contributor_id == bottom_right_owner:
             _reduce_and_store_streamk_quadrant(
-                partials_ptr, c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
-                first_contributor, contributors_per_tile, partial_br_off, tile_elems, acc_layout, C)
+                partials_ptr,
+                bias_ptr + tail_offs_m_bot[:, None] * stride_bias_m + tail_offs_n_right[None, :] * stride_bias_n,
+                c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_br_off, tile_elems, acc_layout, C, ADD_BIAS)
     else:
         # Standard Stream-K fixup path: Divide remaining flattened pairs of K
         # pipeline steps almost evenly across CUs.
@@ -1390,6 +1411,15 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                         tl.load(partials_ptr + peer_base + partial_br_off, cache_modifier=".cv"), acc_layout, pin=False)
                     covered_end += UNITS_PER_PROGRAM + (next_pid < REMAINDER_UNITS)
                     next_pid += 1
+                if ADD_BIAS:
+                    acc_tl += tl.load(bias_ptr + tile_offs_m_top[:, None] * stride_bias_m +
+                                      tile_offs_n_left[None, :] * stride_bias_n).to(tl.float32)
+                    acc_bl += tl.load(bias_ptr + tile_offs_m_bot[:, None] * stride_bias_m +
+                                      tile_offs_n_left[None, :] * stride_bias_n).to(tl.float32)
+                    acc_tr += tl.load(bias_ptr + tile_offs_m_top[:, None] * stride_bias_m +
+                                      tile_offs_n_right[None, :] * stride_bias_n).to(tl.float32)
+                    acc_br += tl.load(bias_ptr + tile_offs_m_bot[:, None] * stride_bias_m +
+                                      tile_offs_n_right[None, :] * stride_bias_n).to(tl.float32)
                 tl.store(c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
                          tlx.require_layout(acc_tl.to(et), C))
                 tl.store(c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
@@ -1760,11 +1790,29 @@ def _choose_streamk_tile(M, N, K):
     return BM, BN
 
 
-def streamk_matmul(a, b):
-    """Run one persistent kernel with a variable-work Stream-K tail when profitable."""
-    M, N, K = _validate_streamk(a, b)
+def _has_streamk_schedule(M, N, K):
+    """Return whether the shape selects a profitable variable-work Stream-K tail."""
     if M % BLOCK_M != 0 or N % BLOCK_N != 0 or K < MIN_K or K % (2 * BLOCK_K) != 0:
-        return matmul(a, b)
+        return False
+    block_m, block_n = _choose_streamk_tile(M, N, K)
+    schedule = _streamk_schedule(M, N, K, block_m=block_m, block_n=block_n)
+    return schedule["HAS_STREAMK"] and schedule["K_PIPE_PAIRS"] >= MIN_STREAMK_PIPE_PAIRS
+
+
+def streamk_matmul(a, b, bias=None):
+    """Run persistent Stream-K when profitable, optionally fusing a final bias add."""
+    M, N, K = _validate_streamk(a, b)
+    if bias is not None:
+        if bias.device != a.device or bias.dtype != a.dtype:
+            raise ValueError("bias and matrix operands must have the same device and dtype")
+        try:
+            bias = torch.broadcast_to(bias, (M, N))
+        except RuntimeError as error:
+            raise ValueError(f"Bias shape {tuple(bias.shape)} is not broadcastable to ({M}, {N})") from error
+        if _needs_i64_offsets(bias):
+            raise ValueError("Stream-K bias exceeds signed-i32 byte offsets")
+    if M % BLOCK_M != 0 or N % BLOCK_N != 0 or K < MIN_K or K % (2 * BLOCK_K) != 0:
+        return matmul(a, b) if bias is None else _launch(a, b, bias=bias)
     BM, BN = _choose_streamk_tile(M, N, K)
     schedule = _streamk_schedule(M, N, K, block_m=BM, block_n=BN)
     use_short_k_persistent = (BM, BN) == (128, 128) and schedule["NUM_FULL_TILES"] == 6 * NUM_CU
@@ -1776,18 +1824,24 @@ def streamk_matmul(a, b):
     # split-K fills underoccupied grids and is substantially cheaper otherwise.
     if ((not schedule["HAS_STREAMK"] and not use_short_k_persistent)
             or (schedule["HAS_STREAMK"] and schedule["K_PIPE_PAIRS"] < MIN_STREAMK_PIPE_PAIRS)):
-        return matmul(a, b)
+        return matmul(a, b) if bias is None else _launch(a, b, bias=bias)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    bias_ptr = c if bias is None else bias
+    stride_bias_m = 0 if bias is None else bias.stride(0)
+    stride_bias_n = 0 if bias is None else bias.stride(1)
     if schedule["HAS_STREAMK"]:
         partials = torch.empty((NUM_CU, BM, BN), device=a.device, dtype=torch.float32)
         locks = torch.zeros((NUM_CU, ), device=a.device, dtype=torch.int32)
     else:
         partials = locks = c
-    streamk_kernel[(schedule["NUM_PROGRAMS"], )](
-        a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
-        c.stride(1), BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
-        GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=4 if use_short_k_persistent else NUM_WARPS,
-        waves_per_eu=2 if use_short_k_persistent else 0, num_stages=1, matrix_instr_nonkdim=16,
-        llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS, A_COLUMN_MAJOR=a.stride(0) == 1,
-        B_ROW_MAJOR=b.stride(1) == 1)
+    streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, bias_ptr, c, partials, locks, _READY_VALUE, K, a.stride(0),
+                                                 a.stride(1), b.stride(0), b.stride(1), stride_bias_m, stride_bias_n,
+                                                 c.stride(0), c.stride(1), BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BLOCK_K,
+                                                 NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU, GROUP_SIZE_M=GROUP_SIZE_M,
+                                                 **schedule, num_warps=4 if use_short_k_persistent else NUM_WARPS,
+                                                 waves_per_eu=2 if use_short_k_persistent else 0, num_stages=1,
+                                                 matrix_instr_nonkdim=16,
+                                                 llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS,
+                                                 ADD_BIAS=bias is not None, A_COLUMN_MAJOR=a.stride(0) == 1,
+                                                 B_ROW_MAJOR=b.stride(1) == 1)
     return c
