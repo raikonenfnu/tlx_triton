@@ -1074,7 +1074,7 @@ def a16w16_8wave(
 def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
                       stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm, stride_cn,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                      HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr, c_layout: tl.constexpr):
+                      HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr, REBASE_A: tl.constexpr, c_layout: tl.constexpr):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -1085,8 +1085,15 @@ def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, sme
     offs_m_bot = offs_m_top + HALF_M
     offs_n_left = pid_n * BLOCK_N + offs_n
     offs_n_right = offs_n_left + HALF_N
-    a_top_off = offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
-    a_bot_off = offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+    if REBASE_A:
+        # Keep direct-to-LDS byte offsets local when the full A allocation is
+        # larger than a signed 32-bit buffer resource can address.
+        a_ptr += (pid_m * BLOCK_M).to(tl.int64) * stride_am
+        a_top_off = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a_bot_off = (offs_m + HALF_M)[:, None] * stride_am + offs_k[None, :] * stride_ak
+    else:
+        a_top_off = offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a_bot_off = offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_left_off = offs_k[:, None] * stride_bk + offs_n_left[None, :] * stride_bn
     b_right_off = offs_k[:, None] * stride_bk + offs_n_right[None, :] * stride_bn
     acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
@@ -1182,7 +1189,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
                    HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr, NUM_PID_N: tl.constexpr,
                    GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr, K_PIPE_PAIRS: tl.constexpr,
                    UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr, ADD_BIAS: tl.constexpr,
-                   A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
+                   REBASE_A: tl.constexpr, A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
@@ -1239,7 +1246,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
         head_pid_m, head_pid_n = _grouped_tile_coords(stream_pid, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
         _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
                           head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
-                          stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
+                          stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, REBASE_A,
+                          C)
     elif not HAS_STREAMK and NUM_FULL_TILES == 3 * NUM_PROGRAMS:
         # Short-K persistent path: each resident program owns three adjacent tiles.
         remapped_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
@@ -1248,7 +1256,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
             _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
                               pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
-                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
+                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS,
+                              REBASE_A, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1264,7 +1273,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
             _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
                               pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n,
-                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS, C)
+                              stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, ADD_BIAS,
+                              REBASE_A, C)
     if not HAS_STREAMK:
         return
 
@@ -1850,5 +1860,51 @@ def streamk_matmul(a, b, bias=None):
                                                  matrix_instr_nonkdim=16,
                                                  llvm_fn_attrs=() if use_short_k_persistent else _LLVM_ATTRS,
                                                  ADD_BIAS=bias is not None, A_COLUMN_MAJOR=a.stride(0) == 1,
-                                                 B_ROW_MAJOR=b.stride(1) == 1)
+                                                 B_ROW_MAJOR=b.stride(1) == 1, REBASE_A=False)
+    return c
+
+
+def _launch_rebased_persistent(a, b, bias=None):
+    """Run full tiles persistently, rebasing A so direct-to-LDS offsets stay local."""
+    M, N, K = _validate_streamk(a, b)
+    assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % (2 * BLOCK_K) == 0
+    schedule = _streamk_schedule(M, N, K)
+    assert not schedule["HAS_STREAMK"], "rebased persistence does not publish Stream-K partials"
+    if bias is not None:
+        bias = torch.broadcast_to(bias, (M, N))
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    bias_ptr = c if bias is None else bias
+    streamk_kernel[(schedule["NUM_PROGRAMS"], )](
+        a,
+        b,
+        bias_ptr,
+        c,
+        c,
+        c,
+        _READY_VALUE,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        0 if bias is None else bias.stride(0),
+        0 if bias is None else bias.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_XCDS=NUM_XCDS,
+        NUM_CU=NUM_CU,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        **schedule,
+        num_warps=NUM_WARPS,
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+        llvm_fn_attrs=_LLVM_ATTRS,
+        ADD_BIAS=bias is not None,
+        REBASE_A=True,
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
+    )
     return c

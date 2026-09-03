@@ -106,8 +106,12 @@ def _addmm_path_support(path: str) -> Callable[[Shape], tuple[bool, str]]:
             return False, "fused addmm candidate"
         if shape.layout_a != "row" or shape.layout_b != "column":
             return False, "gfx950 addmm requires row-major A and column-major B"
-        if path != "register" and max(shape.m * shape.k, shape.k * shape.n) * 2 >= 2**31:
+        if path not in ("register", "persistent") and max(shape.m * shape.k, shape.k * shape.n) * 2 >= 2**31:
             return False, "inter-wave direct-to-LDS operands must each fit signed 32-bit byte offsets"
+        if path == "persistent":
+            valid = (shape.m * shape.k * 2 >= 2**31 and shape.k * shape.n * 2 < 2**31 and shape.m % 256 == 0
+                     and shape.n % 256 == 0 and shape.k >= 128 and shape.k % 128 == 0)
+            return valid, "requires a large row-major A that can be rebased into local buffer offsets"
         if path == "inter_wave_tail":
             valid = (shape.k > 1536 and shape.k % 64 != 0 and shape.k * 2 % 16 == 0
                      and 2 * 1024 * 1024 < shape.m * shape.n <= 16 * 1024 * 1024)
@@ -143,6 +147,7 @@ MM_CANDIDATES = (
 )
 ADDMM_CANDIDATES = (
     Candidate("addmm_register", _addmm_path_support("register"), _addmm_builder("register")),
+    Candidate("addmm_persistent", _addmm_path_support("persistent"), _addmm_builder("persistent")),
     Candidate("addmm_interwave", _addmm_path_support("inter_wave"), _addmm_builder("inter_wave")),
     Candidate("addmm_streamk", _addmm_path_support("stream_k"), _addmm_builder("stream_k")),
     Candidate("addmm_interwave_tail", _addmm_path_support("inter_wave_tail"), _addmm_builder("inter_wave_tail")),
@@ -257,6 +262,9 @@ def _candidate_config(name: str, shape: Shape) -> dict | None:
         prefix, split_k = plan or (shape.k // 128 * 128, 1)
         return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "SPLIT_K": split_k,
                 "K_PREFIX": prefix, "K_TAIL": shape.k - prefix, "num_warps": 8}
+    if name == "addmm_persistent":
+        return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_PROGRAMS": 256, "NUM_XCDS": 8,
+                "num_warps": 8}
     if name == "v9":
         return {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "num_warps": 8}
     if name == "bmm_shared_a_row":

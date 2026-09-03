@@ -5207,7 +5207,7 @@ def test_amd_addmm_large_operand_paths():
     a = torch.empty((2252800, 512), device="meta", dtype=torch.bfloat16)
     b = torch.empty((256, 512), device="meta", dtype=torch.bfloat16).T
     bias = torch.empty((256, ), device="meta", dtype=torch.bfloat16)
-    assert _amd_addmm_paths(bias, a, b) == ("register", )
+    assert _amd_addmm_paths(bias, a, b) == ("register", "persistent")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

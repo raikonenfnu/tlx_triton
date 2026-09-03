@@ -10,12 +10,17 @@ import torch
 import triton
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
     BLOCK_K,
+    BLOCK_M,
+    BLOCK_N,
     NUM_CU,
     _aligned_split_tail_plan,
     _has_streamk_schedule,
     _launch,
     _launch_aligned_split_tail,
+    _launch_rebased_persistent,
     _launch_register,
+    _needs_i64_offsets,
+    _streamk_schedule,
     streamk_matmul,
 )
 
@@ -46,6 +51,14 @@ def _can_use_streamk(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> bo
     N = b.shape[1]
     # N-contiguous bias loads preserve the accumulator layout without extra LDS.
     return bias.stride(1) == 1 and _can_use_inter_wave(a, b) and _has_streamk_schedule(M, N, K)
+
+
+def _can_use_rebased_persistent(a: torch.Tensor, b: torch.Tensor) -> bool:
+    M, K = a.shape
+    N = b.shape[1]
+    aligned = M % BLOCK_M == 0 and N % BLOCK_N == 0 and K >= 2 * BLOCK_K and K % (2 * BLOCK_K) == 0
+    return (aligned and _needs_i64_offsets(a) and not _needs_i64_offsets(b)
+            and not _streamk_schedule(M, N, K)["HAS_STREAMK"])
 
 
 def _path_key(
@@ -89,6 +102,8 @@ def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tup
     it already agrees with `register`, so a genuinely wrong `inter_wave` would
     be dropped from the timing pool and the suite would still pass green.
     """
+    if _can_use_rebased_persistent(a, b):
+        return ("register", "persistent")
     if _can_use_inter_wave(a, b):
         return (("register", "inter_wave", "stream_k") if _can_use_streamk(bias, a, b) else ("register", "inter_wave"))
     if _can_use_inter_wave_tail(a, b):
@@ -99,6 +114,8 @@ def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tup
 def _dispatch(path: str, bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, split_k, config=None):
     if path == "stream_k":
         return streamk_matmul(a, b, bias)
+    if path == "persistent":
+        return _launch_rebased_persistent(a, b, bias)
     if path == "inter_wave":
         return _launch(a, b, bias=bias, SPLIT_K=split_k)
     if path == "inter_wave_tail":
@@ -122,7 +139,12 @@ def _autotune_path(
     register = lambda: _launch_register(a, b, bias=bias)
     register_output = register()
     candidates = {"register": register}
-    if _can_use_inter_wave(a, b):
+    if _can_use_rebased_persistent(a, b):
+        persistent = lambda: _launch_rebased_persistent(a, b, bias)
+        persistent_output = persistent()
+        if torch.allclose(register_output, persistent_output, rtol=1e-2, atol=1e-2):
+            candidates["persistent"] = persistent
+    elif _can_use_inter_wave(a, b):
         inter_wave = lambda: _launch(a, b, bias=bias, SPLIT_K=split_k)
         inter_wave_output = inter_wave()
         if torch.allclose(register_output, inter_wave_output, rtol=1e-2, atol=1e-2):

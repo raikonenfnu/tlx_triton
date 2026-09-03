@@ -125,6 +125,8 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
     matmul_kernel as _amd_gemm, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    _launch_rebased_persistent as _amd_rebased_persistent, )
 from triton.tools.mxfp import MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
@@ -2491,6 +2493,24 @@ def test_amd_addmm_oversubscribed_k_tail(dtype):
     assert _amd_gemm._aligned_split_tail_plan(M, N, K, program_budget=2 * _amd_gemm.NUM_CU) == (11520, 3)
     torch.testing.assert_close(
         _amd_addmm(bias, a, b, path="inter_wave_tail"),
+        torch.addmm(bias, a, b),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_addmm_rebased_persistent(dtype):
+    # 257 full output tiles exercise the persistent loop without a >2 GiB test allocation.
+    M, N, K = 65792, 256, 128
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=DEVICE, dtype=dtype) / K
+    b = (torch.randn((N, K), device=DEVICE, dtype=dtype) / K).T
+    bias = torch.randn((N, ), device=DEVICE, dtype=dtype)
+
+    torch.testing.assert_close(
+        _amd_rebased_persistent(a, b, bias),
         torch.addmm(bias, a, b),
         atol=2e-2,
         rtol=2e-2,
