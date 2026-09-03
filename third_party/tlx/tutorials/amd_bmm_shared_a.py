@@ -19,8 +19,8 @@ layouts are separate files rather than one parameterised kernel.
 Two load paths, selected by K alignment (``K % BLOCK_K == 0`` -> aligned A rows,
 no K-tail):
   * aligned -> direct-to-LDS (``buffer_load_to_local``) + swizzled LDS.
-  * odd K   -> register path (``tl.load`` -> ``tlx.local_store``). Complete K32
-    tiles stay unmasked in the LDS pipeline; one or two masked K16 fragments
+  * odd K   -> register path (``tl.load`` -> ``tl.dot``). Complete K32 tiles
+    stay unmasked in the compiler pipeline; one or two masked K16 fragments
     handle the tail. Required because odd K gives 2-byte-aligned rows, where
     direct-to-LDS is illegal on CDNA4.
 """
@@ -118,15 +118,13 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
 def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
                   BN: tl.constexpr, BK: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
                   NB: tl.constexpr, K_FULL_TILES: tl.constexpr, K_TAIL_STEPS: tl.constexpr):
-    """Odd K: pipeline full K32 tiles through LDS, then compute a masked K16 tail."""
+    """Odd K: pipeline full K32 tiles in registers, then compute a masked K16 tail."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
     bid = pidf // GMN
     pid = pidf % GMN
     pm = pid // npn
     pn = pid % npn
-    sA = tlx.local_alloc((BM, BK), tlx.dtype_of(a_ptr), NB)
-    sB = tlx.local_alloc((BK, BN), tlx.dtype_of(b_ptr), NB)
     om = (pm * BM + tl.arange(0, BM)) % M
     on = (pn * BN + tl.arange(0, BN)) % N
     ok = tl.arange(0, BK)
@@ -135,40 +133,10 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     ao = om[:, None] * sam
     bo = on[None, :] * sbn
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    if K_FULL_TILES >= 2:
-        # Keep mask/zero-fill semantics out of the hot pipeline: only the final
-        # partial K tile needs them. This avoids carrying masked-load fill values
-        # through every global-load -> LDS-store group.
-        for i in tl.range(0, NB, loop_unroll_factor=NB):
-            kk = i * BK
-            ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak)
-            br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo)
-            tlx.local_store(tlx.local_view(sA, i), ar)
-            tlx.local_store(tlx.local_view(sB, i), br)
-        tl.debug_barrier()
-        a = tlx.local_load(tlx.local_view(sA, 0))
-        b = tlx.local_load(tlx.local_view(sB, 0))
-        for k in tl.range(0, K_FULL_TILES - NB):
-            cur = (k + 1) % NB
-            pf = k % NB
-            kp = (k + NB) * BK
-            acc = tl.dot(a, b, acc)
-            ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak)
-            br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo)
-            tlx.local_store(tlx.local_view(sA, pf), ar)
-            tlx.local_store(tlx.local_view(sB, pf), br)
-            tl.debug_barrier()
-            a = tlx.local_load(tlx.local_view(sA, cur))
-            b = tlx.local_load(tlx.local_view(sB, cur))
-        acc = tl.dot(a, b, acc)
-        for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
-            bf = (K_FULL_TILES - (NB - 1) + i) % NB
-            acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
-    elif K_FULL_TILES == 1:
-        # The public API supports 33 <= K < 64; one complete K32 tile is too
-        # short to pipeline, so compute it directly in registers.
-        ar = tl.load(a_ptr + ao + ok[None, :] * sak)
-        br = tl.load(b_ptr + ok[:, None] * sbk + bo)
+    for k_tile in tl.range(0, K_FULL_TILES, num_stages=NB):
+        kk = k_tile * BK
+        ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak)
+        br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo)
         acc = tl.dot(ar, br, acc)
 
     # Use the minimum number of K16 MFMA fragments for the final partial K32
@@ -200,8 +168,7 @@ def bmm(a, b):
     assert k_tiles >= 2, f"K must span >= 2 BLOCK_K={BLOCK_K} tiles, got K={K}"
     k_full_tiles = K // BLOCK_K
     k_tail_steps = triton.cdiv(K % BLOCK_K, 16)
-    # The register path pipelines only complete K32 tiles. Its one-tile case is
-    # computed directly, while local_alloc still requires at least two buffers.
+    # Bound the software-pipeline stages by the number of complete K32 tiles.
     nb = max(2, min(NB, k_full_tiles))
     GMN = triton.cdiv(M, bm) * triton.cdiv(N, BLOCK_N)
     NT = Bs * GMN
