@@ -16,13 +16,14 @@ CONFIG: num_warps=8, matrix_instr_nonkdim=32 (32x32 MFMA). nw=8 does not compile
 with the column-major kernel's swizzle + 4-warp split store, which is why the two
 layouts are separate files rather than one parameterised kernel.
 
-Two load paths, selected by K alignment (``K % BLOCK_K == 0`` -> aligned A rows,
-no K-tail):
+Three load paths, selected by K alignment and tile size:
   * aligned -> direct-to-LDS (``buffer_load_to_local``) + swizzled LDS.
-  * odd K   -> register path (``tl.load`` -> ``tl.dot``). Complete K32 tiles
-    stay unmasked in the compiler pipeline; one or two masked K16 fragments
-    handle the tail. Required because odd K gives 2-byte-aligned rows, where
-    direct-to-LDS is illegal on CDNA4.
+  * unaligned K, M > 64 -> copy the shared A matrix's complete K32 prefix into an
+    aligned row-major buffer, run the direct path, and finish with a masked K16
+    fragment. The small copy is amortized across the batch.
+  * unaligned K, M <= 64 or a single full K32 tile -> register path. Repacking cannot
+    amortize here. Odd K otherwise gives 2-byte-aligned rows, where direct-to-LDS
+    is illegal on CDNA4.
 """
 import torch
 
@@ -60,9 +61,21 @@ def _chip(pid, nt, nx: tl.constexpr, cs: tl.constexpr):
 
 
 @triton.jit
-def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
-                BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr, BB: tl.constexpr, NUM_XCDS: tl.constexpr,
-                GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
+def _pack_shared_a(a_ptr, packed_ptr, M: tl.constexpr, PACKED_K: tl.constexpr, stride_am: tl.constexpr,
+                   stride_ak: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = offsets // PACKED_K
+    col = offsets % PACKED_K
+    mask = offsets < M * PACKED_K
+    values = tl.load(a_ptr + row * stride_am + col * stride_ak, mask=mask)
+    tl.store(packed_ptr + offsets, values, mask=mask)
+
+
+@triton.jit
+def _bmm_direct(a_ptr, a_tail_ptr, b_ptr, c_ptr, M, N, K, K_TOTAL, sab, sam, sak, tail_sab, tail_sam, tail_sak, sbb,
+                sbk, sbn, scb, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr,
+                BB: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr,
+                K_TAIL_STEPS: tl.constexpr):
     """Aligned rows, no K-tail (K % BLOCK_K == 0): direct-to-LDS + swizzled LDS."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
@@ -78,6 +91,7 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
     on = (pn * BN + tl.arange(0, BN)) % N
     ok = tl.arange(0, BK)
     a_ptr = a_ptr + bid.to(tl.int64) * sab
+    a_tail_ptr = a_tail_ptr + bid.to(tl.int64) * tail_sab
     b_ptr = b_ptr + bid.to(tl.int64) * sbb
     ao = om[:, None] * sam
     bo = on[None, :] * sbn
@@ -95,10 +109,12 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
         cur = (k + 1) % NB
         pf = k % NB
         kp = (k + NB) * BK
-        acc = tl.dot(a, b, acc)
-        tlx.buffer_load_to_local(tlx.local_view(sA, pf), a_ptr, ao + (kp + ok[None, :]) * sak)
-        tlx.buffer_load_to_local(tlx.local_view(sB, pf), b_ptr, (kp + ok[:, None]) * sbk + bo)
-        tlx.async_load_commit_group()
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a, b, acc)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            tlx.buffer_load_to_local(tlx.local_view(sA, pf), a_ptr, ao + (kp + ok[None, :]) * sak)
+            tlx.buffer_load_to_local(tlx.local_view(sB, pf), b_ptr, (kp + ok[:, None]) * sbk + bo)
+            tlx.async_load_commit_group()
         tlx.async_load_wait_group(NB - 2)
         a = tlx.local_load(tlx.local_view(sA, cur))
         b = tlx.local_load(tlx.local_view(sB, cur))
@@ -107,6 +123,14 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
+    for tail_step in tl.static_range(0, K_TAIL_STEPS):
+        tail_k = K + tail_step * 16
+        tail_ok = tl.arange(0, 16)
+        km = (tail_k + tail_ok) < K_TOTAL
+        ar = tl.load(a_tail_ptr + om[:, None] * tail_sam + (tail_k + tail_ok[None, :]) * tail_sak, mask=km[None, :],
+                     other=0.0)
+        br = tl.load(b_ptr + (tail_k + tail_ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        acc = tl.dot(ar, br, acc)
     et = c_ptr.dtype.element_ty
     cb = c_ptr + bid.to(tl.int64) * scb
     rm = pm * BM + tl.arange(0, BM)
@@ -161,9 +185,10 @@ def bmm(a, b):
     # sA / sB take their element type from a_ptr / b_ptr independently, so a dtype
     # mismatch would silently give the two LDS buffers different types.
     assert a.dtype == b.dtype, f"A and B must have the same dtype, got {a.dtype} and {b.dtype}"
+    assert a.stride(0) == 0, "A must be shared across batches (stride_ab == 0)"
     Bs, M, K = a.shape
     N = b.shape[-1]
-    bm = 64 if M <= 64 else 128
+    bm = 64 if M <= 64 else (128 if M < 384 else 256)
     k_tiles = triton.cdiv(K, BLOCK_K)
     assert k_tiles >= 2, f"K must span >= 2 BLOCK_K={BLOCK_K} tiles, got K={K}"
     k_full_tiles = K // BLOCK_K
@@ -177,17 +202,31 @@ def bmm(a, b):
     common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
-    # K % BLOCK_K, not K % 8: the direct path does no K-tail masking on
-    # buffer_load_to_local, so a K that is 8-aligned but not BLOCK_K-aligned
-    # (e.g. 264) reads past the K extent. Matches the guard in amd_bmm.py.
+    # The direct path cannot mask its final LDS transfer, so it requires full K32 tiles.
     if K % BLOCK_K == 0:  # 16-byte-aligned A rows, no K-tail -> direct-to-LDS (wins)
         AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
         BB = tuple(tuple(x) for x in _swz([BLOCK_K, BLOCK_N], 1))
-        _bmm_direct[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB, NUM_XCDS=NUM_XCDS,
-                            GMN=GMN, NT=NT, NB=nb, **common)
-    else:  # odd / unaligned K -> register path
+        _bmm_direct[(NT, )](a, a, b, c, M, N, K, K, a.stride(0), a.stride(1), a.stride(2), a.stride(0), a.stride(1),
+                            a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1), c.stride(2),
+                            BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb,
+                            K_TAIL_STEPS=0, **common)
+    elif M <= 64 or k_full_tiles < 2:
         _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
                               NB=nb, K_FULL_TILES=k_full_tiles, K_TAIL_STEPS=k_tail_steps, **common)
+    else:
+        # A is shared by every batch, so aligning its complete K32 prefix costs
+        # one small copy and enables the faster direct-to-LDS pipeline.
+        packed_k = k_full_tiles * BLOCK_K
+        packed_a_2d = torch.empty((M, packed_k), device=a.device, dtype=a.dtype)
+        _pack_shared_a[(triton.cdiv(M * packed_k, 256), )](a, packed_a_2d, M, packed_k, a.stride(1), a.stride(2),
+                                                           BLOCK=256, num_warps=4)
+        packed_a = packed_a_2d.unsqueeze(0).expand(Bs, M, packed_k)
+        AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
+        BB = tuple(tuple(x) for x in _swz([BLOCK_K, BLOCK_N], 1))
+        _bmm_direct[(NT, )](packed_a, a, b, c, M, N, packed_k, K, packed_a.stride(0), packed_a.stride(1),
+                            packed_a.stride(2), a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1),
+                            b.stride(2), c.stride(0), c.stride(1), c.stride(2), BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB,
+                            BB=BB, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb, K_TAIL_STEPS=k_tail_steps, **common)
     return c
 
 
@@ -232,5 +271,5 @@ if __name__ == "__main__":
         ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
         t = _warm_ms(lambda: bmm(a, b)) * 1e3
         rb = _warm_ms(lambda: torch.bmm(a, b)) * 1e3
-        path = "direct" if K % BLOCK_K == 0 else "reg"
+        path = "direct" if K % BLOCK_K == 0 else ("reg" if M <= 64 or K // BLOCK_K < 2 else "packed")
         print(f"{f'{M}x{N}x{K} ({B})':<22}{path:<8}{t:8.0f}u{rb:9.0f}u{rb / t:7.2f}x  {'OK' if ok else 'WRONG'}")
