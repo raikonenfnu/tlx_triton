@@ -1571,7 +1571,11 @@ def choose_tile(M, N, K):
     gmn = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     sk = _split_k_for(gmn, K)
     best_fill = gmn * sk
-    if best_fill <= NUM_CU // 2:  # half-full or worse: prefer a denser, unsplit tile grid
+    # At exactly half fill, smaller tiles help short K by admitting a second
+    # resident CTA wave. For long K, the larger tile's operand reuse is more
+    # valuable and the split kernel already has enough CTAs to saturate memory.
+    underfilled = best_fill < NUM_CU // 2 or (best_fill == NUM_CU // 2 and K <= 64 * BLOCK_K)
+    if underfilled:
         for cbm, cbn in TILE_CANDIDATES[1:]:
             g = triton.cdiv(M, cbm) * triton.cdiv(N, cbn)
             s = _split_k_for(g, K)

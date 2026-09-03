@@ -66,6 +66,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kern
     MIN_STREAMK_PIPE_PAIRS as _A16W16_MIN_STREAMK_PIPE_PAIRS,
     _choose_streamk_tile as _choose_a16w16_streamk_tile,
     _streamk_schedule as _a16w16_streamk_schedule,
+    choose_tile as _choose_a16w16_tile,
     matmul as _a16w16_inter_wave_matmul,
     streamk_matmul as _a16w16_inter_wave_streamk_matmul,
 )
@@ -5199,6 +5200,13 @@ def test_a16w16_streamk_pr2850_schedule_gfx950(n, tail_tiles, units_per_program)
     assert schedule["NUM_FULL_TILES"] == 256
     assert m // bm * (n // bn) - schedule["NUM_FULL_TILES"] == tail_tiles
     assert schedule["UNITS_PER_PROGRAM"] == units_per_program
+
+
+def test_a16w16_half_full_tile_selection_gfx950():
+    # Short K benefits from a denser 128 tile, while long K keeps the greater
+    # operand reuse of the 256 tile once split-K already fills half the CUs.
+    assert _choose_a16w16_tile(2048, 2048, 2048) == (128, 128, 1)
+    assert _choose_a16w16_tile(512, 256, 98304) == (256, 256, 64)
 
 
 def test_amd_addmm_large_operand_paths():
