@@ -230,8 +230,12 @@ _HALF_256 = 256 // 2  # half of the 256x256 tile
 _HALF_128 = 128 // 2  # half of the 128x128 tile
 _A_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 1))
 _A_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 1))
+_A_COLUMN_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 0))
+_A_COLUMN_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 0))
 _B_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 0))
 _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
+_B_ROW_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 1))
+_B_ROW_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 1))
 # Direct-to-LDS offset layouts inferred by the aligned 256x256 path. Pinning
 # these keeps a merely 16-byte-aligned leading stride from falling back to a
 # blocked layout that the AMD buffer-load lowering cannot consume.
@@ -370,7 +374,7 @@ def _launch_register(a, b, bias=None, config=None):
 @triton.jit
 def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, a_top_off, a_bot_off, b_left_off,
                 b_right_off, ka, kb, n_steps, stride_ak, stride_bk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                BLOCK_K: tl.constexpr):
+                BLOCK_K: tl.constexpr, STREAM_A: tl.constexpr):
     """Compute one output tile over an even contiguous range of K64 steps.
 
     ``ka`` and ``kb`` are the initial element offsets along K. ``n_steps`` must
@@ -379,7 +383,6 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     """
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
-
     # Keep the direct-to-LDS producer contract local to this extracted helper.
     # K is contiguous in A's second tensor dimension and B's first tensor
     # dimension. The helper boundary otherwise hides those width/alignment
@@ -404,18 +407,30 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
     tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    if STREAM_A:
+        tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=".cg")
+    else:
+        tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    if STREAM_A:
+        tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=".cg")
+    else:
+        tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    if STREAM_A:
+        tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=".cg")
+    else:
+        tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    if STREAM_A:
+        tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=".cg")
+    else:
+        tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
     tlx.async_load_commit_group()
@@ -443,7 +458,10 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            if STREAM_A:
+                tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=".cg")
+            else:
+                tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -451,7 +469,10 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            if STREAM_A:
+                tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=".cg")
+            else:
+                tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -476,7 +497,10 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            if STREAM_A:
+                tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=".cg")
+            else:
+                tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -484,7 +508,10 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            if STREAM_A:
+                tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=".cg")
+            else:
+                tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -596,7 +623,11 @@ def a16w16_8wave(
     USE_I64_B_OFFSETS: tl.constexpr,
     USE_I64_C_OFFSETS: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
+    FULL_MN_TILES: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    STREAM_A: tl.constexpr,
+    A_COLUMN_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
@@ -674,8 +705,14 @@ def a16w16_8wave(
     # (gfx950 has no direct-to-LDS scattering -> extra write swizzle). Net: this
     # padded layout is the fastest option and still beats vendor -- the stall is the
     # price of the cheap direct-to-LDS write on a small square tile.
-    a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
-    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    if A_COLUMN_MAJOR:
+        a_bases: tl.constexpr = _A_COLUMN_MAJOR_BASES_256 if BLOCK_M == 256 else _A_COLUMN_MAJOR_BASES_128
+    else:
+        a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
+    if B_ROW_MAJOR:
+        b_bases: tl.constexpr = _B_ROW_MAJOR_BASES_256 if BLOCK_N == 256 else _B_ROW_MAJOR_BASES_128
+    else:
+        b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
     smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
@@ -717,11 +754,20 @@ def a16w16_8wave(
         a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
         b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
         b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
-    a_k_mask = offs_k[None, :] < BLOCK_K
-    a_top_mask = (offs_am[:, None] < M) & a_k_mask
-    a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
-    b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
-    b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
+    if FULL_MN_TILES:
+        a_top_mask = None
+        a_bot_mask = None
+        b_left_mask = None
+        b_right_mask = None
+        a_other = None
+        b_other = None
+    else:
+        a_top_mask = offs_am[:, None] < M
+        a_bot_mask = (offs_am[:, None] + HALF_M) < M
+        b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
+        b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
+        a_other = 0.0
+        b_other = 0.0
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -734,6 +780,7 @@ def a16w16_8wave(
     ka = ak_split
     kb = bk_split
 
+    a_cache_modifier: tl.constexpr = ".cg" if STREAM_A else ""
     acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
@@ -747,22 +794,26 @@ def a16w16_8wave(
     n_full = KS // BLOCK_K
     n_pipe = (n_full // 2) * 2
 
-    tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+    tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+    tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other,
+                   cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+    tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other,
+                   cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+    tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
-    tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+    tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+    tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other,
+                   cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+    tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other,
+                   cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+    tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -778,7 +829,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+            tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -786,7 +837,8 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+            tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other,
+                           cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -794,7 +846,8 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+            tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other,
+                           cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -802,7 +855,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+            tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -810,7 +863,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+            tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -818,7 +871,8 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+            tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other,
+                           cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -826,7 +880,8 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+            tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other,
+                           cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -834,7 +889,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+            tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
@@ -1006,7 +1061,7 @@ def _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, 
     b_right_off = offs_k[:, None] * stride_bk + offs_n_right[None, :] * stride_bn
     acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                  a_top_off, a_bot_off, b_left_off, b_right_off, 0, 0, K_PIPE_STEPS,
-                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K, False)
     if HAS_K_TAIL:
         # Mask odd full and/or partial K64 steps left after the even pipelined prefix.
         for kk in tl.range(K_PIPE_STEPS * BLOCK_K, K, BLOCK_K, num_stages=1):
@@ -1170,7 +1225,8 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
         acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                      tail_a_top_off, tail_a_bot_off, tail_b_left_off, tail_b_right_off,
                                                      segment_k_offset * stride_ak, segment_k_offset * stride_bk,
-                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K,
+                                                     False)
 
         # Pin and publish all four partial quadrants before any contributor waits.
         # This avoids cyclic dependencies and lets the MFMA accumulators die before
@@ -1245,7 +1301,7 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                                                          smem_b_right, tile_a_top_off, tile_a_bot_off, tile_b_left_off,
                                                          tile_b_right_off, k_step * stride_ak, k_step * stride_bk,
                                                          (segment_end - start_unit) * 2, stride_ak, stride_bk, BLOCK_M,
-                                                         BLOCK_N, BLOCK_K)
+                                                         BLOCK_N, BLOCK_K, False)
             acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
             acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
             acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
@@ -1447,6 +1503,7 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     stride_bias_m = bias.stride(0) if bias is not None else 0
     stride_bias_n = bias.stride(1) if bias is not None else 0
     use_i64_c_offsets = _needs_i64_offsets(c)
+    full_mn_tiles = M % BM == 0 and N % BN == 0
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
@@ -1478,7 +1535,11 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         USE_I64_B_OFFSETS=_needs_i64_offsets(b),
         USE_I64_C_OFFSETS=use_i64_c_offsets,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
+        FULL_MN_TILES=full_mn_tiles,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        STREAM_A=N <= BN and (a.stride(0) == 1 or K <= 8 * BLOCK_K),
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,

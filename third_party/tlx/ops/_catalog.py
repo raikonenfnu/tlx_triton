@@ -62,6 +62,14 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="interwave_scheduled",
+        impl="kernels.mm.gfx950:mm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",

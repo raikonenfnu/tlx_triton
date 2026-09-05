@@ -17,12 +17,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-# Inherited from v8: keep the LLVM post-RA machine scheduler from re-ordering the
-# warp_pipeline_stage mem/MFMA interleave. Equivalent to TRITON_DISABLE_POST_MISCHED=1,
-# baked in so the kernel ships with its intended schedule (~+1-2%). setdefault()
-# lets an explicit env override win. See python/src/llvm.cc (enable-post-misched=false).
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
-
 
 def _swz_offset_bases(shape, contig_dim):
     """Build the bank-conflict-free operand-tile LDS bit permutation."""
@@ -34,13 +28,14 @@ def _swz_offset_bases(shape, contig_dim):
     contig_bits = int(shape[contig_dim]).bit_length() - 1
     free_bits = int(shape[free_dim]).bit_length() - 1
     contig = [basis(contig_dim, i) for i in range(contig_bits)]
-    free = ([basis(free_dim, i) for i in range(4, free_bits)] +
-            [basis(free_dim, i) for i in range(min(4, free_bits))])
+    free = [basis(free_dim, i) for i in range(4, free_bits)] + [basis(free_dim, i) for i in range(min(4, free_bits))]
     return contig + free
 
 
 _A_LDS_BASES = tl.constexpr(_swz_offset_bases([256, 64], 1))
+_A_COLUMN_MAJOR_LDS_BASES = tl.constexpr(_swz_offset_bases([256, 64], 0))
 _B_LDS_BASES = tl.constexpr(_swz_offset_bases([64, 128], 0))
+_B_ROW_MAJOR_LDS_BASES = tl.constexpr(_swz_offset_bases([64, 128], 1))
 _C_STORE_SIMD_LAYOUT = tlx.layout(
     shape=((16, 4, 8), (8, 8)),
     stride=((8, 128, 512), (1, 4096)),
@@ -75,6 +70,10 @@ def v9_beyond_hotloop(
     GROUP_SIZE_M: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
+    A_COLUMN_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
+    FULL_M_TILES: tl.constexpr,
+    FULL_N_TILES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -91,7 +90,7 @@ def v9_beyond_hotloop(
         if xcd < tall_xcds:
             pid = xcd * pids_per_xcd + local_pid
         else:
-            pid = (tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+            pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
 
     if GROUP_SIZE_M == 1:
         pid_m = pid // num_pid_n
@@ -114,21 +113,27 @@ def v9_beyond_hotloop(
     # Pin the padded-shared offset bases instead of relying on layout inference.
     # The explicit row/column bit permutation avoids LDS bank conflicts and keeps
     # the direct-to-LDS buffer loads coalesced for the fixed 256x256x64 tile.
-    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _A_LDS_BASES, [BLOCK_M, BLOCK_K])
-    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _B_LDS_BASES, [BLOCK_K, HALF_N])
-    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    a_bases: tl.constexpr = _A_COLUMN_MAJOR_LDS_BASES if A_COLUMN_MAJOR else _A_LDS_BASES
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [BLOCK_M, BLOCK_K])
+    b_bases: tl.constexpr = _B_ROW_MAJOR_LDS_BASES if B_ROW_MAJOR else _B_LDS_BASES
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
+    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
 
     offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+    offs_bn_left = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+    offs_bn_right = offs_bn_left + HALF_N
+    if not FULL_M_TILES and pid_m == num_pid_m - 1:
+        offs_am %= M
+    if not FULL_N_TILES and pid_n == num_pid_n - 1:
+        offs_bn_left %= N
+        offs_bn_right %= N
     offs_k = tl.arange(0, BLOCK_K)
 
     a_off = offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    bl_off = offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    br_off = bl_off + HALF_N * stride_bn
+    bl_off = offs_k[:, None] * stride_bk + offs_bn_left[None, :] * stride_bn
+    br_off = offs_k[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn
     a_k = tl.zeros([], dtype=tl.int32)
     b_k = tl.zeros([], dtype=tl.int32)
 
@@ -234,54 +239,70 @@ def v9_beyond_hotloop(
     store_layout: tl.constexpr = _C_STORE_SIMD_LAYOUT
     acc_layout: tl.constexpr = _ACCUMULATOR_LAYOUT
     acc_left = tlx.require_layout(acc_left, acc_layout)
-    c_left = tlx.require_layout(acc_left.to(tl.float16), store_layout)
+    output_ty = c_ptr.dtype.element_ty
+    c_left = tlx.require_layout(acc_left.to(output_ty), store_layout)
     tlx.assert_same_layout(c_left, store_layout)
-    c_left_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :])
+    c_left_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :]
     tl.store(c_left_ptrs, c_left, mask=(offs_cm[:, None] < M) & (offs_cn_left[None, :] < N))
 
     acc_right = tl.dot(a, b_right, acc_right)
 
     # Store right half
     acc_right = tlx.require_layout(acc_right, acc_layout)
-    c_right = tlx.require_layout(acc_right.to(tl.float16), store_layout)
-    c_right_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :])
+    c_right = tlx.require_layout(acc_right.to(output_ty), store_layout)
+    c_right_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :]
     tl.store(
         c_right_ptrs,
         c_right,
         mask=(offs_cm[:, None] < M) & (offs_cn_right[None, :] < N),
     )
 
+
 def matmul(a, b):
+    assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16)
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
     NUM_XCDS = 8
-    GROUP_SIZE_M = 4
+    # Four N tiles share each B panel.  Grouping 16 consecutive M tiles keeps
+    # that panel resident across two XCD-local workgroup waves.
+    GROUP_SIZE_M = 16
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    GRID_MN = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    v9_beyond_hotloop[(GRID_MN, )](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_XCDS=NUM_XCDS,
-        GRID_MN=GRID_MN,
-        num_warps=8,
-        num_stages=1,
-        matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-    )
+    grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    previous_post_misched = os.environ.get("TRITON_DISABLE_POST_MISCHED")
+    if previous_post_misched is None:
+        os.environ["TRITON_DISABLE_POST_MISCHED"] = "1"
+    try:
+        v9_beyond_hotloop[(grid_mn,)](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            NUM_XCDS=NUM_XCDS,
+            GRID_MN=grid_mn,
+            A_COLUMN_MAJOR=a.stride(0) == 1,
+            B_ROW_MAJOR=b.stride(1) == 1,
+            FULL_M_TILES=M % BLOCK_M == 0,
+            FULL_N_TILES=N % BLOCK_N == 0,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+        )
+    finally:
+        if previous_post_misched is None:
+            del os.environ["TRITON_DISABLE_POST_MISCHED"]
     return c

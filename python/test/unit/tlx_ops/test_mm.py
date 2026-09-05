@@ -13,7 +13,7 @@ import time
 import pytest
 import torch
 
-from triton._internal_testing import is_blackwell, is_hip_cdna3
+from triton._internal_testing import is_blackwell, is_hip_cdna3, is_hip_cdna4
 from triton.tlx.ops import InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, operand
 
@@ -24,6 +24,8 @@ def _arch():
         return "sm100"
     if is_hip_cdna3():
         return "gfx942"
+    if is_hip_cdna4():
+        return "gfx950"
     return None
 
 
@@ -99,3 +101,21 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     # this the union OOMs partway through rather than at a diagnosable point.
     del a, b, out, ref
     torch.cuda.empty_cache()
+
+
+def test_gfx950_schedule_policy():
+    if ARCH != "gfx950":
+        pytest.skip("gfx950-only schedule policy")
+
+    from triton.tlx.ops.kernels.mm.gfx950 import Schedule, plan_for
+
+    # An underfilled output grid uses K parallelism, including a masked-tail
+    # variant when K is not an even number of pipeline steps.
+    assert plan_for(3 * 256, 256, 128 * 1024, 128 * 1024, 1, 256, 1).schedule is Schedule.SPLIT_K
+    assert plan_for(4 * 256, 4 * 256, 43500, 1, 4 * 256, 4 * 256, 1).schedule is Schedule.SPLIT_K_TAIL
+
+    # At least two output-tile waves with short K use the single-A-tile path,
+    # but only when A is physically row-major; the column-major case retains
+    # the stride-aware data-centric pipeline.
+    assert plan_for(150 * 256, 4 * 256, 1024, 1024, 1, 1024, 1).schedule is Schedule.WIDE_SHORT_K
+    assert plan_for(150 * 256, 4 * 256, 1024, 1, 150 * 256, 1024, 1).schedule is Schedule.DATA_CENTRIC
