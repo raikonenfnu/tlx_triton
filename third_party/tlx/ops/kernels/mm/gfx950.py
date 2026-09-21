@@ -471,8 +471,12 @@ _HALF_256 = 256 // 2  # half of the 256x256 tile
 _HALF_128 = 128 // 2  # half of the 128x128 tile
 _A_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 1))
 _A_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 1))
+_A_COLUMN_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 0))
+_A_COLUMN_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 0))
 _B_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 0))
 _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
+_B_ROW_MAJOR_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 1))
+_B_ROW_MAJOR_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 1))
 # Direct-to-LDS offset layouts inferred by the aligned 256x256 path. Pinning
 # these keeps a merely 16-byte-aligned leading stride from falling back to a
 # blocked layout that the AMD buffer-load lowering cannot consume.
@@ -776,6 +780,8 @@ def a16w16_8wave(
     HAS_N_TAIL: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    A_COLUMN_MAJOR: tl.constexpr,
+    B_ROW_MAJOR: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Exact partitions use KS; uneven partitions
@@ -847,8 +853,10 @@ def a16w16_8wave(
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
     if PIN_OFFSET_LAYOUT:
-        stride_am = tl.multiple_of(stride_am, 8)
-        stride_bn = tl.multiple_of(stride_bn, 8)
+        if not A_COLUMN_MAJOR:
+            stride_am = tl.multiple_of(stride_am, 8)
+        if not B_ROW_MAJOR:
+            stride_bn = tl.multiple_of(stride_bn, 8)
 
     TOP_M: tl.constexpr = 128 if BLOCK_M == 192 else BLOCK_M // 2
     BOTTOM_M: tl.constexpr = BLOCK_M - TOP_M
@@ -869,13 +877,18 @@ def a16w16_8wave(
     # (gfx950 has no direct-to-LDS scattering -> extra write swizzle). Net: this
     # padded layout is the fastest option and still beats vendor -- the stall is the
     # price of the cheap direct-to-LDS write on a small square tile.
-    a_top_bases: tl.constexpr = (
-        _A_BASES_256 if TOP_M == 128 else _A_BASES_128
-    )
-    a_bot_bases: tl.constexpr = (
-        _A_BASES_256 if BOTTOM_M == 128 else _A_BASES_128
-    )
-    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    if A_COLUMN_MAJOR:
+        a_top_bases: tl.constexpr = (_A_COLUMN_MAJOR_BASES_256 if TOP_M == 128 else
+                                     _A_COLUMN_MAJOR_BASES_128)
+        a_bot_bases: tl.constexpr = (_A_COLUMN_MAJOR_BASES_256 if BOTTOM_M == 128 else
+                                     _A_COLUMN_MAJOR_BASES_128)
+    else:
+        a_top_bases: tl.constexpr = _A_BASES_256 if TOP_M == 128 else _A_BASES_128
+        a_bot_bases: tl.constexpr = _A_BASES_256 if BOTTOM_M == 128 else _A_BASES_128
+    if B_ROW_MAJOR:
+        b_bases: tl.constexpr = _B_ROW_MAJOR_BASES_256 if BLOCK_N == 256 else _B_ROW_MAJOR_BASES_128
+    else:
+        b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_top_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [(512, 16)], a_top_bases, [TOP_M, BLOCK_K]
     )
@@ -1347,7 +1360,8 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                    NUM_XCDS: tl.constexpr, NUM_CU: tl.constexpr, NUM_PROGRAMS: tl.constexpr, HAS_STREAMK: tl.constexpr,
                    NUM_FULL_TILES: tl.constexpr, HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr,
                    NUM_PID_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                   K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr):
+                   K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr,
+                   A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
@@ -1361,8 +1375,14 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
     HALF_N: tl.constexpr = BLOCK_N // 2
     acc_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
                                                    warps_per_cta=[2, 4])
-    a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
-    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    if A_COLUMN_MAJOR:
+        a_bases: tl.constexpr = _A_COLUMN_MAJOR_BASES_256 if BLOCK_M == 256 else _A_COLUMN_MAJOR_BASES_128
+    else:
+        a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
+    if B_ROW_MAJOR:
+        b_bases: tl.constexpr = _B_ROW_MAJOR_BASES_256 if BLOCK_N == 256 else _B_ROW_MAJOR_BASES_128
+    else:
+        b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
     et: tl.constexpr = a_ptr.dtype.element_ty
@@ -1381,7 +1401,10 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
     partial_br_off = partial_bl_off + HALF_N
     stream_pid = pid
     if HAS_STREAMK:
-        stream_pid = (pid % NUM_XCDS) * (NUM_CU // NUM_XCDS) + pid // NUM_XCDS
+        # Origami may choose a non-CU-sized grid.  Apply the XCD permutation
+        # only when it is a true permutation of that selected grid.
+        if NUM_PROGRAMS % NUM_XCDS == 0:
+            stream_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
         # Fuse TritonBLAS-style lock initialization into the resident kernel;
         # each program clears the slot it may later publish.
         tl.store(locks_ptr + stream_pid, 0, cache_modifier=".wt")
@@ -1389,8 +1412,9 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
 
     if HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS:
         # Fast path: each Stream-K program owns one full tile, so no loop is needed.
-        head_pid_m = stream_pid % NUM_PID_M
-        head_pid_n = stream_pid // NUM_PID_M
+        # Use the same bijection as the tail. Mixing an ungrouped head with a
+        # grouped tail makes their coordinate sets overlap for multi-wave grids.
+        head_pid_m, head_pid_n = _grouped_tile_coords(stream_pid, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
         _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
                           head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M,
                           BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
@@ -1801,6 +1825,8 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         HAS_N_TAIL=N % BN != 0,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
         num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -1913,8 +1939,119 @@ def streamk_matmul(a, b):
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS)
+                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
+                                                 A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1)
     return c
+
+
+def _origami_streamk_schedule(M, N, K, block_m, block_n, grid_size):
+    """Translate Origami's grid into the single Stream-K kernel schedule.
+
+    One full output-tile wave is kept ahead of the flattened Stream-K tail.
+    Thus grids below, equal to, and above the output tile count naturally
+    become persistent/Stream-K, data-parallel, and split-K launches.
+    """
+    num_pid_m = M // block_m
+    num_pid_n = N // block_n
+    total_tiles = num_pid_m * num_pid_n
+    k_pipe_steps = K // BLOCK_K
+    k_pipe_pairs = k_pipe_steps // 2
+    if grid_size == total_tiles:
+        return {
+            "HAS_STREAMK": False,
+            "HAS_K_TAIL": False,
+            "NUM_PROGRAMS": grid_size,
+            "NUM_FULL_TILES": total_tiles,
+            "NUM_PID_M": num_pid_m,
+            "NUM_PID_N": num_pid_n,
+            "K_PIPE_STEPS": k_pipe_steps,
+            "K_PIPE_PAIRS": k_pipe_pairs,
+            "UNITS_PER_PROGRAM": 0,
+            "REMAINDER_UNITS": 0,
+        }
+
+    num_full_tiles = grid_size if total_tiles >= grid_size else 0
+    streamk_tiles = total_tiles - num_full_tiles
+    total_streamk_units = streamk_tiles * k_pipe_pairs
+    if total_streamk_units < grid_size:
+        raise InvalidInput(
+            f"Origami grid {grid_size} over-splits {total_streamk_units} Stream-K work units"
+        )
+    return {
+        "HAS_STREAMK": True,
+        "HAS_K_TAIL": False,
+        "NUM_PROGRAMS": grid_size,
+        "NUM_FULL_TILES": num_full_tiles,
+        "NUM_PID_M": num_pid_m,
+        "NUM_PID_N": num_pid_n,
+        "K_PIPE_STEPS": k_pipe_steps,
+        "K_PIPE_PAIRS": k_pipe_pairs,
+        "UNITS_PER_PROGRAM": total_streamk_units // grid_size,
+        "REMAINDER_UNITS": total_streamk_units % grid_size,
+    }
+
+
+def _launch_origami_streamk(a, b, decision, out):
+    """Launch the registered Stream-K template with Origami's exact grid."""
+    M, K = a.shape
+    _, N = b.shape
+    BM, BN, BK = decision.tile
+    if BK != BLOCK_K or BM not in (128, 256) or BN not in (128, 256):
+        raise InvalidInput(f"unsupported registered Stream-K tile {decision.tile}")
+    if M % BM or N % BN or K < 2 * BK or K % (2 * BK):
+        raise InvalidInput(
+            f"registered {decision.kernel.name} requires M%{BM}=N%{BN}=0 "
+            f"and K%{2 * BK}=0; got ({M}, {N}, {K})"
+        )
+    schedule = _origami_streamk_schedule(M, N, K, BM, BN, decision.grid_size)
+    if schedule["HAS_STREAMK"] and decision.grid_size > decision.number_of_cus:
+        # The current fixup uses producer/consumer locks. Queuing more lock-
+        # participating workgroups than can be resident can deadlock when the
+        # consumers occupy the machine ahead of their producers.
+        raise InvalidInput(
+            f"Origami Stream-K grid {decision.grid_size} exceeds the resident-CU limit "
+            f"{decision.number_of_cus} for the lock-based reduction"
+        )
+    if schedule["HAS_STREAMK"]:
+        partials = torch.empty((decision.grid_size, BM, BN), device=a.device, dtype=torch.float32)
+        locks = torch.empty((decision.grid_size,), device=a.device, dtype=torch.int32)
+    else:
+        partials = locks = out
+    # wgmxcc is the model's cross-XCD mapping width.  An identity mapping is
+    # required when a non-divisible analytical grid cannot be permuted evenly.
+    num_xcds = (decision.wgmxcc if decision.wgmxcc > 0 and decision.grid_size % decision.wgmxcc == 0 else 1)
+    streamk_kernel[(decision.grid_size,)](
+        a,
+        b,
+        out,
+        partials,
+        locks,
+        _READY_VALUE,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        BLOCK_K=BK,
+        NUM_XCDS=num_xcds,
+        NUM_CU=decision.number_of_cus,
+        # GROUP_M is part of the measured macro-kernel template. Keep the
+        # model's WGM recommendation in LaunchDecision for telemetry until
+        # Origami can model this TLX template's cache behavior accurately.
+        GROUP_SIZE_M=decision.kernel.options["GROUP_M"],
+        **schedule,
+        num_warps=decision.kernel.options["num_warps"],
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+        llvm_fn_attrs=_LLVM_ATTRS,
+        A_COLUMN_MAJOR=a.stride(0) == 1,
+        B_ROW_MAJOR=b.stride(1) == 1,
+    )
+    return out
 
 
 # Persistent N160/N192 paths.
@@ -3275,7 +3412,7 @@ def _problem_for(a, b):
     m, k = a.shape
     _, n = b.shape
     if not (a.dtype in (torch.float16, torch.bfloat16) and b.dtype == a.dtype and a.is_cuda and a.device == b.device
-            and _device_arch(a.device) == "gfx950" and a.stride(1) == 1 and b.stride(0) == 1):
+            and _device_arch(a.device) == "gfx950" and 1 in a.stride() and 1 in b.stride()):
         return None
     return m, n, k
 
@@ -3438,7 +3575,7 @@ def _validate_out(a, b, out):
     return out
 
 
-def _origami_plan(a, b):
+def _origami_plan(a, b, *, variant):
     from .origami import OrigamiUnavailable, select_plan
 
     try:
@@ -3450,9 +3587,26 @@ def _origami_plan(a, b):
             a.device,
             a.stride(),
             b.stride(),
+            variant=variant,
         )
     except OrigamiUnavailable as error:
         raise InvalidInput(str(error)) from error
+
+
+def _register_config_from_origami(decision):
+    block_m, block_n, block_k = decision.tile
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": decision.wgm,
+        "NUM_XCDS": decision.kernel.options["NUM_XCDS"],
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": decision.kernel.options.get("waves_per_eu", 0),
+        "kpack": 1,
+        "num_warps": decision.kernel.options["num_warps"],
+        "num_stages": decision.kernel.options["num_stages"],
+    }
 
 
 def _bias_2d(input, a, b):
@@ -3485,17 +3639,28 @@ def mm(a, b, *, out=None, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
     if space not in ("heuristic", "origami"):
         raise InvalidInput("gfx950 mm supports space='heuristic' or space='origami'")
-    if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
+    if not a.is_cuda or 1 not in a.stride() or 1 not in b.stride():
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     m, k = a.shape
     _, n = b.shape
     out = _validate_out(a, b, out)
     if space == "origami":
+        decision = _origami_plan(a, b, variant="streamk")
+        block_m, block_n, block_k = decision.tile
+        if m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0:
+            return _launch_origami_streamk(a, b, decision, out)
+        # Tails are a distinct capability variant, not a shape-specific kernel
+        # preference. Origami still selects its tile from the registered tail
+        # macro-kernels; this path can disappear once Stream-K supports masking.
+        if k >= 2 * BLOCK_K and k * a.element_size() % 16 == 0:
+            tail = _origami_plan(a, b, variant="tail_lds")
+            return _launch_lds(a, b, SPLIT_K=1, TILE=tail.tile[:2], out=out)
+        tail = _origami_plan(a, b, variant="tail")
         return _launch_register_plan(
             a,
             b,
-            config=_origami_plan(a, b),
+            config=_register_config_from_origami(tail),
             out=out,
             _validated=True,
         )
@@ -3547,7 +3712,8 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
     bias = _bias_2d(input, a, b)
     output = _validate_out(a, b, out)
     if space == "origami":
-        plan = _origami_plan(a, b)
+        decision = _origami_plan(a, b, variant="fused_addmm")
+        plan = _register_config_from_origami(decision)
     else:
         m, k = a.shape
         _, n = b.shape

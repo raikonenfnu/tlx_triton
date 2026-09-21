@@ -139,12 +139,17 @@ def test_origami_plan_translation_uses_only_validated_tlx_knobs():
             assert kwargs["k"] == 4096
             assert kwargs["a_stride"] == (4096, 1)
             assert kwargs["b_stride"] == (1, 4096)
+            assert kwargs["streamk"]
             assert all(c.kwargs["waves_per_eu"] == 1 for c in kwargs["config_gen"])
             self._hardware = Hardware()
             self.macrotile_m = 256
             self.macrotile_n = 256
             self.macrotile_k = 64
+            self.grid_size = 192
             self.wgm = 8
+            self.wgmxcc = 8
+            self.wgmxccchunk = 4
+            self.number_of_cus = 256
 
     plan = select_plan(
         4096,
@@ -156,18 +161,12 @@ def test_origami_plan_translation_uses_only_validated_tlx_knobs():
         (1, 4096),
         selector_cls=FakeSelector,
     )
-    assert plan == {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "GROUP_M": 8,
-        "NUM_XCDS": 8,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-    }
+    assert plan.kernel.name == "streamk_256x256x64"
+    assert plan.tile == (256, 256, 64)
+    assert plan.grid_size == 192
+    assert plan.reduction == "unknown"
+    assert (plan.wgm, plan.wgmxcc, plan.wgmxccchunk) == (8, 8, 4)
+    assert plan.number_of_cus == 256
 
 
 def test_origami_plan_rejects_wrong_architecture():
@@ -179,7 +178,11 @@ def test_origami_plan_rejects_wrong_architecture():
             self.macrotile_m = 128
             self.macrotile_n = 128
             self.macrotile_k = 64
+            self.grid_size = 64
             self.wgm = 4
+            self.wgmxcc = 8
+            self.wgmxccchunk = 0
+            self.number_of_cus = 304
 
     with pytest.raises(ValueError, match="expected 'gfx950'"):
         select_plan(
@@ -192,6 +195,22 @@ def test_origami_plan_rejects_wrong_architecture():
             (1, 1024),
             selector_cls=Selector,
         )
+
+
+@pytest.mark.parametrize(
+    "tiles,grid,expected",
+    [
+        (64, 128, (0, True)),       # split-K: more workgroups than output tiles
+        (256, 256, (256, False)),   # data parallel: one workgroup per tile
+        (320, 213, (213, True)),    # genuine Stream-K tail
+        (1024, 256, (256, True)),   # persistent: several tiles per workgroup
+    ],
+)
+def test_origami_grid_drives_streamk_schedule(tiles, grid, expected):
+    # Use a 128x128 tile and choose M/N to produce exactly ``tiles`` tiles.
+    schedule = _gfx950._origami_streamk_schedule(128, tiles * 128, 1024, 128, 128, grid)
+    assert (schedule["NUM_FULL_TILES"], schedule["HAS_STREAMK"]) == expected
+    assert schedule["NUM_PROGRAMS"] == grid
 
 
 @pytest.mark.parametrize("op", ["mm", "addmm"])
@@ -228,7 +247,9 @@ def test_mm_rejects_unsupported_operands():
     assert supports(a, b)
     assert not supports(unsupported_a, unsupported_b)
     assert not supports(a.to(torch.float32), b.to(torch.float32))
-    assert not supports(a, b.contiguous())
+    # The gfx950 LDS producer now has explicit row-major-B and column-major-A
+    # swizzles, so either dense orientation is a supported operand layout.
+    assert supports(a, b.contiguous())
     with pytest.raises(InvalidInput, match="does not support"):
         mm(unsupported_a, unsupported_b)
     with pytest.raises(InvalidInput, match="does not support"):
