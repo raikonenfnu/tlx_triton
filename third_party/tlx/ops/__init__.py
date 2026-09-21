@@ -25,7 +25,8 @@ compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
 second. On implementations that provide it, pass `space="full"` explicitly to
 buy back the tuned configs, which are worth up to ~4x on small shapes. The
-gfx950 implementation currently provides only `"heuristic"`.
+gfx950 implementation also provides `"origami"` when the optional RAD Origami
+Python package is installed.
 
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
@@ -47,6 +48,18 @@ __all__ = [
 ]
 
 
+def _validate_mm_operands(a, b, op):
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput(f"tlx.ops.{op} expects two rank-2 tensors; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise InvalidInput(f"tlx.ops.{op} reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if a.dtype != b.dtype or a.device != b.device:
+        raise InvalidInput(f"tlx.ops.{op} operands must have the same dtype and device; "
+                           f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
+
+
 def mm(a, b, *, out=None, arch=None, space="heuristic"):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
@@ -55,15 +68,7 @@ def mm(a, b, *, out=None, arch=None, space="heuristic"):
     autotune space; unsupported spaces raise `InvalidInput`. See the module
     docstring.
     """
-    if a.ndim != 2 or b.ndim != 2:
-        raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
-                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    if a.shape[1] != b.shape[0]:
-        raise InvalidInput("tlx.ops.mm reduction dimensions must match; "
-                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    if a.dtype != b.dtype or a.device != b.device:
-        raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
-                           f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
+    _validate_mm_operands(a, b, "mm")
     fn, spec = impl_for("mm", arch)
     if spec.accepts is None:
         check_inputs(spec, dtype=a.dtype)
@@ -85,6 +90,11 @@ def addmm(input, a, b, *, out=None, arch=None, space="heuristic"):
     ``input`` may be ``(N,)`` or two-dimensional and broadcastable to the
     ``(M, N)`` result. Matrix and input scale factors are both one.
     """
+    _validate_mm_operands(a, b, "addmm")
+    if input.dtype != a.dtype or input.device != a.device:
+        raise InvalidInput("tlx.ops.addmm input must have the same dtype and device as its matrices; "
+                           f"got input=({input.dtype}, {input.device}), "
+                           f"matrices=({a.dtype}, {a.device})")
     fn, spec = impl_for("addmm", arch)
     check_inputs(spec, dtype=a.dtype)
     return fn(input, a, b, out=out, space=space)

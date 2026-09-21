@@ -119,8 +119,103 @@ def test_mm_rejects_invalid_space():
 
     a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
     b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
-    with pytest.raises(InvalidInput, match="space='heuristic'"):
+    with pytest.raises(InvalidInput, match="space='heuristic' or space='origami'"):
         mm(a, b, space="full")
+
+
+def test_origami_plan_translation_uses_only_validated_tlx_knobs():
+    from triton.tlx.ops.kernels.mm.origami import select_plan
+
+    class Arch:
+        name = "gfx950"
+
+    class Hardware:
+        arch = Arch()
+
+    class FakeSelector:
+        def __init__(self, **kwargs):
+            assert kwargs["m"] == 4096
+            assert kwargs["n"] == 4096
+            assert kwargs["k"] == 4096
+            assert kwargs["a_stride"] == (4096, 1)
+            assert kwargs["b_stride"] == (1, 4096)
+            assert all(c.kwargs["waves_per_eu"] == 1 for c in kwargs["config_gen"])
+            self._hardware = Hardware()
+            self.macrotile_m = 256
+            self.macrotile_n = 256
+            self.macrotile_k = 64
+            self.wgm = 8
+
+    plan = select_plan(
+        4096,
+        4096,
+        4096,
+        torch.float16,
+        torch.device("cuda:0"),
+        (4096, 1),
+        (1, 4096),
+        selector_cls=FakeSelector,
+    )
+    assert plan == {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "GROUP_M": 8,
+        "NUM_XCDS": 8,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
+
+
+def test_origami_plan_rejects_wrong_architecture():
+    from triton.tlx.ops.kernels.mm.origami import select_plan
+
+    class Selector:
+        def __init__(self, **_):
+            self._hardware = type("Hardware", (), {"arch": "gfx942"})()
+            self.macrotile_m = 128
+            self.macrotile_n = 128
+            self.macrotile_k = 64
+            self.wgm = 4
+
+    with pytest.raises(ValueError, match="expected 'gfx950'"):
+        select_plan(
+            1024,
+            1024,
+            1024,
+            torch.float16,
+            torch.device("cuda:0"),
+            (1024, 1),
+            (1, 1024),
+            selector_cls=Selector,
+        )
+
+
+@pytest.mark.parametrize("op", ["mm", "addmm"])
+def test_origami_space_matches_eager(op):
+    pytest.importorskip("origami")
+    from triton.tlx.ops import addmm as tlx_addmm
+    from triton.tlx.ops import mm as tlx_mm
+
+    m, n, k = 512, 512, 512
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    if op == "mm":
+        actual = tlx_mm(a, b, arch="gfx950", space="origami")
+        expected = torch.mm(a, b)
+    else:
+        bias = torch.randn((n,), device="cuda", dtype=torch.float16)
+        actual = tlx_addmm(bias, a, b, arch="gfx950", space="origami")
+        expected = torch.addmm(bias, a, b)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=2e-2 * expected.abs().max().item(),
+        rtol=2e-2,
+    )
 
 
 def test_mm_rejects_unsupported_operands():

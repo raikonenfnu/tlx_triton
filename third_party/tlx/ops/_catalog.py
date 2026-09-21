@@ -79,6 +79,14 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="addmm",
+        arch="gfx950",
+        variant="fused_register_gemm",
+        impl="triton.tlx.ops.kernels.mm.gfx950:addmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
         # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
         # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
         op="mm_torchtlx",

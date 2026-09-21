@@ -3040,7 +3040,7 @@ def _launch_persistent(a, b, out=None, specialization=None):
 
 # LocalSplitU path and public dispatch.
 
-__all__ = ["mm", "matmul", "supports"]
+__all__ = ["addmm", "matmul", "mm", "supports"]
 
 PERF_SHAPES = GFX950_FOCUS
 
@@ -3418,41 +3418,87 @@ def _launch_dispatch(a, b, out, dispatch):
     return _launch_validated(a, b, out, plan)
 
 
+def _validate_out(a, b, out):
+    m, _ = a.shape
+    _, n = b.shape
+    if out is None:
+        return torch.empty((m, n), device=a.device, dtype=a.dtype)
+    if not isinstance(out, torch.Tensor):
+        raise InvalidInput("gfx950 mm output must be a torch.Tensor; "
+                           f"got {type(out).__name__}")
+    if out.shape != (m, n):
+        raise InvalidInput(f"gfx950 mm output shape must be {(m, n)}; "
+                           f"got {tuple(out.shape)}")
+    if out.dtype != a.dtype:
+        raise InvalidInput(f"gfx950 mm output dtype must be {a.dtype}; "
+                           f"got {out.dtype}")
+    if out.device != a.device:
+        raise InvalidInput(f"gfx950 mm output device must be {a.device}; "
+                           f"got {out.device}")
+    return out
+
+
+def _origami_plan(a, b):
+    from .origami import OrigamiUnavailable, select_plan
+
+    try:
+        return select_plan(
+            a.shape[0],
+            b.shape[1],
+            a.shape[1],
+            a.dtype,
+            a.device,
+            a.stride(),
+            b.stride(),
+        )
+    except OrigamiUnavailable as error:
+        raise InvalidInput(str(error)) from error
+
+
+def _bias_2d(input, a, b):
+    m, _ = a.shape
+    _, n = b.shape
+    if not isinstance(input, torch.Tensor):
+        raise InvalidInput("gfx950 addmm input must be a torch.Tensor; "
+                           f"got {type(input).__name__}")
+    if input.device != a.device or input.dtype != a.dtype:
+        raise InvalidInput("gfx950 addmm input must match the matrix device and dtype")
+    try:
+        return torch.broadcast_to(input, (m, n))
+    except RuntimeError as error:
+        raise InvalidInput(
+            f"gfx950 addmm input shape {tuple(input.shape)} is not broadcastable to {(m, n)}"
+        ) from error
+
+
 def matmul(a, b, out=None):
     """Run the selected gfx950 GEMM specialization."""
     dispatch = _dispatch_for(a, b)
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    m, _ = a.shape
-    _, n = b.shape
-    if out is None:
-        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    elif not isinstance(out, torch.Tensor):
-        raise InvalidInput("gfx950 mm output must be a torch.Tensor; "
-                           f"got {type(out).__name__}")
-    elif out.shape != (m, n):
-        raise InvalidInput(f"gfx950 mm output shape must be {(m, n)}; "
-                           f"got {tuple(out.shape)}")
-    elif out.dtype != a.dtype:
-        raise InvalidInput(f"gfx950 mm output dtype must be {a.dtype}; "
-                           f"got {out.dtype}")
-    elif out.device != a.device:
-        raise InvalidInput(f"gfx950 mm output device must be {a.device}; "
-                           f"got {out.device}")
-
+    out = _validate_out(a, b, out)
     return _launch_dispatch(a, b, out, dispatch)
 
 
-def mm(a, b, *, space="heuristic"):
+def mm(a, b, *, out=None, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
-    if space != "heuristic":
-        raise InvalidInput("gfx950 mm currently supports space='heuristic' only")
+    if space not in ("heuristic", "origami"):
+        raise InvalidInput("gfx950 mm supports space='heuristic' or space='origami'")
     if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     m, k = a.shape
     _, n = b.shape
+    out = _validate_out(a, b, out)
+    if space == "origami":
+        return _launch_register_plan(
+            a,
+            b,
+            config=_origami_plan(a, b),
+            out=out,
+            _validated=True,
+        )
     dispatch = _dispatch_plan(
         m,
         n,
@@ -3463,7 +3509,6 @@ def mm(a, b, *, space="heuristic"):
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
@@ -3487,3 +3532,33 @@ def mm(a, b, *, space="heuristic"):
             out=out,
         )
     return _launch_validated(a, b, out, plan)
+
+
+def addmm(input, a, b, *, out=None, space="heuristic"):
+    """Compute ``input + a @ b`` with the gfx950 register GEMM epilogue.
+
+    ``space='origami'`` selects the tile analytically.  The dependency-free
+    heuristic uses the existing bounded register-plan policy.
+    """
+    if space not in ("heuristic", "origami"):
+        raise InvalidInput("gfx950 addmm supports space='heuristic' or space='origami'")
+    if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
+        raise InvalidInput("gfx950 addmm requires row-major A and column-major B")
+    bias = _bias_2d(input, a, b)
+    output = _validate_out(a, b, out)
+    if space == "origami":
+        plan = _origami_plan(a, b)
+    else:
+        m, k = a.shape
+        _, n = b.shape
+        plan = _register_plan_for_shape(m, n, k)
+        if plan is None:
+            plan = _intermediate_register_config(m, n, k)
+    return _launch_register_plan(
+        a,
+        b,
+        bias=bias,
+        config=plan,
+        out=output,
+        _validated=True,
+    )
