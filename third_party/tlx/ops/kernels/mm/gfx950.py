@@ -1264,10 +1264,20 @@ def a16w16_8wave(
 
 
 @triton.jit
-def _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
-                      stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M: tl.constexpr,
-                      BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
-                      HAS_K_TAIL: tl.constexpr, c_layout: tl.constexpr):
+def _streamk_add_bias(acc, bias_ptr, offs_m, offs_n, stride_bias_m, stride_bias_n, ADD_BIAS: tl.constexpr):
+    """Apply the fused epilogue only in the workgroup that owns the output."""
+    if ADD_BIAS:
+        bias = tl.load(bias_ptr + offs_m[:, None] * stride_bias_m + offs_n[None, :] * stride_bias_n)
+        acc += bias.to(tl.float32)
+    return acc
+
+
+@triton.jit
+def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m,
+                      pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm,
+                      stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                      K_PIPE_STEPS: tl.constexpr, HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr,
+                      c_layout: tl.constexpr):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -1303,6 +1313,10 @@ def _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, 
             acc_tr = tl.dot(a_top, b_right, acc_tr)
             acc_br = tl.dot(a_bot, b_right, acc_br)
     et: tl.constexpr = c_ptr.dtype.element_ty
+    acc_tl = _streamk_add_bias(acc_tl, bias_ptr, offs_m_top, offs_n_left, stride_bias_m, stride_bias_n, ADD_BIAS)
+    acc_bl = _streamk_add_bias(acc_bl, bias_ptr, offs_m_bot, offs_n_left, stride_bias_m, stride_bias_n, ADD_BIAS)
+    acc_tr = _streamk_add_bias(acc_tr, bias_ptr, offs_m_top, offs_n_right, stride_bias_m, stride_bias_n, ADD_BIAS)
+    acc_br = _streamk_add_bias(acc_br, bias_ptr, offs_m_bot, offs_n_right, stride_bias_m, stride_bias_n, ADD_BIAS)
     tl.store(c_ptr + offs_m_top[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
              tlx.require_layout(acc_tl.to(et), c_layout))
     tl.store(c_ptr + offs_m_bot[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
@@ -1355,20 +1369,23 @@ def _reduce_and_store_streamk_quadrant(
 
 
 @triton.jit
-def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K, stride_am, stride_ak, stride_bk,
-                   stride_bn, stride_cm, stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K, stride_am, stride_ak,
+                   stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm, stride_cn, BLOCK_M: tl.constexpr,
+                   BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                    NUM_XCDS: tl.constexpr, NUM_CU: tl.constexpr, NUM_PROGRAMS: tl.constexpr, HAS_STREAMK: tl.constexpr,
                    NUM_FULL_TILES: tl.constexpr, HAS_K_TAIL: tl.constexpr, NUM_PID_M: tl.constexpr,
                    NUM_PID_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
                    K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr,
-                   A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
+                   A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, ADD_BIAS: tl.constexpr,
+                   COOPERATIVE_FIXUP: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
     # When every flattened interval is one equal segment of one tile, all
     # contributors can participate in fixup instead of serializing it in the
     # tile owner. This is a reduction optimization, not a separate schedule.
-    DISTRIBUTED_FIXUP: tl.constexpr = (HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS and REMAINDER_UNITS == 0
+    DISTRIBUTED_FIXUP: tl.constexpr = (COOPERATIVE_FIXUP and HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS
+                                       and REMAINDER_UNITS == 0
                                        and K_PIPE_PAIRS % max(UNITS_PER_PROGRAM, 1) == 0
                                        and (contributors_per_tile == 2 or contributors_per_tile == 4))
     HALF_M: tl.constexpr = BLOCK_M // 2
@@ -1415,9 +1432,10 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
         # Use the same bijection as the tail. Mixing an ungrouped head with a
         # grouped tail makes their coordinate sets overlap for multi-wave grids.
         head_pid_m, head_pid_n = _grouped_tile_coords(stream_pid, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
-        _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, head_pid_m,
-                          head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M,
-                          BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+        _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                          head_pid_m, head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m,
+                          stride_bias_n, stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL,
+                          ADD_BIAS, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1431,9 +1449,10 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
             else:
                 tile_id = (tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
             pid_m, pid_n = _grouped_tile_coords(tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
-            _matmul_full_tile(a_ptr, b_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, pid_m, pid_n, K,
-                              stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, BLOCK_M, BLOCK_N,
-                              BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+            _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                              pid_m, pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m,
+                              stride_bias_n, stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS,
+                              HAS_K_TAIL, ADD_BIAS, C)
     if not HAS_STREAMK:
         return
 
@@ -1572,6 +1591,14 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                         tl.load(partials_ptr + peer_base + partial_br_off, cache_modifier=".cv"), acc_layout, pin=False)
                     covered_end += UNITS_PER_PROGRAM + (next_pid < REMAINDER_UNITS)
                     next_pid += 1
+                acc_tl = _streamk_add_bias(acc_tl, bias_ptr, tile_offs_m_top, tile_offs_n_left,
+                                           stride_bias_m, stride_bias_n, ADD_BIAS)
+                acc_bl = _streamk_add_bias(acc_bl, bias_ptr, tile_offs_m_bot, tile_offs_n_left,
+                                           stride_bias_m, stride_bias_n, ADD_BIAS)
+                acc_tr = _streamk_add_bias(acc_tr, bias_ptr, tile_offs_m_top, tile_offs_n_right,
+                                           stride_bias_m, stride_bias_n, ADD_BIAS)
+                acc_br = _streamk_add_bias(acc_br, bias_ptr, tile_offs_m_bot, tile_offs_n_right,
+                                           stride_bias_m, stride_bias_n, ADD_BIAS)
                 tl.store(c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
                          tlx.require_layout(acc_tl.to(et), C))
                 tl.store(c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
@@ -1935,12 +1962,14 @@ def streamk_matmul(a, b):
         locks = torch.empty((NUM_CU, ), device=a.device, dtype=torch.int32)
     else:
         partials = locks = c
-    streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, c, partials, locks, _READY_VALUE, K, a.stride(0), a.stride(1),
-                                                 b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
-                                                 BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
-                                                 GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
-                                                 A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1)
+    streamk_kernel[(schedule["NUM_PROGRAMS"], )](a, b, c, c, partials, locks, _READY_VALUE, K, a.stride(0),
+                                                 a.stride(1), b.stride(0), b.stride(1), 0, 0, c.stride(0),
+                                                 c.stride(1), BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BLOCK_K,
+                                                 NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU, GROUP_SIZE_M=GROUP_SIZE_M,
+                                                 **schedule, num_warps=NUM_WARPS, num_stages=1,
+                                                 matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
+                                                 A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1,
+                                                 ADD_BIAS=False, COOPERATIVE_FIXUP=True)
     return c
 
 
@@ -1954,12 +1983,15 @@ def _origami_streamk_schedule(M, N, K, block_m, block_n, grid_size):
     num_pid_m = M // block_m
     num_pid_n = N // block_n
     total_tiles = num_pid_m * num_pid_n
-    k_pipe_steps = K // BLOCK_K
+    # The async hot loop consumes pairs of K64 steps. A data-parallel launch
+    # may finish an odd/full partial tail in registers; distributed Stream-K
+    # currently requires an exact paired-K domain.
+    k_pipe_steps = (K // BLOCK_K // 2) * 2
     k_pipe_pairs = k_pipe_steps // 2
     if grid_size == total_tiles:
         return {
             "HAS_STREAMK": False,
-            "HAS_K_TAIL": False,
+            "HAS_K_TAIL": K != k_pipe_steps * BLOCK_K,
             "NUM_PROGRAMS": grid_size,
             "NUM_FULL_TILES": total_tiles,
             "NUM_PID_M": num_pid_m,
@@ -1991,17 +2023,20 @@ def _origami_streamk_schedule(M, N, K, block_m, block_n, grid_size):
     }
 
 
-def _launch_origami_streamk(a, b, decision, out):
+def _launch_origami_streamk(a, b, decision, out, bias=None):
     """Launch the registered Stream-K template with Origami's exact grid."""
     M, K = a.shape
     _, N = b.shape
     BM, BN, BK = decision.tile
     if BK != BLOCK_K or BM not in (128, 256) or BN not in (128, 256):
         raise InvalidInput(f"unsupported registered Stream-K tile {decision.tile}")
-    if M % BM or N % BN or K < 2 * BK or K % (2 * BK):
+    total_tiles = (M // BM) * (N // BN) if M % BM == 0 and N % BN == 0 else 0
+    has_k_tail = K % (2 * BK) != 0
+    if M % BM or N % BN or K < 2 * BK or (has_k_tail and decision.grid_size != total_tiles):
         raise InvalidInput(
             f"registered {decision.kernel.name} requires M%{BM}=N%{BN}=0 "
-            f"and K%{2 * BK}=0; got ({M}, {N}, {K})"
+            f"and either K%{2 * BK}=0 or a data-parallel grid; got ({M}, {N}, {K}) "
+            f"with grid={decision.grid_size}"
         )
     schedule = _origami_streamk_schedule(M, N, K, BM, BN, decision.grid_size)
     if schedule["HAS_STREAMK"] and decision.grid_size > decision.number_of_cus:
@@ -2020,9 +2055,13 @@ def _launch_origami_streamk(a, b, decision, out):
     # wgmxcc is the model's cross-XCD mapping width.  An identity mapping is
     # required when a non-divisible analytical grid cannot be permuted evenly.
     num_xcds = (decision.wgmxcc if decision.wgmxcc > 0 and decision.grid_size % decision.wgmxcc == 0 else 1)
+    bias_ptr = out if bias is None else bias
+    stride_bias_m = 0 if bias is None else bias.stride(0)
+    stride_bias_n = 0 if bias is None else bias.stride(1)
     streamk_kernel[(decision.grid_size,)](
         a,
         b,
+        bias_ptr,
         out,
         partials,
         locks,
@@ -2032,6 +2071,8 @@ def _launch_origami_streamk(a, b, decision, out):
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        stride_bias_m,
+        stride_bias_n,
         out.stride(0),
         out.stride(1),
         BLOCK_M=BM,
@@ -2050,6 +2091,8 @@ def _launch_origami_streamk(a, b, decision, out):
         llvm_fn_attrs=_LLVM_ATTRS,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
+        ADD_BIAS=bias is not None,
+        COOPERATIVE_FIXUP=bool(decision.kernel.options["cooperative_fixup"]),
     )
     return out
 
@@ -3650,6 +3693,11 @@ def mm(a, b, *, out=None, space="heuristic"):
         block_m, block_n, block_k = decision.tile
         if m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0:
             return _launch_origami_streamk(a, b, decision, out)
+        if k >= 2 * block_k:
+            tail_data = _origami_plan(a, b, variant="tail_data")
+            tail_m, tail_n, _ = tail_data.tile
+            if m % tail_m == 0 and n % tail_n == 0:
+                return _launch_origami_streamk(a, b, tail_data, out)
         # Tails are a distinct capability variant, not a shape-specific kernel
         # preference. Origami still selects its tile from the registered tail
         # macro-kernels; this path can disappear once Stream-K supports masking.
@@ -3700,10 +3748,12 @@ def mm(a, b, *, out=None, space="heuristic"):
 
 
 def addmm(input, a, b, *, out=None, space="heuristic"):
-    """Compute ``input + a @ b`` with the gfx950 register GEMM epilogue.
+    """Compute ``input + a @ b`` with a fused gfx950 GEMM epilogue.
 
-    ``space='origami'`` selects the tile analytically.  The dependency-free
-    heuristic uses the existing bounded register-plan policy.
+    ``space='origami'`` uses the grid-driven fused Stream-K macro-kernel when
+    its exact-tile capability covers the problem, otherwise the explicit
+    fused-register variant. The dependency-free heuristic retains the bounded
+    register-plan policy.
     """
     if space not in ("heuristic", "origami"):
         raise InvalidInput("gfx950 addmm supports space='heuristic' or space='origami'")
@@ -3712,6 +3762,13 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
     bias = _bias_2d(input, a, b)
     output = _validate_out(a, b, out)
     if space == "origami":
+        streamk = _origami_plan(a, b, variant="fused_streamk")
+        block_m, block_n, block_k = streamk.tile
+        m, k = a.shape
+        _, n = b.shape
+        if (m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0
+                and not _needs_i64_offsets(a) and not _needs_i64_offsets(b)):
+            return _launch_origami_streamk(a, b, streamk, output, bias=bias)
         decision = _origami_plan(a, b, variant="fused_addmm")
         plan = _register_config_from_origami(decision)
     else:

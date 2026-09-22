@@ -162,6 +162,7 @@ def test_origami_plan_translation_uses_only_validated_tlx_knobs():
         selector_cls=FakeSelector,
     )
     assert plan.kernel.name == "streamk_256x256x64"
+    assert plan.kernel.options["cooperative_fixup"] == 0
     assert plan.tile == (256, 256, 64)
     assert plan.grid_size == 192
     assert plan.reduction == "unknown"
@@ -211,6 +212,14 @@ def test_origami_grid_drives_streamk_schedule(tiles, grid, expected):
     schedule = _gfx950._origami_streamk_schedule(128, tiles * 128, 1024, 128, 128, grid)
     assert (schedule["NUM_FULL_TILES"], schedule["HAS_STREAMK"]) == expected
     assert schedule["NUM_PROGRAMS"] == grid
+
+
+def test_origami_data_parallel_schedule_handles_k_tail():
+    schedule = _gfx950._origami_streamk_schedule(1024, 1024, 43500, 256, 256, 16)
+    assert schedule["NUM_PROGRAMS"] == schedule["NUM_FULL_TILES"] == 16
+    assert not schedule["HAS_STREAMK"]
+    assert schedule["HAS_K_TAIL"]
+    assert schedule["K_PIPE_STEPS"] * 64 == 43392
 
 
 @pytest.mark.parametrize("op", ["mm", "addmm"])

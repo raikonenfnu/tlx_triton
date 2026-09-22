@@ -78,10 +78,33 @@ def _register_kernel(name, tile, *, variant="register", model_waves_per_eu=1, **
 # Origami grids smaller than, equal to, or larger than the output-tile count as
 # persistent/Stream-K, data-parallel, or split-K schedules respectively.
 _STREAMK_KERNELS = (
-    MacroKernel("streamk_128x128x64", "streamk", (128, 128, 64), "streamk", _options(waves_per_eu=1),
-                _options(num_warps=8, GROUP_M=4)),
-    MacroKernel("streamk_256x256x64", "streamk", (256, 256, 64), "streamk", _options(waves_per_eu=1),
-                _options(num_warps=8, GROUP_M=4)),
+    MacroKernel("streamk_128x128x64", "streamk", (128, 128, 64), "streamk",
+                _options(waves_per_eu=1, streamk_grid=1),
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0)),
+    MacroKernel("streamk_256x256x64", "streamk", (256, 256, 64), "streamk",
+                _options(waves_per_eu=1, streamk_grid=1),
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0)),
+)
+
+
+_FUSED_STREAMK_KERNELS = tuple(
+    dataclasses.replace(
+        kernel,
+        name=kernel.name.replace("streamk_", "streamk_fused_"),
+        variant="fused_streamk",
+    )
+    for kernel in _STREAMK_KERNELS
+)
+
+
+_TAIL_DATA_KERNELS = tuple(
+    dataclasses.replace(
+        kernel,
+        name=kernel.name.replace("streamk_", "streamk_tail_data_"),
+        variant="tail_data",
+        model=_options(waves_per_eu=kernel.model["waves_per_eu"], streamk_grid=0),
+    )
+    for kernel in _STREAMK_KERNELS
 )
 
 
@@ -126,6 +149,8 @@ _TAIL_LDS_KERNELS = (
 
 MACRO_KERNEL_REGISTRY = MappingProxyType({
     ("gfx950", "streamk"): _STREAMK_KERNELS,
+    ("gfx950", "fused_streamk"): _FUSED_STREAMK_KERNELS,
+    ("gfx950", "tail_data"): _TAIL_DATA_KERNELS,
     ("gfx950", "fused_addmm"): _FUSED_ADDMM_KERNELS,
     ("gfx950", "tail"): _TAIL_KERNELS,
     ("gfx950", "tail_lds"): _TAIL_LDS_KERNELS,
@@ -205,7 +230,7 @@ def _select(selector_cls, m, n, k, dtype, device, a_stride, b_stride, variant):
     except KeyError as error:
         raise ValueError(f"unknown Origami problem variant {variant!r} for gfx950") from error
 
-    streamk = variant == "streamk"
+    streamk = all(kernel.model.get("streamk_grid", 0) for kernel in kernels)
     selector = selector_cls(
         config_gen=_model_configs(kernels),
         m=m,
