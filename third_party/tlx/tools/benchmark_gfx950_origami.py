@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
-"""Benchmark public TLX+Origami mm/addmm against torch on gfx950.
+"""Benchmark TLX+Origami mm/addmm and the suite BMM against torch on gfx950.
 
 The named suites reproduce the in-scope shapes and layouts from tlx_triton
-issues #20, #21, and #22.  Issue #21's BMM case is intentionally excluded:
-BMM needs its own macro-kernel registry domain.
+issues #20, #21, and #22.  The BMM case exercises the existing optimized
+shared-A tutorial kernel; it is coverage for issue #21, not part of the
+Origami mm/addmm registry.
 """
 
 from __future__ import annotations
@@ -12,12 +12,17 @@ import argparse
 import dataclasses
 import gc
 import json
-from pathlib import Path
 import statistics
+from pathlib import Path
 
 import torch
 import triton
-
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    bmm as tlx_shared_a_bmm,
+)
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    make_bmm_inputs,
+)
 from triton.tlx.ops import addmm as tlx_addmm
 from triton.tlx.ops import mm as tlx_mm
 from triton.tlx.ops.kernels.mm import gfx950
@@ -33,6 +38,7 @@ class Case:
     k: int
     layout_a: str
     layout_b: str
+    batch: int = 1
 
 
 CASES = (
@@ -53,6 +59,7 @@ CASES = (
     Case("20", "gemm_1024x1024x43500", "mm", 1024, 1024, 43500, "column", "row"),
     Case("21", "priority_addmm_1024x20480x6144", "addmm", 1024, 20480, 6144, "row", "column"),
     Case("21", "priority_addmm_262144x262x294", "addmm", 262144, 262, 294, "row", "column"),
+    Case("21", "priority_bmm_b3072_448x160x931", "bmm", 448, 160, 931, "shared-row", "row", batch=3072),
     Case("21", "priority_addmm_2252800x256x512", "addmm", 2252800, 256, 512, "row", "column"),
     Case("21", "priority_addmm_3072x15360x4096", "addmm", 3072, 15360, 4096, "row", "column"),
     Case("21", "priority_addmm_3072x4096x25344", "addmm", 3072, 4096, 25344, "row", "column"),
@@ -121,21 +128,48 @@ def _selection(case: Case, a: torch.Tensor, b: torch.Tensor) -> tuple[str, objec
 
 
 def _run_case(case: Case, args) -> dict:
-    a = _matrix(case.m, case.k, case.layout_a, args.seed)
-    b = _matrix(case.k, case.n, case.layout_b, args.seed + 1)
-    bias = _matrix(1, case.n, "row", args.seed + 2).reshape(case.n) if case.op == "addmm" else None
-    if case.op == "mm":
-        tlx_fn = lambda: tlx_mm(a, b, arch="gfx950", space="origami")
-        torch_fn = lambda: torch.mm(a, b)
+    lhs = None
+    rhs = None
+    input_bias = None
+    if case.op == "bmm":
+        lhs, rhs = make_bmm_inputs(
+            case.batch, case.m, case.n, case.k, "cuda", dtype=torch.bfloat16, seed=args.seed
+        )
+        tlx_fn = lambda: tlx_shared_a_bmm(lhs, rhs)
+        torch_fn = lambda: torch.bmm(lhs, rhs)
     else:
-        tlx_fn = lambda: tlx_addmm(bias, a, b, arch="gfx950", space="origami")
-        torch_fn = lambda: torch.addmm(bias, a, b)
+        lhs = _matrix(case.m, case.k, case.layout_a, args.seed)
+        rhs = _matrix(case.k, case.n, case.layout_b, args.seed + 1)
+        input_bias = _matrix(1, case.n, "row", args.seed + 2).reshape(case.n) if case.op == "addmm" else None
+    if case.op == "mm":
+        tlx_fn = lambda: tlx_mm(lhs, rhs, arch="gfx950", space="origami")
+        torch_fn = lambda: torch.mm(lhs, rhs)
+    elif case.op == "addmm":
+        tlx_fn = lambda: tlx_addmm(input_bias, lhs, rhs, arch="gfx950", space="origami")
+        torch_fn = lambda: torch.addmm(input_bias, lhs, rhs)
 
     actual = tlx_fn()
     expected = torch_fn()
     delta = (actual.float() - expected.float()).abs()
     correct = bool(torch.allclose(actual, expected, rtol=0.02, atol=0.02))
-    mode, decision = _selection(case, a, b)
+    if case.op == "bmm":
+        mode = "shared_a_bmm"
+        selection = {
+            "candidate": "bmm_shared_a_row",
+            "tile": (224, 160, 32),
+            "grid": case.batch * triton.cdiv(case.m, 224) * triton.cdiv(case.n, 160),
+            "reduction": "none",
+            "wgm": 256,
+        }
+    else:
+        mode, decision = _selection(case, lhs, rhs)
+        selection = {
+            "candidate": decision.kernel.name,
+            "tile": decision.tile,
+            "grid": decision.grid_size,
+            "reduction": decision.reduction,
+            "wgm": decision.wgm,
+        }
     tlx_samples, warmup_launches, timed_launches = _samples(tlx_fn, args)
     torch_samples, _, _ = _samples(torch_fn, args)
     tlx_ms = statistics.median(tlx_samples)
@@ -143,11 +177,7 @@ def _run_case(case: Case, args) -> dict:
     result = {
         **dataclasses.asdict(case),
         "mode": mode,
-        "candidate": decision.kernel.name,
-        "tile": decision.tile,
-        "grid": decision.grid_size,
-        "reduction": decision.reduction,
-        "wgm": decision.wgm,
+        **selection,
         "correct": correct,
         "max_abs": float(delta.max()),
         "tlx_samples_ms": tlx_samples,
@@ -158,7 +188,8 @@ def _run_case(case: Case, args) -> dict:
         "warmup_launches": warmup_launches,
         "timed_launches": timed_launches,
     }
-    del a, b, bias, actual, expected, delta
+    tlx_fn = torch_fn = None
+    lhs = rhs = input_bias = actual = expected = delta = None
     gc.collect()
     torch.cuda.empty_cache()
     return result
@@ -188,7 +219,7 @@ def main() -> None:
         print(f"[{case.issue}] {case.name}", flush=True)
         try:
             result = _run_case(case, args)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - keep running and report per-case failures
             result = {**dataclasses.asdict(case), "error": f"{type(error).__name__}: {error}"}
         results.append(result)
         print(json.dumps(result, sort_keys=True), flush=True)
@@ -202,7 +233,7 @@ def main() -> None:
             "cache": "Triton benchmark cache flushed before every timed launch",
             "dtype": "bfloat16",
         },
-        "excluded": ["#21 priority_bmm_b3072_448x160x931: BMM is outside the mm/addmm registry"],
+        "excluded": [],
         "results": results,
     }
     if args.output:
