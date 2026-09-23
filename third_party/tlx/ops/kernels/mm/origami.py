@@ -58,6 +58,8 @@ class LaunchDecision:
     wgmxcc: int
     wgmxccchunk: int
     number_of_cus: int
+    model_grid_size: int | None = None
+    grid_policy: str = "origami"
 
     @property
     def tile(self) -> tuple[int, int, int]:
@@ -83,10 +85,16 @@ def _register_kernel(name, tile, *, variant="register", model_waves_per_eu=1, **
 _STREAMK_KERNELS = (
     MacroKernel("streamk_128x128x64", "streamk", (128, 128, 64), "adaptive_streamk",
                 _options(waves_per_eu=1, streamk_grid=1),
-                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1)),
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1,
+                         min_k_tiles_per_split=16, producer_cost=16, reduction_cost=3,
+                         resident_streamk_tail=1, min_streamk_pairs=48,
+                         max_persistent_k=1024, rebase_a=1, max_rebased_k=1024)),
     MacroKernel("streamk_256x256x64", "streamk", (256, 256, 64), "adaptive_streamk",
                 _options(waves_per_eu=1, streamk_grid=1),
-                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1)),
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1,
+                         min_k_tiles_per_split=16, producer_cost=16, reduction_cost=3,
+                         resident_streamk_tail=1, min_streamk_pairs=48,
+                         max_persistent_k=1024, rebase_a=1, max_rebased_k=1024)),
 )
 
 
@@ -95,6 +103,7 @@ _FUSED_STREAMK_KERNELS = tuple(
         kernel,
         name=kernel.name.replace("streamk_", "streamk_fused_"),
         variant="fused_streamk",
+        options=_options(**kernel.options, min_k=384),
     )
     for kernel in _STREAMK_KERNELS
 )
@@ -127,8 +136,30 @@ _FUSED_ADDMM_KERNELS = (
                      GROUP_M=8, NUM_XCDS=1, num_warps=8, num_stages=3),
     _register_kernel("register_fused_256x128x64", (256, 128, 64), variant="fused_addmm",
                      GROUP_M=4, NUM_XCDS=1, num_warps=8, num_stages=2),
+    _register_kernel("register_fused_256x128x32", (256, 128, 32), variant="fused_addmm",
+                     model_waves_per_eu=2, GROUP_M=4, NUM_XCDS=8, num_warps=4,
+                     num_stages=3, waves_per_eu=2, adaptive_xcd=1),
     _register_kernel("register_fused_256x256x64", (256, 256, 64), variant="fused_addmm",
                      GROUP_M=4, NUM_XCDS=8, num_warps=8, num_stages=2),
+)
+
+
+# Short K cannot amortize the direct-to-LDS Stream-K pipeline.  Keep its
+# register-resident candidates in a separate semantic selection domain so the
+# model does not compare unlike execution mechanisms using tile geometry alone.
+_FUSED_SHORT_K_KERNELS = (
+    _register_kernel("register_short_128x128x64", (128, 128, 64), variant="fused_short_k",
+                     GROUP_M=16, NUM_XCDS=1, num_warps=4, num_stages=2),
+    _register_kernel("register_short_256x128x32", (256, 128, 32), variant="fused_short_k",
+                     model_waves_per_eu=2, GROUP_M=4, NUM_XCDS=8, num_warps=4,
+                     num_stages=3, waves_per_eu=2, adaptive_xcd=1),
+)
+
+
+_FUSED_SHORT_K_TAIL_KERNELS = (
+    _register_kernel("register_short_tail_128x128x64", (128, 128, 64),
+                     variant="fused_short_k_tail", GROUP_M=16, NUM_XCDS=1,
+                     num_warps=4, num_stages=2),
 )
 
 
@@ -150,13 +181,26 @@ _TAIL_LDS_KERNELS = (
 )
 
 
+_FUSED_TAIL_LDS_KERNELS = tuple(
+    dataclasses.replace(
+        kernel,
+        name=kernel.name.replace("lds_tail_", "lds_fused_tail_"),
+        variant="fused_tail_lds",
+    )
+    for kernel in _TAIL_LDS_KERNELS
+)
+
+
 MACRO_KERNEL_REGISTRY = MappingProxyType({
     ("gfx950", "streamk"): _STREAMK_KERNELS,
     ("gfx950", "fused_streamk"): _FUSED_STREAMK_KERNELS,
     ("gfx950", "tail_data"): _TAIL_DATA_KERNELS,
     ("gfx950", "fused_addmm"): _FUSED_ADDMM_KERNELS,
+    ("gfx950", "fused_short_k"): _FUSED_SHORT_K_KERNELS,
+    ("gfx950", "fused_short_k_tail"): _FUSED_SHORT_K_TAIL_KERNELS,
     ("gfx950", "tail"): _TAIL_KERNELS,
     ("gfx950", "tail_lds"): _TAIL_LDS_KERNELS,
+    ("gfx950", "fused_tail_lds"): _FUSED_TAIL_LDS_KERNELS,
 })
 
 
@@ -226,6 +270,124 @@ def _reduction_name(selector: Any, *, streamk: bool) -> str:
     return str(reduction).rsplit(".", 1)[-1].lower()
 
 
+def _parallel_workspace_grid(m, n, k, kernel, number_of_cus, model_grid_size, reduction):
+    """Apply the registered workspace-reduction cost to a parallel grid.
+
+    Origami 0.1 models a generic Stream-K workgroup, while the TLX inter-wave
+    implementation has a concrete minimum K slice and FP32 reduction cost.
+    Keep those template properties in the registry and choose among exact,
+    dependency-free split factors.  This is a macro-kernel cost constraint,
+    not a problem-shape table; ``model_grid_size`` remains in the decision for
+    diagnostics and can become authoritative once Origami accepts these fields.
+    """
+    options = kernel.options
+    if reduction != "parallel" or not options.get("parallel_workspace", 0):
+        return model_grid_size, "origami"
+    block_m, block_n, block_k = kernel.tile
+    output_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
+    if output_tiles <= 0 or output_tiles >= number_of_cus or k % block_k:
+        return model_grid_size, "origami"
+    k_tiles = k // block_k
+    min_k_tiles = options.get("min_k_tiles_per_split", 1)
+    max_split = min(number_of_cus // output_tiles, k_tiles // min_k_tiles)
+    producer_cost = options.get("producer_cost", 1)
+    reduction_cost = options.get("reduction_cost", 0)
+    best = None
+    for split_k in range(2, max_split + 1):
+        if k_tiles % split_k:
+            continue
+        # The current workspace addressing is signed-i32.  Treat that as an
+        # executable capability rather than waiting for allocation to fail.
+        if split_k * m * n * 4 > (1 << 31) - 1:
+            continue
+        cost = producer_cost * (k_tiles // split_k) + reduction_cost * output_tiles * split_k
+        candidate = (cost, -output_tiles * split_k, split_k)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return model_grid_size, "origami"
+    return output_tiles * best[2], "registry_parallel_cost"
+
+
+def _resident_streamk_grid(m, n, k, kernel, number_of_cus, grid_size, reduction, grid_policy):
+    """Use the registered one-wave owner/fixup regime for a partial second wave."""
+    options = kernel.options
+    if reduction == "parallel" or not options.get("resident_streamk_tail", 0):
+        return grid_size, grid_policy
+    block_m, block_n, block_k = kernel.tile
+    if m % block_m or n % block_n or k % (2 * block_k):
+        return grid_size, grid_policy
+    output_tiles = (m // block_m) * (n // block_n)
+    k_pairs = k // (2 * block_k)
+    if (
+        number_of_cus < output_tiles < 2 * number_of_cus
+        and k_pairs >= options.get("min_streamk_pairs", 1)
+    ):
+        return number_of_cus, "registry_resident_tail"
+    return grid_size, grid_policy
+
+
+def _short_k_data_parallel_grid(m, n, k, kernel, number_of_cus, grid_size, reduction, grid_policy):
+    """Avoid wrapping short independent tiles in a persistent traversal."""
+    max_persistent_k = kernel.options.get("max_persistent_k", 0)
+    if reduction == "parallel" or not max_persistent_k or k > max_persistent_k:
+        return grid_size, grid_policy
+    block_m, block_n, block_k = kernel.tile
+    if m % block_m or n % block_n or k % (2 * block_k):
+        return grid_size, grid_policy
+    output_tiles = (m // block_m) * (n // block_n)
+    if output_tiles > number_of_cus:
+        return output_tiles, "registry_data_parallel"
+    return grid_size, grid_policy
+
+
+def _max_byte_offset(shape, stride, element_size):
+    return sum((size - 1) * dim_stride for size, dim_stride in zip(shape, stride)) * element_size
+
+
+def _rebased_persistent_grid(
+    m,
+    n,
+    k,
+    kernel,
+    number_of_cus,
+    grid_size,
+    reduction,
+    grid_policy,
+    a_stride,
+    b_stride,
+    element_size,
+):
+    """Use local A resource bases when only the tall operand exceeds i32.
+
+    This is an executable address-space capability of the registered template,
+    not a size lookup.  The bounded-K condition identifies the bandwidth-heavy
+    regime in which resident workgroups can stream A while retaining B.
+    """
+    options = kernel.options
+    if (
+        reduction == "parallel"
+        or not options.get("rebase_a", 0)
+        or k > options.get("max_rebased_k", 0)
+    ):
+        return grid_size, grid_policy
+    block_m, block_n, block_k = kernel.tile
+    if (
+        m % block_m
+        or n % block_n
+        or k % (2 * block_k)
+        or any(dim_stride < 0 for dim_stride in (*a_stride, *b_stride))
+    ):
+        return grid_size, grid_policy
+    i32_max = (1 << 31) - 1
+    a_is_large = _max_byte_offset((m, k), a_stride, element_size) > i32_max
+    b_is_large = _max_byte_offset((k, n), b_stride, element_size) > i32_max
+    output_tiles = (m // block_m) * (n // block_n)
+    if a_is_large and not b_is_large and output_tiles > number_of_cus:
+        return number_of_cus, "registry_rebased_persistent"
+    return grid_size, grid_policy
+
+
 def _select(selector_cls, m, n, k, dtype, device, a_stride, b_stride, variant):
     registry_key = ("gfx950", variant)
     try:
@@ -262,9 +424,10 @@ def _select(selector_cls, m, n, k, dtype, device, a_stride, b_stride, variant):
     except KeyError as error:
         raise ValueError(f"Origami selected unsupported TLX macrotile {tile}") from error
 
-    grid_size = int(selector.grid_size)
-    if grid_size <= 0:
-        raise ValueError(f"Origami selected invalid grid size {grid_size}")
+    model_grid_size = int(selector.grid_size)
+    if model_grid_size <= 0:
+        raise ValueError(f"Origami selected invalid grid size {model_grid_size}")
+    reduction = _reduction_name(selector, streamk=streamk)
     wgm = int(selector.wgm)
     wgmxcc = int(selector.wgmxcc)
     wgmxccchunk = int(selector.wgmxccchunk)
@@ -274,14 +437,62 @@ def _select(selector_cls, m, n, k, dtype, device, a_stride, b_stride, variant):
             "Origami selected invalid workgroup mapping "
             f"(wgm={wgm}, wgmxcc={wgmxcc}, wgmxccchunk={wgmxccchunk}, cus={number_of_cus})"
         )
+    grid_size, grid_policy = _parallel_workspace_grid(
+        m,
+        n,
+        k,
+        kernel,
+        number_of_cus,
+        model_grid_size,
+        reduction,
+    )
+    grid_size, grid_policy = _resident_streamk_grid(
+        m,
+        n,
+        k,
+        kernel,
+        number_of_cus,
+        grid_size,
+        reduction,
+        grid_policy,
+    )
+    grid_size, grid_policy = _short_k_data_parallel_grid(
+        m,
+        n,
+        k,
+        kernel,
+        number_of_cus,
+        grid_size,
+        reduction,
+        grid_policy,
+    )
+    # Origami receives torch dtypes in this integration.  Avoid importing torch
+    # in the optional selector module merely to recover the two supported item
+    # sizes; FP16 and BF16 are both two-byte elements.
+    element_size = 2
+    grid_size, grid_policy = _rebased_persistent_grid(
+        m,
+        n,
+        k,
+        kernel,
+        number_of_cus,
+        grid_size,
+        reduction,
+        grid_policy,
+        a_stride,
+        b_stride,
+        element_size,
+    )
     return LaunchDecision(
         kernel=kernel,
         grid_size=grid_size,
-        reduction=_reduction_name(selector, streamk=streamk),
+        reduction=reduction,
         wgm=wgm,
         wgmxcc=wgmxcc,
         wgmxccchunk=wgmxccchunk,
         number_of_cus=number_of_cus,
+        model_grid_size=model_grid_size,
+        grid_policy=grid_policy,
     )
 
 

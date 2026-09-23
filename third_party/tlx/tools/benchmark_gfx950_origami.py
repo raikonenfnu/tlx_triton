@@ -113,7 +113,19 @@ def _selection(case: Case, a: torch.Tensor, b: torch.Tensor) -> tuple[str, objec
             split_k = gfx950._origami_parallel_split_k(
                 case.m, case.n, case.k, a.element_size(), streamk
             )
+            if streamk.grid_policy == "registry_data_parallel":
+                return "interwave_data_parallel", streamk
             return ("interwave_splitk" if split_k is not None else "streamk"), streamk
+        if case.k >= 2 * gfx950.BLOCK_K and case.k % (2 * gfx950.BLOCK_K):
+            tail = gfx950._origami_plan(a, b, variant="tail_lds")
+            if gfx950._aligned_split_tail_plan(
+                case.m,
+                case.n,
+                case.k,
+                tile=tail.tile[:2],
+                program_budget=tail.number_of_cus,
+            ) is not None:
+                return "aligned_split_tail", tail
         if case.k >= 2 * bk:
             tail_data = gfx950._origami_plan(a, b, variant="tail_data")
             tail_m, tail_n, _ = tail_data.tile
@@ -124,13 +136,38 @@ def _selection(case: Case, a: torch.Tensor, b: torch.Tensor) -> tuple[str, objec
         return "tail", gfx950._origami_plan(a, b, variant="tail")
     streamk = gfx950._origami_plan(a, b, variant="fused_streamk")
     bm, bn, bk = streamk.tile
-    if (case.m % bm == 0 and case.n % bn == 0 and case.k >= 2 * bk and case.k % (2 * bk) == 0
-            and not gfx950._needs_i64_offsets(a) and not gfx950._needs_i64_offsets(b)):
+    if (case.m % bm == 0 and case.n % bn == 0
+            and case.k >= streamk.kernel.options.get("min_k", 2 * bk)
+            and case.k % (2 * bk) == 0
+            and (
+                streamk.grid_policy == "registry_rebased_persistent"
+                or (not gfx950._needs_i64_offsets(a) and not gfx950._needs_i64_offsets(b))
+            )):
         split_k = gfx950._origami_parallel_split_k(
             case.m, case.n, case.k, a.element_size(), streamk
         )
+        if streamk.grid_policy == "registry_rebased_persistent":
+            return "fused_rebased_persistent", streamk
+        if streamk.grid_policy == "registry_data_parallel":
+            return "fused_interwave_data_parallel", streamk
         return ("fused_interwave_splitk" if split_k is not None else "fused_streamk"), streamk
-    return "fused_addmm", gfx950._origami_plan(a, b, variant="fused_addmm")
+    if (case.k >= 2 * gfx950.BLOCK_K and case.k % (2 * gfx950.BLOCK_K)
+            and not gfx950._needs_i64_offsets(a) and not gfx950._needs_i64_offsets(b)):
+        tail = gfx950._origami_plan(a, b, variant="fused_tail_lds")
+        if gfx950._aligned_split_tail_plan(
+            case.m,
+            case.n,
+            case.k,
+            tile=tail.tile[:2],
+            program_budget=2 * tail.number_of_cus,
+        ) is not None:
+            return "fused_aligned_split_tail", tail
+    variant = (
+        ("fused_short_k" if case.k % 32 == 0 else "fused_short_k_tail")
+        if case.k < streamk.kernel.options.get("min_k", 2 * bk)
+        else "fused_addmm"
+    )
+    return variant, gfx950._origami_plan(a, b, variant=variant)
 
 
 def _run_case(case: Case, args) -> dict:
@@ -173,6 +210,8 @@ def _run_case(case: Case, args) -> dict:
             "candidate": decision.kernel.name,
             "tile": decision.tile,
             "grid": decision.grid_size,
+            "model_grid": decision.model_grid_size,
+            "grid_policy": decision.grid_policy,
             "reduction": decision.reduction,
             "wgm": decision.wgm,
         }

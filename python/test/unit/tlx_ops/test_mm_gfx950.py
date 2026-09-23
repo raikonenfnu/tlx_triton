@@ -234,6 +234,128 @@ def test_origami_parallel_reduction_uses_exact_interwave_split():
     assert _gfx950._origami_parallel_split_k(1024, 20480, 6144, 2, decision) is None
 
 
+@pytest.mark.parametrize(
+    "m,n,k,budget,expected",
+    [
+        (1024, 1024, 43500, 256, (43264, 13)),
+        (3072, 3072, 11800, 512, (11776, 3)),
+        # An already aligned K does not need a fused masked-tail launch.
+        (1024, 1024, 43520, 256, None),
+        # A sufficiently broad output grid should use ordinary data parallelism.
+        (4096, 4096, 43500, 256, None),
+    ],
+)
+def test_aligned_split_tail_plan_is_geometry_driven(m, n, k, budget, expected):
+    assert _gfx950._aligned_split_tail_plan(
+        m,
+        n,
+        k,
+        tile=(256, 256),
+        program_budget=budget,
+    ) == expected
+
+
+def test_origami_registry_parallel_grid_uses_template_cost():
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, _parallel_workspace_grid
+
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    grid, policy = _parallel_workspace_grid(
+        768,
+        256,
+        851968,
+        kernel,
+        256,
+        48,
+        "parallel",
+    )
+    assert (grid, policy) == (192, "registry_parallel_cost")
+
+    # Non-parallel reductions remain entirely model-owned.
+    assert _parallel_workspace_grid(
+        768,
+        256,
+        851968,
+        kernel,
+        256,
+        47,
+        "tree",
+    ) == (47, "origami")
+
+
+def test_origami_registry_resident_tail_is_a_wave_regime():
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, _resident_streamk_grid
+
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    assert _resident_streamk_grid(
+        1024,
+        20480,
+        6144,
+        kernel,
+        256,
+        320,
+        "tree",
+        "origami",
+    ) == (256, "registry_resident_tail")
+    # At two complete waves there is no Stream-K tail to fold into residents.
+    assert _resident_streamk_grid(
+        1024,
+        32768,
+        6144,
+        kernel,
+        256,
+        512,
+        "tree",
+        "origami",
+    ) == (512, "origami")
+
+
+def test_origami_registry_short_k_uses_independent_output_tiles():
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, _short_k_data_parallel_grid
+
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    assert _short_k_data_parallel_grid(
+        851968,
+        256,
+        768,
+        kernel,
+        256,
+        256,
+        "tree",
+        "origami",
+    ) == (3328, "registry_data_parallel")
+    # Longer K retains the model-selected persistent traversal.
+    assert _short_k_data_parallel_grid(
+        851968,
+        256,
+        1152,
+        kernel,
+        256,
+        256,
+        "tree",
+        "origami",
+    ) == (256, "origami")
+
+
+def test_origami_registry_rebases_only_the_oversized_streamed_operand():
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, _rebased_persistent_grid
+
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "fused_streamk")][1]
+    args = (2252800, 256, 512, kernel, 256, 8800, "tree", "origami")
+    assert _rebased_persistent_grid(
+        *args,
+        (512, 1),
+        (1, 512),
+        2,
+    ) == (256, "registry_rebased_persistent")
+    # Rebasing A cannot rescue a view whose B resource also exceeds i32.
+    assert _rebased_persistent_grid(
+        *args,
+        (512, 1),
+        (2252800, 1),
+        2,
+    ) == (8800, "origami")
+
+
 def test_origami_adaptive_dispatches_parallel_split_to_interwave(monkeypatch):
     from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, LaunchDecision
 
@@ -260,6 +382,45 @@ def test_origami_adaptive_dispatches_parallel_split_to_interwave(monkeypatch):
     assert launches[0]["SPLIT_K"] == 16
     assert launches[0]["TILE"] == (256, 256)
     assert launches[0]["out"] is out
+
+
+def test_origami_adaptive_dispatches_short_k_to_data_parallel(monkeypatch):
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, LaunchDecision
+
+    launches = []
+
+    def fake_lds(a, b, **kwargs):
+        launches.append(kwargs)
+        return kwargs["out"]
+
+    def fail_streamk(*_args, **_kwargs):
+        pytest.fail("independent short-K output tiles should not use persistent Stream-K")
+
+    monkeypatch.setattr(_gfx950, "_launch_lds", fake_lds)
+    monkeypatch.setattr(_gfx950, "_launch_origami_streamk", fail_streamk)
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    decision = LaunchDecision(
+        kernel,
+        3328,
+        "tree",
+        1,
+        8,
+        0,
+        256,
+        model_grid_size=256,
+        grid_policy="registry_data_parallel",
+    )
+    a = torch.empty((851968, 768), device="meta", dtype=torch.bfloat16)
+    b = torch.empty((768, 256), device="meta", dtype=torch.bfloat16)
+    out = torch.empty((851968, 256), device="meta", dtype=torch.bfloat16)
+
+    assert _gfx950._launch_origami_adaptive(a, b, decision, out) is out
+    assert launches == [{
+        "bias": None,
+        "SPLIT_K": 1,
+        "TILE": (256, 256),
+        "out": out,
+    }]
 
 
 @pytest.mark.parametrize("op", ["mm", "addmm"])

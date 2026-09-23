@@ -550,7 +550,7 @@ def _launch_register(a, b, bias=None, config=None, out=None):
 @triton.jit
 def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right, a_top_off, a_bot_off, b_left_off,
                 b_right_off, ka, kb, n_steps, stride_ak, stride_bk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                BLOCK_K: tl.constexpr):
+                BLOCK_K: tl.constexpr, STREAM_A: tl.constexpr):
     """Compute one output tile over an even contiguous range of K64 steps.
 
     ``ka`` and ``kb`` are the initial element offsets along K. ``n_steps`` must
@@ -559,6 +559,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     """
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
+    a_cache_modifier: tl.constexpr = ".cg" if STREAM_A else ""
 
     # Keep the direct-to-LDS producer contract local to this extracted helper.
     # K is contiguous in A's second tensor dimension and B's first tensor
@@ -584,18 +585,18 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
     # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
     tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=a_cache_modifier)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
     tlx.async_load_commit_group()
@@ -623,7 +624,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -631,7 +632,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -656,7 +657,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -664,7 +665,7 @@ def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, cache_modifier=a_cache_modifier)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -991,6 +992,22 @@ def a16w16_8wave(
         b_right_mask = tl.broadcast_to(offs_bn_right[None, :] < N, b_right_off.shape)
     else:
         b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
+    if PIN_OFFSET_LAYOUT:
+        a_top_mask = tlx.require_layout(a_top_mask, _A_OFFSET_LAYOUT_256)
+        a_bot_mask = tlx.require_layout(a_bot_mask, _A_OFFSET_LAYOUT_256)
+        b_left_mask = tlx.require_layout(b_left_mask, _B_OFFSET_LAYOUT_256)
+        b_right_mask = tlx.require_layout(b_right_mask, _B_OFFSET_LAYOUT_256)
+        a_other = tlx.require_layout(
+            tl.full(a_top_off.shape, 0.0, tlx.dtype_of(a_ptr)),
+            _A_OFFSET_LAYOUT_256,
+        )
+        b_other = tlx.require_layout(
+            tl.full(b_left_off.shape, 0.0, tlx.dtype_of(b_ptr)),
+            _B_OFFSET_LAYOUT_256,
+        )
+    else:
+        a_other = 0.0
+        b_other = 0.0
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -1016,22 +1033,46 @@ def a16w16_8wave(
     n_full = split_ks // BLOCK_K
     n_pipe = (n_full // 2) * 2
 
-    tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, mask=b_left_mask, other=b_other)
+    else:
+        tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
+    else:
+        tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
+    else:
+        tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
     tlx.async_load_commit_group()
-    tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, mask=b_right_mask, other=b_other)
+    else:
+        tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
-    tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, mask=b_left_mask, other=b_other)
+    else:
+        tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
+    else:
+        tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
     tlx.async_load_commit_group()
-    tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
+    else:
+        tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
     tlx.async_load_commit_group()
-    tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+    if PIN_OFFSET_LAYOUT:
+        tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, mask=b_right_mask, other=b_other)
+    else:
+        tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -1047,7 +1088,10 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb, mask=b_left_mask, other=b_other)
+            else:
+                tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1055,7 +1099,10 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka, mask=a_top_mask, other=a_other)
+            else:
+                tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1063,7 +1110,10 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka, mask=a_bot_mask, other=a_other)
+            else:
+                tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1071,7 +1121,10 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb, mask=b_right_mask, other=b_other)
+            else:
+                tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1079,7 +1132,10 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb, mask=b_left_mask, other=b_other)
+            else:
+                tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=b_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1087,7 +1143,10 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka, mask=a_top_mask, other=a_other)
+            else:
+                tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1095,7 +1154,10 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka, mask=a_bot_mask, other=a_other)
+            else:
+                tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=a_other)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -1103,7 +1165,10 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
+            if PIN_OFFSET_LAYOUT:
+                tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb, mask=b_right_mask, other=b_other)
+            else:
+                tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=b_other)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
@@ -1277,7 +1342,7 @@ def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, sme
                       pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m, stride_bias_n, stride_cm,
                       stride_cn, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
                       K_PIPE_STEPS: tl.constexpr, HAS_K_TAIL: tl.constexpr, ADD_BIAS: tl.constexpr,
-                      c_layout: tl.constexpr):
+                      REBASE_A: tl.constexpr, STREAM_A: tl.constexpr, c_layout: tl.constexpr):
     """Compute and store one complete output tile."""
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -1288,13 +1353,21 @@ def _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, sme
     offs_m_bot = offs_m_top + HALF_M
     offs_n_left = pid_n * BLOCK_N + offs_n
     offs_n_right = offs_n_left + HALF_N
-    a_top_off = offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
-    a_bot_off = offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+    if REBASE_A:
+        # The AMD buffer resource uses signed-i32 byte offsets.  Move its base
+        # to the current output row tile when a very tall A would exceed that
+        # range, keeping the direct-to-LDS offsets local and vectorizable.
+        a_ptr += (pid_m * BLOCK_M).to(tl.int64) * stride_am
+        a_top_off = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a_bot_off = (offs_m + HALF_M)[:, None] * stride_am + offs_k[None, :] * stride_ak
+    else:
+        a_top_off = offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a_bot_off = offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_left_off = offs_k[:, None] * stride_bk + offs_n_left[None, :] * stride_bn
     b_right_off = offs_k[:, None] * stride_bk + offs_n_right[None, :] * stride_bn
     acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                  a_top_off, a_bot_off, b_left_off, b_right_off, 0, 0, K_PIPE_STEPS,
-                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                 stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K, STREAM_A)
     if HAS_K_TAIL:
         # Mask odd full and/or partial K64 steps left after the even pipelined prefix.
         for kk in tl.range(K_PIPE_STEPS * BLOCK_K, K, BLOCK_K, num_stages=1):
@@ -1377,7 +1450,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
                    NUM_PID_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
                    K_PIPE_PAIRS: tl.constexpr, UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr,
                    A_COLUMN_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, ADD_BIAS: tl.constexpr,
-                   COOPERATIVE_FIXUP: tl.constexpr):
+                   COOPERATIVE_FIXUP: tl.constexpr, REBASE_A: tl.constexpr, STREAM_A: tl.constexpr):
     """Persistent full tiles plus owner or distributed Stream-K fixup."""
     pid = tl.program_id(0)
     contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
@@ -1435,7 +1508,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
         _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                           head_pid_m, head_pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m,
                           stride_bias_n, stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL,
-                          ADD_BIAS, C)
+                          ADD_BIAS, REBASE_A, STREAM_A, C)
     else:
         # General path for both persistent and generic Stream-K.
         pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
@@ -1452,7 +1525,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
             _matmul_full_tile(a_ptr, b_ptr, bias_ptr, c_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                               pid_m, pid_n, K, stride_am, stride_ak, stride_bk, stride_bn, stride_bias_m,
                               stride_bias_n, stride_cm, stride_cn, BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS,
-                              HAS_K_TAIL, ADD_BIAS, C)
+                              HAS_K_TAIL, ADD_BIAS, REBASE_A, STREAM_A, C)
     if not HAS_STREAMK:
         return
 
@@ -1478,7 +1551,8 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
         acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
                                                      tail_a_top_off, tail_a_bot_off, tail_b_left_off, tail_b_right_off,
                                                      segment_k_offset * stride_ak, segment_k_offset * stride_bk,
-                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+                                                     segment_k_steps, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K,
+                                                     STREAM_A)
 
         # Pin and publish all four partial quadrants before any contributor waits.
         # This avoids cyclic dependencies and lets the MFMA accumulators die before
@@ -1553,7 +1627,7 @@ def streamk_kernel(a_ptr, b_ptr, bias_ptr, c_ptr, partials_ptr, locks_ptr, ready
                                                          smem_b_right, tile_a_top_off, tile_a_bot_off, tile_b_left_off,
                                                          tile_b_right_off, k_step * stride_ak, k_step * stride_bk,
                                                          (segment_end - start_unit) * 2, stride_ak, stride_bk, BLOCK_M,
-                                                         BLOCK_N, BLOCK_K)
+                                                         BLOCK_N, BLOCK_K, STREAM_A)
             acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
             acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
             acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
@@ -1641,6 +1715,85 @@ def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride
     tl.store(c_ptr + output_offsets, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
+_TAIL_REDUCTION_CONFIGS = [
+    triton.Config({"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n}, num_warps=num_warps)
+    for block_m, block_n, num_warps in (
+        (64, 64, 4),
+        (64, 128, 4),
+        (128, 64, 4),
+        (128, 128, 8),
+    )
+]
+
+
+@triton.autotune(
+    configs=_TAIL_REDUCTION_CONFIGS,
+    key=["M", "N", "K_TAIL", "SPLIT_K", "ADD_BIAS"],
+)
+@triton.jit
+def _reduce_k_tail_kernel(
+    a_ptr,
+    b_ptr,
+    workspace_ptr,
+    bias_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K_OFFSET: tl.constexpr,
+    K_TAIL: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    TAIL_BLOCK_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+):
+    """Reduce an aligned inter-wave prefix and compute its masked K tail."""
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    workspace_offsets = offs_m[:, None] * N + offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    offs_k = tl.arange(0, TAIL_BLOCK_K)
+    for kk in tl.range(0, K_TAIL, TAIL_BLOCK_K, num_stages=1):
+        k = kk + offs_k
+        k_mask = k < K_TAIL
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + (K_OFFSET + k[None, :]) * stride_ak,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + (K_OFFSET + k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+    for split in range(SPLIT_K):
+        acc += tl.load(
+            workspace_ptr + split * M * N + workspace_offsets,
+            mask=mask,
+            other=0.0,
+        )
+    if ADD_BIAS:
+        bias_offsets = offs_m[:, None] * stride_bias_m + offs_n[None, :] * stride_bias_n
+        acc += tl.load(bias_ptr + bias_offsets, mask=mask, other=0.0).to(tl.float32)
+    output_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptr + output_offsets, acc.to(c_ptr.dtype.element_ty), mask=mask)
+
+
 NUM_CU = 256  # gfx950 (CDNA4) compute units
 # Minimum K-tiles per split. Two forces set this floor: (1) below it the per-split
 # prologue/epilogue overhead dominates the shrinking K work; (2) more splits means
@@ -1650,6 +1803,7 @@ NUM_CU = 256  # gfx950 (CDNA4) compute units
 # (e.g. K=12288 wants SPLIT_K=12 (16 tiles) not 16 (12 tiles); the latter fills the
 # CUs but its extra reduce traffic makes it net slower).
 MIN_KTILES_PER_SPLIT = 16
+MAX_BALANCED_SPLIT = 4
 
 # Tile candidates, largest first. The big tile is the tuned default; the smaller
 # one is used only when the big tile can't fill the CUs (see choose_tile).
@@ -1731,6 +1885,45 @@ def _needs_i64_offsets(tensor):
     max_element_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
     max_byte_offset = max_element_offset * tensor.element_size()
     return max_byte_offset > (1 << 31) - 1
+
+
+def _aligned_split_tail_plan(M, N, K, tile=(BLOCK_M, BLOCK_N), program_budget=NUM_CU):
+    """Choose a reusable aligned-prefix/short-tail reduction plan.
+
+    The plan is based only on output geometry, K work, workspace traffic, and
+    the launch budget.  It deliberately contains no production-shape table.
+    The inter-wave producer handles the aligned prefix while one fused kernel
+    reduces its FP32 partials, computes the masked tail, and applies the bias.
+    """
+    block_m, block_n = tile
+    grid_mn = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if K % (2 * BLOCK_K) == 0 or grid_mn >= program_budget // 2:
+        return None
+    best = None
+    for split_k in range(2, program_budget // grid_mn + 1):
+        # Small split counts can use uneven whole-K128 partitions without
+        # disturbing the producer pipeline.  Larger counts use equal slices.
+        quantum = 2 * BLOCK_K if split_k <= MAX_BALANCED_SPLIT else split_k * 2 * BLOCK_K
+        prefix = K // quantum * quantum
+        prefix_pairs = prefix // (2 * BLOCK_K)
+        longest_split_pairs = triton.cdiv(prefix_pairs, split_k)
+        if longest_split_pairs * 2 < MIN_KTILES_PER_SPLIT:
+            continue
+        if split_k * M * N * 4 > (1 << 31) - 1:
+            continue
+        tail = K - prefix
+        # Integer proxy for producer time + FP32 reduction traffic + masked
+        # tail work.  The coefficients are architecture-level calibration,
+        # independent of any exact problem shape.
+        cost = (
+            16 * (longest_split_pairs * 2)
+            + 3 * grid_mn * split_k
+            + 16 * triton.cdiv(tail, BLOCK_K)
+        )
+        candidate = (cost, prefix, split_k)
+        if best is None or candidate < best:
+            best = candidate
+    return None if best is None else best[1:]
 
 
 _STRONG_LDS_PLANS = {
@@ -1850,7 +2043,15 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         UNEVEN_SPLIT_K=uneven_split_k,
         HAS_M_TAIL=M % BM != 0,
         HAS_N_TAIL=N % BN != 0,
-        PIN_OFFSET_LAYOUT=K_LIMIT is not None,
+        # The row-A/column-B aligned-prefix path needs explicit offset layouts
+        # to preserve vectorization.  Other dense orientations already infer
+        # their matching producer layouts; forcing these A/B-specific layouts
+        # there makes the direct-to-LDS mask unrealizable.
+        PIN_OFFSET_LAYOUT=(
+            K_LIMIT is not None
+            and a.stride(0) != 1
+            and b.stride(1) != 1
+        ),
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         A_COLUMN_MAJOR=a.stride(0) == 1,
         B_ROW_MAJOR=b.stride(1) == 1,
@@ -1889,6 +2090,53 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
     if DEFER_EPILOGUE:
         return workspace, c
     return c
+
+
+def _launch_aligned_split_tail(a, b, prefix, split_k, *, tile, out, bias=None):
+    """Compute an aligned prefix in parallel and fuse reduction with its tail."""
+    M, K = a.shape
+    _, N = b.shape
+    if not (0 < prefix < K and prefix % (2 * BLOCK_K) == 0):
+        raise InvalidInput(f"invalid aligned-prefix plan prefix={prefix} for K={K}")
+    workspace, output = _launch_lds(
+        a,
+        b,
+        SPLIT_K=split_k,
+        TILE=tile,
+        K_LIMIT=prefix,
+        DEFER_EPILOGUE=True,
+        out=out,
+    )
+    bias_ptr = output if bias is None else bias
+    stride_bias_m = 0 if bias is None else bias.stride(0)
+    stride_bias_n = 0 if bias is None else bias.stride(1)
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE_M"])
+        * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+    )
+    _reduce_k_tail_kernel[grid](
+        a,
+        b,
+        workspace,
+        bias_ptr,
+        output,
+        M,
+        N,
+        prefix,
+        K - prefix,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        stride_bias_m,
+        stride_bias_n,
+        output.stride(0),
+        output.stride(1),
+        SPLIT_K=split_k,
+        TAIL_BLOCK_K=32 if K - prefix <= 32 else BLOCK_K,
+        ADD_BIAS=bias is not None,
+    )
+    return output
 
 
 def _lds_matmul(a, b, SPLIT_K=None):
@@ -1969,7 +2217,8 @@ def streamk_matmul(a, b):
                                                  **schedule, num_warps=NUM_WARPS, num_stages=1,
                                                  matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS,
                                                  A_COLUMN_MAJOR=a.stride(0) == 1, B_ROW_MAJOR=b.stride(1) == 1,
-                                                 ADD_BIAS=False, COOPERATIVE_FIXUP=True)
+                                                 ADD_BIAS=False, COOPERATIVE_FIXUP=True, REBASE_A=False,
+                                                 STREAM_A=False)
     return c
 
 
@@ -2064,6 +2313,15 @@ def _launch_origami_adaptive(a, b, decision, out, bias=None):
         )
     M, K = a.shape
     _, N = b.shape
+    if decision.grid_policy == "registry_data_parallel":
+        return _launch_lds(
+            a,
+            b,
+            bias=bias,
+            SPLIT_K=1,
+            TILE=decision.tile[:2],
+            out=out,
+        )
     split_k = _origami_parallel_split_k(M, N, K, a.element_size(), decision)
     if split_k is not None:
         return _launch_lds(
@@ -2092,7 +2350,24 @@ def _launch_origami_streamk(a, b, decision, out, bias=None):
             f"and either K%{2 * BK}=0 or a data-parallel grid; got ({M}, {N}, {K}) "
             f"with grid={decision.grid_size}"
         )
-    schedule = _origami_streamk_schedule(M, N, K, BM, BN, decision.grid_size)
+    rebase_a = decision.grid_policy == "registry_rebased_persistent"
+    if rebase_a:
+        # Address rebasing applies to independent full tiles only.  Resident
+        # workgroups traverse the complete output grid without Stream-K locks.
+        schedule = {
+            "HAS_STREAMK": False,
+            "HAS_K_TAIL": False,
+            "NUM_PROGRAMS": decision.grid_size,
+            "NUM_FULL_TILES": total_tiles,
+            "NUM_PID_M": M // BM,
+            "NUM_PID_N": N // BN,
+            "K_PIPE_STEPS": K // BK,
+            "K_PIPE_PAIRS": K // (2 * BK),
+            "UNITS_PER_PROGRAM": 0,
+            "REMAINDER_UNITS": 0,
+        }
+    else:
+        schedule = _origami_streamk_schedule(M, N, K, BM, BN, decision.grid_size)
     if schedule["HAS_STREAMK"] and decision.grid_size > decision.number_of_cus:
         # The current fixup uses producer/consumer locks. Queuing more lock-
         # participating workgroups than can be resident can deadlock when the
@@ -2147,6 +2422,8 @@ def _launch_origami_streamk(a, b, decision, out, bias=None):
         B_ROW_MAJOR=b.stride(1) == 1,
         ADD_BIAS=bias is not None,
         COOPERATIVE_FIXUP=bool(decision.kernel.options["cooperative_fixup"]),
+        REBASE_A=rebase_a,
+        STREAM_A=rebase_a and N <= BN and K <= 8 * BK,
     )
     return out
 
@@ -3690,14 +3967,20 @@ def _origami_plan(a, b, *, variant):
         raise InvalidInput(str(error)) from error
 
 
-def _register_config_from_origami(decision):
+def _register_config_from_origami(decision, m, n):
     block_m, block_n, block_k = decision.tile
+    num_xcds = decision.kernel.options["NUM_XCDS"]
+    if decision.kernel.options.get("adaptive_xcd", 0):
+        num_xcds = 8 if triton.cdiv(n, block_n) >= 8 else 1
     return {
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "BLOCK_K": block_k,
-        "GROUP_M": decision.wgm,
-        "NUM_XCDS": decision.kernel.options["NUM_XCDS"],
+        # The registry owns the measured launch recipe.  Origami's WGM is
+        # retained in LaunchDecision telemetry until its cache model is
+        # calibrated for this concrete register kernel.
+        "GROUP_M": decision.kernel.options["GROUP_M"],
+        "NUM_XCDS": num_xcds,
         "matrix_instr_nonkdim": 16,
         "waves_per_eu": decision.kernel.options.get("waves_per_eu", 0),
         "kpack": 1,
@@ -3747,6 +4030,23 @@ def mm(a, b, *, out=None, space="heuristic"):
         block_m, block_n, block_k = decision.tile
         if m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0:
             return _launch_origami_adaptive(a, b, decision, out)
+        if k >= 2 * BLOCK_K and k % (2 * BLOCK_K):
+            tail = _origami_plan(a, b, variant="tail_lds")
+            tail_plan = _aligned_split_tail_plan(
+                m,
+                n,
+                k,
+                tile=tail.tile[:2],
+                program_budget=tail.number_of_cus,
+            )
+            if tail_plan is not None:
+                return _launch_aligned_split_tail(
+                    a,
+                    b,
+                    *tail_plan,
+                    tile=tail.tile[:2],
+                    out=out,
+                )
         if k >= 2 * block_k:
             tail_data = _origami_plan(a, b, variant="tail_data")
             tail_m, tail_n, _ = tail_data.tile
@@ -3762,7 +4062,7 @@ def mm(a, b, *, out=None, space="heuristic"):
         return _launch_register_plan(
             a,
             b,
-            config=_register_config_from_origami(tail),
+            config=_register_config_from_origami(tail, m, n),
             out=out,
             _validated=True,
         )
@@ -3820,11 +4120,40 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
         block_m, block_n, block_k = streamk.tile
         m, k = a.shape
         _, n = b.shape
-        if (m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0
-                and not _needs_i64_offsets(a) and not _needs_i64_offsets(b)):
+        if (m % block_m == 0 and n % block_n == 0
+                and k >= streamk.kernel.options.get("min_k", 2 * block_k)
+                and k % (2 * block_k) == 0
+                and (
+                    streamk.grid_policy == "registry_rebased_persistent"
+                    or (not _needs_i64_offsets(a) and not _needs_i64_offsets(b))
+                )):
             return _launch_origami_adaptive(a, b, streamk, output, bias=bias)
-        decision = _origami_plan(a, b, variant="fused_addmm")
-        plan = _register_config_from_origami(decision)
+        if (k >= 2 * BLOCK_K and k % (2 * BLOCK_K)
+                and not _needs_i64_offsets(a) and not _needs_i64_offsets(b)):
+            tail = _origami_plan(a, b, variant="fused_tail_lds")
+            tail_plan = _aligned_split_tail_plan(
+                m,
+                n,
+                k,
+                tile=tail.tile[:2],
+                program_budget=2 * tail.number_of_cus,
+            )
+            if tail_plan is not None:
+                return _launch_aligned_split_tail(
+                    a,
+                    b,
+                    *tail_plan,
+                    tile=tail.tile[:2],
+                    out=output,
+                    bias=bias,
+                )
+        variant = (
+            ("fused_short_k" if k % 32 == 0 else "fused_short_k_tail")
+            if k < streamk.kernel.options.get("min_k", 2 * block_k)
+            else "fused_addmm"
+        )
+        decision = _origami_plan(a, b, variant=variant)
+        plan = _register_config_from_origami(decision, m, n)
     else:
         m, k = a.shape
         _, n = b.shape
