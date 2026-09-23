@@ -2023,6 +2023,60 @@ def _origami_streamk_schedule(M, N, K, block_m, block_n, grid_size):
     }
 
 
+def _origami_parallel_split_k(M, N, K, element_size, decision):
+    """Return the exact Origami split for the inter-wave workspace path.
+
+    Origami's ``parallel`` reduction is dependency-free: every workgroup owns
+    one complete K partition and a second launch reduces FP32 partials.  It is
+    therefore a better match for TLX's inter-wave kernel than the lock-based
+    Stream-K fixup, but only when the selected grid is an integer multiple of
+    the output-tile grid.  Irregular Stream-K partitions remain in
+    ``streamk_kernel``.
+    """
+    block_m, block_n, block_k = decision.tile
+    if not decision.kernel.options.get("parallel_workspace", 0):
+        return None
+    if block_k != BLOCK_K:
+        return None
+    if decision.reduction != "parallel" or M % block_m or N % block_n:
+        return None
+    total_tiles = (M // block_m) * (N // block_n)
+    if decision.grid_size <= total_tiles or decision.grid_size % total_tiles:
+        return None
+    split_k = decision.grid_size // total_tiles
+    if K % block_k:
+        return None
+    min_partition = (K // block_k // split_k) * block_k
+    if min_partition < 2 * block_k or min_partition * element_size % 16:
+        return None
+    # _launch_lds uses a dense (split_k * M, N) FP32 workspace and currently
+    # requires signed-i32 byte offsets.
+    if split_k * M * N * 4 > (1 << 31):
+        return None
+    return split_k
+
+
+def _launch_origami_adaptive(a, b, decision, out, bias=None):
+    """Launch the registered tile with the reduction matching Origami's grid."""
+    if decision.kernel.launch != "adaptive_streamk":
+        raise InvalidInput(
+            f"Origami kernel {decision.kernel.name} is not an adaptive Stream-K template"
+        )
+    M, K = a.shape
+    _, N = b.shape
+    split_k = _origami_parallel_split_k(M, N, K, a.element_size(), decision)
+    if split_k is not None:
+        return _launch_lds(
+            a,
+            b,
+            bias=bias,
+            SPLIT_K=split_k,
+            TILE=decision.tile[:2],
+            out=out,
+        )
+    return _launch_origami_streamk(a, b, decision, out, bias=bias)
+
+
 def _launch_origami_streamk(a, b, decision, out, bias=None):
     """Launch the registered Stream-K template with Origami's exact grid."""
     M, K = a.shape
@@ -3692,12 +3746,12 @@ def mm(a, b, *, out=None, space="heuristic"):
         decision = _origami_plan(a, b, variant="streamk")
         block_m, block_n, block_k = decision.tile
         if m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0:
-            return _launch_origami_streamk(a, b, decision, out)
+            return _launch_origami_adaptive(a, b, decision, out)
         if k >= 2 * block_k:
             tail_data = _origami_plan(a, b, variant="tail_data")
             tail_m, tail_n, _ = tail_data.tile
             if m % tail_m == 0 and n % tail_n == 0:
-                return _launch_origami_streamk(a, b, tail_data, out)
+                return _launch_origami_adaptive(a, b, tail_data, out)
         # Tails are a distinct capability variant, not a shape-specific kernel
         # preference. Origami still selects its tile from the registered tail
         # macro-kernels; this path can disappear once Stream-K supports masking.
@@ -3768,7 +3822,7 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
         _, n = b.shape
         if (m % block_m == 0 and n % block_n == 0 and k >= 2 * block_k and k % (2 * block_k) == 0
                 and not _needs_i64_offsets(a) and not _needs_i64_offsets(b)):
-            return _launch_origami_streamk(a, b, streamk, output, bias=bias)
+            return _launch_origami_adaptive(a, b, streamk, output, bias=bias)
         decision = _origami_plan(a, b, variant="fused_addmm")
         plan = _register_config_from_origami(decision)
     else:

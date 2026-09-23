@@ -6,8 +6,8 @@ import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import InvalidInput, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import GFX950_FOCUS, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
+from triton.tlx.ops.kernels.mm._shapes import GFX950_FOCUS, operand
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -220,6 +220,46 @@ def test_origami_data_parallel_schedule_handles_k_tail():
     assert not schedule["HAS_STREAMK"]
     assert schedule["HAS_K_TAIL"]
     assert schedule["K_PIPE_STEPS"] * 64 == 43392
+
+
+def test_origami_parallel_reduction_uses_exact_interwave_split():
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, LaunchDecision
+
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    decision = LaunchDecision(kernel, 48, "parallel", 1, 8, 0, 256)
+    assert _gfx950._origami_parallel_split_k(768, 256, 851968, 2, decision) == 16
+
+    # A genuine Stream-K grid is not an integer split of the output tiles.
+    decision = LaunchDecision(kernel, 213, "tree", 1, 8, 0, 256)
+    assert _gfx950._origami_parallel_split_k(1024, 20480, 6144, 2, decision) is None
+
+
+def test_origami_adaptive_dispatches_parallel_split_to_interwave(monkeypatch):
+    from triton.tlx.ops.kernels.mm.origami import MACRO_KERNEL_REGISTRY, LaunchDecision
+
+    launches = []
+
+    def fake_lds(a, b, **kwargs):
+        launches.append(kwargs)
+        return kwargs["out"]
+
+    def fail_streamk(*_args, **_kwargs):
+        pytest.fail("exact parallel split-K should not use lock-based Stream-K")
+
+    monkeypatch.setattr(_gfx950, "_launch_lds", fake_lds)
+    monkeypatch.setattr(_gfx950, "_launch_origami_streamk", fail_streamk)
+    kernel = MACRO_KERNEL_REGISTRY[("gfx950", "streamk")][1]
+    decision = LaunchDecision(kernel, 48, "parallel", 1, 8, 0, 256)
+    a = torch.empty((768, 851968), device="meta", dtype=torch.bfloat16)
+    b = torch.empty((851968, 256), device="meta", dtype=torch.bfloat16)
+    out = torch.empty((768, 256), device="meta", dtype=torch.bfloat16)
+
+    assert _gfx950._launch_origami_adaptive(a, b, decision, out) is out
+    assert len(launches) == 1
+    assert launches[0]["bias"] is None
+    assert launches[0]["SPLIT_K"] == 16
+    assert launches[0]["TILE"] == (256, 256)
+    assert launches[0]["out"] is out
 
 
 @pytest.mark.parametrize("op", ["mm", "addmm"])

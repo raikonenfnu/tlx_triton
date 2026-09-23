@@ -74,16 +74,19 @@ def _register_kernel(name, tile, *, variant="register", model_waves_per_eu=1, **
 
 
 # Stream-K is the default mm variant. Its candidate list intentionally contains
-# only tiles implemented by ``streamk_kernel``. The same macro-kernel consumes
-# Origami grids smaller than, equal to, or larger than the output-tile count as
-# persistent/Stream-K, data-parallel, or split-K schedules respectively.
+# only tiles implemented by the adaptive gfx950 macro-kernel. The same registered
+# tile consumes Origami grids smaller than, equal to, or larger than the output-
+# tile count as persistent/Stream-K, data-parallel, or split-K schedules. Exact
+# parallel split-K grids use the inter-wave kernel's dependency-free FP32
+# workspace reduction; genuine Stream-K and persistent grids retain the lock-
+# based scheduling shell.
 _STREAMK_KERNELS = (
-    MacroKernel("streamk_128x128x64", "streamk", (128, 128, 64), "streamk",
+    MacroKernel("streamk_128x128x64", "streamk", (128, 128, 64), "adaptive_streamk",
                 _options(waves_per_eu=1, streamk_grid=1),
-                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0)),
-    MacroKernel("streamk_256x256x64", "streamk", (256, 256, 64), "streamk",
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1)),
+    MacroKernel("streamk_256x256x64", "streamk", (256, 256, 64), "adaptive_streamk",
                 _options(waves_per_eu=1, streamk_grid=1),
-                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0)),
+                _options(num_warps=8, GROUP_M=4, cooperative_fixup=0, parallel_workspace=1)),
 )
 
 

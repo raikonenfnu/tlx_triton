@@ -110,7 +110,10 @@ def _selection(case: Case, a: torch.Tensor, b: torch.Tensor) -> tuple[str, objec
         streamk = gfx950._origami_plan(a, b, variant="streamk")
         bm, bn, bk = streamk.tile
         if case.m % bm == 0 and case.n % bn == 0 and case.k >= 2 * bk and case.k % (2 * bk) == 0:
-            return "streamk", streamk
+            split_k = gfx950._origami_parallel_split_k(
+                case.m, case.n, case.k, a.element_size(), streamk
+            )
+            return ("interwave_splitk" if split_k is not None else "streamk"), streamk
         if case.k >= 2 * bk:
             tail_data = gfx950._origami_plan(a, b, variant="tail_data")
             tail_m, tail_n, _ = tail_data.tile
@@ -123,7 +126,10 @@ def _selection(case: Case, a: torch.Tensor, b: torch.Tensor) -> tuple[str, objec
     bm, bn, bk = streamk.tile
     if (case.m % bm == 0 and case.n % bn == 0 and case.k >= 2 * bk and case.k % (2 * bk) == 0
             and not gfx950._needs_i64_offsets(a) and not gfx950._needs_i64_offsets(b)):
-        return "fused_streamk", streamk
+        split_k = gfx950._origami_parallel_split_k(
+            case.m, case.n, case.k, a.element_size(), streamk
+        )
+        return ("fused_interwave_splitk" if split_k is not None else "fused_streamk"), streamk
     return "fused_addmm", gfx950._origami_plan(a, b, variant="fused_addmm")
 
 
