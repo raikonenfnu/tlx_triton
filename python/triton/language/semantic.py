@@ -1051,8 +1051,7 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Create loaded result type `dst_ty`
         if ptr.type.is_block():
-            shape = ptr.type.get_block_shapes()
-            dst_ty = tl.block_type(elt_ty, shape)
+            dst_ty = ptr.type.with_element_ty(elt_ty)
         else:
             # Load by de-referencing the pointer of scalar
             dst_ty = elt_ty
@@ -1078,9 +1077,9 @@ class TritonSemantic(Generic[TensorTy]):
         dst_ty, ptr, mask, other, is_bool = self._prepare_load(ptr, mask, other, boundary_check, padding)
         # Build IR
         if mask is None:
-            x = tl.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
+            x = self.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
         else:
-            x = tl.tensor(
+            x = self.tensor(
                 self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache,
                                                 eviction, is_volatile),
                 dst_ty,

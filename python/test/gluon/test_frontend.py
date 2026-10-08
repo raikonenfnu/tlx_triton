@@ -2744,6 +2744,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     )
 
 
+@pytest.mark.parametrize("target", ALL_TARGETS)
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("dtype", [ttgl.int32, ttgl.int1])
+def test_load_preserves_layout(target, masked, dtype):
+    @gluon.jit
+    def kernel(inp, out, MASKED: ttgl.constexpr):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+        offs = ttgl.arange(0, 128, layout)
+        if MASKED:
+            value = ttgl.load(inp + offs, mask=offs < 64, other=0)
+        else:
+            value = ttgl.load(inp + offs)
+        ttgl.static_assert(value.type.layout == layout)
+        ttgl.store(out + offs, value)
+
+    run_parser(kernel, *make_args(MockTensor(dtype), MockTensor(dtype), MASKED=masked), target=target)
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA4, HIP_TARGET_GFX1250])
+def test_warp_pipeline_stage_borders(target):
+    from triton.experimental.gluon.language.amd import warp_pipeline_stage
+
+    @gluon.jit
+    def kernel(out):
+        for k in range(2):
+            with warp_pipeline_stage("first", priority=1):
+                ttgl.store(out, k)
+            with warp_pipeline_stage("second", priority=0):
+                ttgl.store(out, k + 1)
+
+    mod = run_parser(kernel, *make_args(MockTensor(ttgl.int32)), target=target)
+    text = mod.str_nodebug()
+    assert text.count("triton.warp_pipeline.border") == 2
+    assert 'triton.warp_pipeline.border = "first"' in text
+    assert 'triton.warp_pipeline.border = "second"' in text
+    assert "triton.warp_pipeline.priority = 1" in text
+    assert "triton.warp_pipeline.priority = 0" in text
+
+
 @gluon.jit
 def async_copy_kernel(inp, xnumel, XBLOCK: ttgl.constexpr):
     smem = ttgl.allocate_shared_memory(inp.dtype.element_ty, [XBLOCK], ttgl.SwizzledSharedLayout(1, 1, 1, order=[0]))

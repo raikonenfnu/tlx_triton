@@ -1300,6 +1300,12 @@ class CodeGenerator(ast.NodeVisitor):
         # which will be done later
         if isinstance(context, ast.Call):
             withitemClass = self.visit(context.func)
+            if self.is_gluon:
+                from triton.experimental.gluon.language.amd import warp_pipeline_stage
+                from triton.language.extra.tlx import warp_pipeline_stage as tlx_warp_pipeline_stage
+
+                if withitemClass is warp_pipeline_stage:
+                    withitemClass = tlx_warp_pipeline_stage
             handler = WITH_DISPATCH.get(withitemClass)
             if handler:
                 return handler(self, node)
