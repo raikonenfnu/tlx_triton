@@ -386,6 +386,19 @@ def TritonAMDGPUConvertToTensorOps
   }];
 }
 
+def TritonAMDGPUPreserveWarpPipelineOwners
+    : Pass<"tritonamdgpu-preserve-warp-pipeline-owners"> {
+  let summary = "Preserve warp-pipeline scope across loop folding and unrolling";
+  let description = [{
+    Bound loops that contain direct borders or calls to stage helpers.
+    Run this pass before the inliner and before each callable cleanup pipeline.
+    WarpPipeliner consumes these markers before selecting loop owners.
+    A folded loop becomes a bounded flat pipeline instead of annotating its
+    enclosing loop.
+  }];
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
+}
+
 def TritonAMDGPUWarpPipeline
     : Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
   let summary = "partition and pipeline";

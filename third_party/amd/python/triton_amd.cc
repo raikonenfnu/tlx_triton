@@ -8,7 +8,9 @@
 #include "lld/Common/Driver.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
+#include "mlir/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LLVMOptions.h"
@@ -108,6 +110,22 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
                           mlir::createTritonAMDGPUOptimizeBufferOpPtr);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
+  ADD_PASS_WRAPPER_0("add_preserve_warp_pipeline_owners",
+                     mlir::createTritonAMDGPUPreserveWarpPipelineOwners);
+  m.def(
+      "add_warp_pipeline_inliner",
+      [](mlir::PassManager &pm, bool isGluon) {
+        pm.addPass(mlir::createInlinerPass(
+            /*opPipelines=*/{}, [isGluon](mlir::OpPassManager &pm) {
+              pm.addPass(mlir::createTritonAMDGPUPreserveWarpPipelineOwners());
+              if (isGluon)
+                pm.addPass(
+                    mlir::triton::gluon::createGluonSimplifyControlFlow());
+              else
+                pm.addPass(mlir::createCanonicalizerPass());
+            }));
+      },
+      py::arg("pm"), py::arg("is_gluon") = false);
   ADD_PASS_WRAPPER_0("add_fp_sanitizer", mlir::createTritonAMDGPUFpSanitizer);
 
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",

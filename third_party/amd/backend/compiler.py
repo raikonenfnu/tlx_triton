@@ -512,7 +512,10 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        passes.common.add_inliner(pm)
+        # Protect direct owners and owners exposed during helper inlining.
+        # The inliner preserves them before each callable cleanup pipeline.
+        amd.passes.ttgpuir.add_preserve_warp_pipeline_owners(pm)
+        amd.passes.ttgpuir.add_warp_pipeline_inliner(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
@@ -681,7 +684,11 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 
-        passes.gluon.add_inliner(pm)
+        # Protect direct owners and owners exposed during helper inlining.
+        # The inliner preserves them before each callable cleanup pipeline.
+        amd.passes.ttgpuir.add_preserve_warp_pipeline_owners(pm)
+        amd.passes.ttgpuir.add_warp_pipeline_inliner(pm, is_gluon=True)
+        passes.common.add_symbol_dce(pm)
         passes.gluon.add_resolve_auto_encodings(pm)
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)

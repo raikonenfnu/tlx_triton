@@ -1,3 +1,7 @@
+import re
+
+import pytest
+
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
@@ -9,10 +13,59 @@ NUM_WARPS = 4
 BLOCK = 128
 
 
-def _compile_gluon(fn, signature, constexprs, arch="gfx950"):
-    """Compile a Gluon kernel for gfx950 and return the compiled object."""
+def _compile_gluon(fn, signature, constexprs, arch="gfx950", warp_size=64):
+    """Compile a Gluon kernel for the requested AMD target."""
     return triton.compile(src=gluon._runtime.GluonASTSource(fn, signature, constexprs),
-                          target=GPUTarget("hip", arch, 64), options={"num_warps": NUM_WARPS})
+                          target=GPUTarget("hip", arch, warp_size), options={"num_warps": NUM_WARPS})
+
+
+@gluon.jit
+def _pipeline_owner_stages(A, B, offs, k):
+    with warp_pipeline_stage("load", priority=1):
+        value = gl.load(A + offs)
+    with warp_pipeline_stage("store", priority=0):
+        gl.store(B + offs, value + k)
+
+
+@gluon.jit
+def pipeline_nested_owner(A, B, N, INNER: gl.constexpr, WAIT: gl.constexpr, HELPER: gl.constexpr,
+                          WARP_SIZE: gl.constexpr = 64):
+    layout: gl.constexpr = gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0])
+    offs = gl.arange(0, 256, layout=layout)
+    for tile in range(N):
+        gl.store(B + offs, -1)
+        if WAIT:
+            gl.amd.cdna4.async_copy.wait_group(0)
+        for k in range(INNER):
+            if HELPER:
+                _pipeline_owner_stages(A, B, offs, k)
+            else:
+                with warp_pipeline_stage("load", priority=1):
+                    value = gl.load(A + offs)
+                with warp_pipeline_stage("store", priority=0):
+                    gl.store(B + offs, value + k)
+        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.store(B + offs, gl.load(B + offs) + 1)
+
+
+@pytest.mark.parametrize("inner", [0, 1, 4])
+@pytest.mark.parametrize("wait", [False, True])
+@pytest.mark.parametrize("helper", [False, True])
+@pytest.mark.parametrize("arch, warp_size", [("gfx950", 64), ("gfx1250", 32)])
+def test_pipeline_nested_loop_ownership(inner, wait, helper, arch, warp_size):
+    signature = {
+        "A": "*i32", "B": "*i32", "N": "i32", "INNER": "constexpr", "WAIT": "constexpr", "HELPER": "constexpr",
+        "WARP_SIZE": "constexpr"
+    }
+    constexprs = {"INNER": inner, "WAIT": wait, "HELPER": helper, "WARP_SIZE": warp_size}
+    k = _compile_gluon(pipeline_nested_owner, signature, constexprs, arch, warp_size)
+    ttgir = k.asm["ttgir"]
+    assert "triton.warp_pipeline.owner" not in ttgir
+    assert "triton.warp_pipeline.border" not in ttgir
+    assert ttgir.count("triton.warp_pipeline.pipelined_for") == int(inner > 1)
+    assert ("triton.warp_pipeline.flat" in ttgir) == (inner == 1)
+    if inner:
+        assert "s_setprio" in k.asm["amdgcn"]
 
 
 @gluon.jit
@@ -113,14 +166,15 @@ def test_pipeline_static_range_with_unroll():
     signature = {"A": "*fp16", "B": "*fp16", "N": "i32", "BLOCK": "constexpr"}
     constexprs = {"BLOCK": BLOCK}
     k = _compile_gluon(pipeline_static_range_unrolled, signature, constexprs)
-    amdgcn = k.asm["amdgcn"]
-    setprio_lines = [line.strip() for line in amdgcn.splitlines() if "s_setprio" in line]
-    prios = [int(l.split()[-1]) for l in setprio_lines]
-    # Each converted loop emits: 1 pre-loop + (N-1) in-body + 1 wrap-around + 1 post-loop reset.
-    # Main loop has 8 clusters (static_range(2) * 2 stages * unroll(2)): 1+7+1+1 = 10.
-    # Epilogue has 4 clusters (static_range(2) * 2 stages): 1+3+1+1 = 6.
-    # Total: 16 s_setprio.  Both priority levels must appear.
-    assert len(prios) == 16, \
-        f"Expected 16 s_setprio (main=10 + epilogue=6), got {len(prios)}: {prios}"
-    assert prios.count(0) == 8 and prios.count(1) == 8, \
-        f"Expected 8 prio-0 and 8 prio-1, got {prios}"
+    ttgir = k.asm["ttgir"]
+    pipelined_loop_pattern = r"scf\.for\b.*?\n    \} \{[^}]*triton\.warp_pipeline\.pipelined_for[^}]*\}"
+    pipelined_loops = re.findall(pipelined_loop_pattern, ttgir, re.S)
+    stage_counts = [loop.count("triton.warp_pipeline.stage") for loop in pipelined_loops]
+    priority_counts = [(loop.count("triton.warp_pipeline.priority = 1"),
+                        loop.count("triton.warp_pipeline.priority = 0")) for loop in pipelined_loops]
+    # Main loop has 8 clusters (static_range(2) * 2 stages * unroll(2)).
+    # Epilogue has 4 clusters (static_range(2) * 2 stages).
+    assert stage_counts == [8, 4], \
+        f"Expected main+epilogue warp-pipelined loops with 8 and 4 stages, got {stage_counts}"
+    assert priority_counts == [(4, 4), (2, 2)], \
+        f"Expected balanced stage priorities in ttgir, got {priority_counts}"

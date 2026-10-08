@@ -264,6 +264,54 @@ def test_warp_pipeline_lowering():
     assert "s_setprio" in asm, "Expected s_setprio from warp pipeline priority hints"
 
 
+@triton.jit
+def _nested_owner_stages(A, B, offs, k):
+    with tlx.warp_pipeline_stage("load", priority=1):
+        value = tl.load(A + offs)
+    with tlx.warp_pipeline_stage("store", priority=0):
+        tl.store(B + offs, value + k)
+
+
+@triton.jit(do_not_specialize=["N", "ENABLED"])
+def _nested_owner_kernel(A, B, N, ENABLED, INNER: tl.constexpr, UNROLL: tl.constexpr, WAIT: tl.constexpr,
+                         HELPER: tl.constexpr):
+    offs = tl.arange(0, 256)
+    for tile in range(N):
+        tl.store(B + offs, -1)
+        if WAIT:
+            tlx.async_load_wait_group(0)
+        if ENABLED:
+            for k in tl.range(INNER, loop_unroll_factor=UNROLL):
+                if HELPER:
+                    _nested_owner_stages(A, B, offs, k)
+                else:
+                    with tlx.warp_pipeline_stage("load", priority=1):
+                        value = tl.load(A + offs)
+                    with tlx.warp_pipeline_stage("store", priority=0):
+                        tl.store(B + offs, value + k)
+        tlx.async_load_wait_group(0)
+        tl.store(B + offs, tl.load(B + offs) + 1)
+
+
+@pytest.mark.skipif(not is_hip(), reason="warp pipeline is AMD-only")
+@pytest.mark.parametrize("inner, unroll", [(0, 1), (1, 1), (2, 2), (5, 2)])
+@pytest.mark.parametrize("wait", [False, True])
+@pytest.mark.parametrize("helper", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_warp_pipeline_nested_owner(inner, unroll, wait, helper, enabled, device):
+    a = torch.arange(256, device=device, dtype=torch.int32)
+    b = torch.empty_like(a)
+    kernel = _nested_owner_kernel[(1, )](a, b, 3, enabled, inner, unroll, wait, helper, num_warps=4, num_stages=1)
+    expected = a + inner if inner and enabled else torch.zeros_like(a)
+    torch.testing.assert_close(b, expected, rtol=0, atol=0)
+    ttgir = kernel.asm["ttgir"]
+    assert "triton.warp_pipeline.owner" not in ttgir
+    assert "triton.warp_pipeline.border" not in ttgir
+    assert ttgir.count("triton.warp_pipeline.pipelined_for") == int(inner > unroll)
+    if inner:
+        assert "s_setprio" in kernel.asm["amdgcn"]
+
+
 # --- Validation tests ---
 
 
