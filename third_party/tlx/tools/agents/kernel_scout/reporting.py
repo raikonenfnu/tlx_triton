@@ -1,0 +1,86 @@
+"""Render measured evidence, frozen control dates, and pinned reproducer commands."""
+
+import shlex
+
+from contracts import ROOT, select_winner
+
+
+def cell(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def describe(target, case):
+    prefix = f"{target['id']}/{case['id']}, {case['dtype']}"
+    if target["operation"] == "mm":
+        return f"{prefix}, M={case['m']} N={case['n']} K={case['k']}, B {case['b_layout']}"
+    q, k = case["q_lengths"], case["kv_lengths"]
+    return (f"{prefix}, B={len(q)} Q={min(q)}–{max(q)} KV={min(k)}–{max(k)}, "
+            f"H={case['heads']}/{case['kv_heads']} D={case['head_dim']}, causal={case['causal']}")
+
+
+def render(report):
+    columns = report["columns"]
+    lines = [
+        f"# TLX Kernel Scout — {report['date']} ({report['mode']})", "",
+        f"Device: {report['device']['name']}, {report['device']['arch']}, physical GPU {report['device']['physical_gpu']}.",
+        f"Week: {report['week']}. Campaign: `{report['campaign']}`. Provider: {report['provider']}.",
+        "Best observed among evaluated candidates; unavailable and unstable results cannot win.",
+        "All calls use returned tensors, eager triton.testing.do_bench, and the same seeded logical inputs.",
+        "Weekly controls are frozen observations, not simultaneous nightly measurements.", "",
+        "| Problem | " + " | ".join(columns) + " | Winner |",
+        "| --- | " + " | ".join("---" for _ in columns) + " | --- |"
+    ]
+    for row in report["rows"]:
+        values = []
+        for backend in columns:
+            result = row["results"].get(backend, {"status": "unavailable"})
+            if result["status"] == "ok":
+                metric = "tflops" if row["target"]["metric"] == "compute" else "logical_tbps"
+                unit = "TFLOP/s" if metric == "tflops" else "logical TB/s"
+                frozen = f"; frozen {result['frozen_date']}" if "frozen_date" in result else ""
+                values.append(f"{result[metric]:.3f} {unit}; {result['latency_ms'] * 1000:.2f} µs{frozen}")
+            else:
+                values.append(result["status"] + (": " + result.get("error", "")[:110] if result.get("error") else ""))
+        results = {k: v for k, v in row["results"].items() if report["mode"] != "weekly" or k != "tlx_ops_baseline"}
+        winner = select_winner(results, row["target"]["timing"]["tie_fraction"])
+        lines.append("| " + " | ".join(cell(v) for v in [row["description"], *values, winner]) + " |")
+    lines += [
+        "",
+        "Useful FLOPs exclude padded/masked work. Logical bytes count inputs and output once; they are not measured HBM traffic.",
+        "Overlap between p20–p80 timing intervals or the configured minimum separation produces a tie.", "",
+        "## Reproducers", "", "Commands verify the saved source, compiler, runtime, and device pins before measuring.",
+        "Keep the run directory and source revisions. A moved source checkout is rejected.", "",
+        "| Problem | " + " | ".join(columns) + " |", "| --- | " + " | ".join("---" for _ in columns) + " |"
+    ]
+    for row in report["rows"]:
+        values = []
+        for backend in columns:
+            result = row["results"].get(backend, {})
+            command = result.get("reproducer_command", "unavailable")
+            values.append(f"`{command}`" if command != "unavailable" else command)
+        lines.append("| " + " | ".join(cell(v) for v in [row["description"], *values]) + " |")
+    lines += [
+        "", "## Provenance and search coverage", "",
+        "| Backend / case | Source commit | Compiler hash | Variant | Evaluated |", "| --- | --- | --- | --- | --- |"
+    ]
+    for row in report["rows"]:
+        for backend, result in row["results"].items():
+            if result.get("status") != "ok":
+                continue
+            lines.append("| " + " | ".join(
+                cell(v) for v in [
+                    f"{backend} / {row['case']['id']}", result["backend_pin"].get("git_sha")
+                    or "unknown (package hash in JSON)", result["runtime"]["compiler_sha256"][:16], result["candidate"]
+                    ["id"],
+                    f"{result.get('evaluated_candidates', 'weekly control')}; discovery {result.get('discovery_status', 'not_requested')}"
+                ]) + " |")
+    lines += [
+        "",
+        f"Candidate budget: {report['budget']}. Discovery and failed candidate details are in report.json and candidate logs.",
+        ""
+    ]
+    return "\n".join(lines)
+
+
+def reproduce_command(python, request):
+    return shlex.join([str(python), str(ROOT / "appctl.py"), "reproduce", "--request", str(request)])

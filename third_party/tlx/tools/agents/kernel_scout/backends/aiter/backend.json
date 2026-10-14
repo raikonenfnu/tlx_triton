@@ -1,0 +1,15 @@
+{
+  "id": "aiter",
+  "vendors": [
+    "amd"
+  ],
+  "architectures": [
+    "gfx950"
+  ],
+  "operations": [
+    "mm",
+    "flash_attn",
+    "flash_attn_varlen"
+  ],
+  "cadence": "weekly"
+}

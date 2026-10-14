@@ -1,0 +1,14 @@
+{
+  "id": "pytorch",
+  "vendors": [
+    "amd",
+    "nvidia"
+  ],
+  "architectures": [],
+  "operations": [
+    "mm",
+    "flash_attn",
+    "flash_attn_varlen"
+  ],
+  "cadence": "weekly"
+}

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "vendor": "amd",
+    "architectures": [
+      "gfx950"
+    ]
+  },
+  "output_policy": "returned_tensor",
+  "metric": "compute",
+  "timing": {
+    "warmup_ms": 25,
+    "rep_ms": 100,
+    "repeats": 5,
+    "max_relative_spread": 0.15,
+    "tie_fraction": 0.03
+  },
+  "correctness": {
+    "seeds": [
+      17,
+      29
+    ],
+    "rtol": 0.02,
+    "atol": 0.02
+  },
+  "skills": [
+    "benchmark-fairness"
+  ],
+  "id": "a16w16_gemm",
+  "operation": "mm",
+  "cases": [
+    {
+      "id": "square_512",
+      "dtype": "float16",
+      "m": 512,
+      "n": 512,
+      "k": 512,
+      "b_layout": "column_major"
+    },
+    {
+      "id": "square_4096",
+      "dtype": "bfloat16",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "b_layout": "column_major"
+    }
+  ]
+}
