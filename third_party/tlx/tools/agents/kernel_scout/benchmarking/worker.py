@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from contracts import REPOSITORY, digest, harness_digest, read_json, work, write_json
+from contracts import digest, harness_digest, read_json, work, write_json
 
 from benchmarking.environment import assert_idle, conditions, inspect_device, package_identity, runtime_identity
 
@@ -36,7 +36,7 @@ def measure(request):
         fn = module(path, "scout_candidate").build(case, candidate["params"])
     else:
         fn = build(request["backend"], operation, case, candidate["params"])
-    runtime = runtime_identity(request.get("repository", REPOSITORY))
+    runtime = runtime_identity()
     backend_pin = package_identity("aiter") if request["backend"] == "aiter" else (
         {"git_sha": torch.version.git_version, "version": torch.__version__}
         if request["backend"] == "pytorch" else runtime["source"])
@@ -99,8 +99,7 @@ def main():
     if args.probe:
         device = inspect_device()
         assert_idle(device)
-        write_json(args.probe,
-                   {"device": device, "runtime": runtime_identity(REPOSITORY), "aiter": package_identity("aiter")})
+        write_json(args.probe, {"device": device, "runtime": runtime_identity(), "aiter": package_identity("aiter")})
         return 0
     if args.request is None or args.output is None:
         parser.error("request and output are required for a measurement")
