@@ -633,6 +633,61 @@ def report(mode="weekly", week="2026-10-12", date="2026-10-14"):
     return {"campaign": "abc", "week": week, "date": date, "mode": mode, "device": {"arch": "gfx950"}}
 
 
+def test_long_report_split_preserves_unicode_rows_and_table_headers():
+    from publication import split_report
+
+    header = "| Problem | Command |\n| --- | --- |"
+    rows = [f"| case_{i} | `reproduce {'µ' * 20} {i}` |" for i in range(10)]
+    chunks = split_report("# Report\n\n" + header + "\n" + "\n".join(rows), max_bytes=240)
+    assert len(chunks) > 1
+    assert all(len(chunk.encode()) <= 240 for chunk in chunks)
+    joined = "\n".join(chunks)
+    assert all(joined.count(row) == 1 for row in rows)
+    assert all(header in chunk for chunk in chunks if "| case_" in chunk)
+
+
+def test_chunked_publication_is_idempotent_and_retires_stale_parts(monkeypatch):
+    import publication
+
+    monkeypatch.setattr(publication, "BODY_BYTES", 240)
+    header = "| Problem | Command |\n| --- | --- |"
+    markdown = "# Report\n\n" + header + "\n" + "\n".join(f"| case_{i} | {'x' * 70} |" for i in range(10))
+    api = FakeGitHub()
+    issue = publish(api, report(), markdown)
+    comments = len(api.comments)
+    assert comments > 1 and "continues" in issue["body"]
+    publish(api, report(), markdown)
+    assert len(api.issues) == 1 and len(api.comments) == comments
+    publish(api, report(mode="nightly"), markdown)
+    nightly_count = len(api.comments)
+    publish(api, report(mode="nightly"), markdown)
+    assert len(api.comments) == nightly_count
+    publish(api, report(mode="nightly"), "short report")
+    nightly_parts = [c for c in api.comments.values() if "mode=nightly;" in c["body"]]
+    assert all("superseded" in c["body"] for c in nightly_parts)
+    assert all("case_" in c["body"] for c in api.comments.values() if "mode=weekly;" in c["body"])
+
+
+def test_failed_continuation_check_does_not_close_previous_week(monkeypatch):
+    import publication
+
+    monkeypatch.setattr(publication, "BODY_BYTES", 50)
+    api = FakeGitHub()
+    old = publish(api, report(week="2026-10-05"), "old")
+    original = api.request
+
+    def request(method, resource, payload=None):
+        result = original(method, resource, payload)
+        if method == "GET" and resource.startswith("issues/comments/"):
+            result["body"] = "corrupted"
+        return result
+
+    monkeypatch.setattr(api, "request", request)
+    with pytest.raises(RuntimeError, match="read-after-write"):
+        publish(api, report(), "a" * 40 + "\n\n" + "b" * 40)
+    assert api.issues[old["number"]]["state"] == "open"
+
+
 def test_publication_rotation_and_daily_upsert():
     api = FakeGitHub()
     previous = publish(api, report(week="2026-10-05"), "old week")

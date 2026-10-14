@@ -190,7 +190,11 @@ Publication is a separate command and previews by default:
 ```
 
 Weekly publication checks the new owned issue before linking and closing previous campaign weeks.
-Nightly publication updates one dated comment on that week's open issue. Local artifacts remain
+Nightly publication updates one dated comment on that week's open issue.
+Long reports use labeled continuation comments with repeated table headers and complete rows.
+Publication checks every part before closing a previous weekly issue.
+Retries update owned parts and mark obsolete continuations as superseded.
+Local artifacts remain
 the detailed evidence. See [deployment instructions](deploy/README.md) for configuration, cron,
 optional source refresh, and failure handling. The runner measures before publishing and does not install cron or update Megabrain automatically.
 
