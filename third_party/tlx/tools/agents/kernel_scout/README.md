@@ -18,7 +18,8 @@ The worker measures those adapters through one shared harness. Agent-reported ti
 ```mermaid
 flowchart TD
     T[Target JSON + backend manifests] --> C[appctl.py: check hardware and contracts]
-    C --> S[Seed recipes + optional agent proposals]
+    C --> G[GPU supervisor: wait for idle ownership]
+    G --> S[Seed recipes + optional agent proposals]
     S --> W[Worker: common inputs, correctness, timing]
     W --> F[Measured feedback]
     F --> S
@@ -35,6 +36,7 @@ a new process. Reports compare those independent measurements and account for ti
 | Component | Responsibility |
 | --- | --- |
 | [appctl.py](appctl.py) | CLI, hardware admission, search loop, worker orchestration, and weekly/nightly state |
+| [gpu_scheduler.py](gpu_scheduler.py) | Startup ownership polling, bounded waiting, and supervisor state |
 | [contracts.py](contracts.py) | Target checks, backend eligibility, work counts, input agreement, and winner rules |
 | [backends/](backends/) | Capability manifests and research instructions. [seeds.py](backends/seeds.py) supplies known variants. |
 | [discovery.py](discovery.py), [coding_agents.py](coding_agents.py) | Prompt context, structured proposals, provider permissions, and timeouts |
@@ -105,6 +107,11 @@ PCI identity. On AMD, it sets ROCR visibility before HIP visibility. Keep the sa
 case filter, GPU, and state directory for weekly and nightly runs. Remove `--case` for all cases.
 Preview creates a run directory but performs no discovery or GPU measurement.
 
+Manual and cron runs share a GPU supervisor. It checks ownership immediately, then once per minute for up to 30 minutes.
+Measurement starts automatically when the GPU becomes idle. Unknown ownership fails immediately.
+Use `--gpu-wait-seconds` and `--gpu-poll-seconds` to change these defaults.
+The run directory records supervisor state in `gpu_admission.json`.
+
 The default `--provider builtin` measures known recipes without an LLM. Add these options to a
 run for discovery:
 
@@ -150,6 +157,7 @@ Run a fresh weekly comparison when every backend must have a current measurement
 STATE/
   baselines/<campaign>/<week>.json       # Immutable weekly report
   runs/<date>_<mode>_<timestamp>/
+    gpu_admission.json                  # GPU supervisor state and ownership checks
     report.md / report.json             # Tables and structured results
     device.json / probe.log             # Hardware and runtime evidence
     <target>/<case>/<backend>/

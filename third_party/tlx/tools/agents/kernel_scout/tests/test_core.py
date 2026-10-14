@@ -534,6 +534,8 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
 
     import appctl
 
+    monkeypatch.setattr(appctl, "wait_for_gpu", lambda *args, **kwargs: None)
+
     target_path = tmp_path / "target.json"
     write_json(target_path, target)
     device = {"vendor": "amd", "arch": "gfx950", "physical_gpu": 0, "name": "GPU"}
@@ -690,12 +692,86 @@ def test_deployment_uses_argument_lists_and_success_pointer(tmp_path):
     spec.loader.exec_module(module)
     config = {
         "python": "/venv/bin/python", "targets": ["/source/target with spaces.json"], "state": "/state with spaces",
-        "provider": "claude", "model": "model", "rounds": 1
+        "provider": "claude", "model": "model", "rounds": 1, "gpu_wait_seconds": 1800, "gpu_poll_seconds": 60
     }
     argv = module.commands(config, "nightly", tmp_path / "pointer.json")
     assert "/source/target with spaces.json" in argv
     assert argv[argv.index("--state") + 1] == "/state with spaces"
     assert argv[argv.index("--report-pointer") + 1] == str(tmp_path / "pointer.json")
+    assert argv[argv.index("--gpu-wait-seconds") + 1] == "1800"
+    assert argv[argv.index("--gpu-poll-seconds") + 1] == "60"
+
+
+@pytest.mark.parametrize("busy_checks,timeout", [(0, False), (2, False), (31, True)])
+def test_gpu_scheduler_waits_once_per_minute_with_a_30_minute_limit(tmp_path, monkeypatch, busy_checks, timeout):
+    import gpu_scheduler
+
+    now, sleeps, checks = [0.0], [], []
+
+    def busy(physical, vendor):
+        assert (physical, vendor) == (1, "amd")
+        checks.append(now[0])
+        return "selected GPU has external processes: [123]" if len(checks) <= busy_checks else None
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(gpu_scheduler, "busy_reason", busy)
+    monkeypatch.setattr(gpu_scheduler.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(gpu_scheduler.time, "sleep", sleep)
+    path = tmp_path / "admission.json"
+    if timeout:
+        with pytest.raises(TimeoutError, match="stayed busy for 1800s"):
+            gpu_scheduler.wait_for_gpu(1, "amd", status_path=path)
+    else:
+        gpu_scheduler.wait_for_gpu(1, "amd", status_path=path)
+    assert checks == list(range(0, min(busy_checks, 30) * 60 + 1, 60))
+    assert sleeps == [60] * min(busy_checks, 30)
+    assert json.loads(path.read_text())["state"] == ("timed_out" if timeout else "ready")
+
+
+@pytest.mark.parametrize("message,retryable", [("selected GPU has external processes: [123]", True),
+                                               ("cannot inspect selected GPU ownership", False)])
+def test_gpu_scheduler_retries_ownership_only(monkeypatch, message, retryable):
+    import gpu_scheduler
+
+    monkeypatch.setattr(gpu_scheduler, "command", lambda args: '[{"gpu": 1, "kfd_id": 999}]')
+
+    def check(device):
+        assert device == {"physical_gpu": 1, "vendor": "amd", "kfd_id": 999}
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(gpu_scheduler, "assert_idle", check)
+    if retryable:
+        assert gpu_scheduler.busy_reason(1, "amd") == message
+    else:
+        with pytest.raises(RuntimeError, match=message):
+            gpu_scheduler.busy_reason(1, "amd")
+
+
+def test_gpu_scheduler_does_not_wait_on_an_inspection_failure(tmp_path, monkeypatch):
+    import gpu_scheduler
+
+    def fail(*args):
+        raise RuntimeError("KFD process ownership is unavailable")
+
+    monkeypatch.setattr(gpu_scheduler, "busy_reason", fail)
+    monkeypatch.setattr(gpu_scheduler.time, "sleep", lambda seconds: pytest.fail("inspection errors must not retry"))
+    path = tmp_path / "admission.json"
+    with pytest.raises(RuntimeError, match="KFD process ownership"):
+        gpu_scheduler.wait_for_gpu(1, "amd", status_path=path)
+    assert json.loads(path.read_text())["state"] == "failed"
+
+
+@pytest.mark.parametrize("wait,poll", [(-1, 60), (float("nan"), 60), (1800, 0), (1800, float("inf"))])
+def test_gpu_scheduler_rejects_invalid_wait_parameters(monkeypatch, wait, poll):
+    import gpu_scheduler
+
+    monkeypatch.setattr(gpu_scheduler, "busy_reason",
+                        lambda *args: pytest.fail("invalid parameters must not inspect GPUs"))
+    with pytest.raises(ValueError):
+        gpu_scheduler.wait_for_gpu(1, "amd", wait_seconds=wait, poll_seconds=poll)
 
 
 def test_pci_guard_rejects_wrong_physical_gpu():

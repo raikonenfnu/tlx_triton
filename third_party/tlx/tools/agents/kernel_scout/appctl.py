@@ -25,6 +25,7 @@ from contracts import (
     write_json,
 )
 from discovery import discover
+from gpu_scheduler import wait_for_gpu
 from publication import GitHub, publish
 from reporting import describe, render, reproduce_command
 from target_templates import create_target
@@ -214,6 +215,8 @@ def run(args):
     # One lock per physical GPU across state directories used by this user.
     gpu_lock = Path.home() / ".cache/tlx-kernel-scout" / f"gpu-{args.gpu}.lock"
     with locked(gpu_lock), locked(args.state / "controller.lock"):
+        wait_for_gpu(args.gpu, runtime["vendor"], wait_seconds=getattr(args, "gpu_wait_seconds", 1800),
+                     poll_seconds=getattr(args, "gpu_poll_seconds", 60), status_path=directory / "gpu_admission.json")
         identity = probe(runtime, args.gpu, directory)
         if not Path(identity["runtime"]["triton_module"]).is_relative_to(REPOSITORY / "python"):
             raise ValueError("base runtime must import source TLX from this checkout; check PYTHONPATH")
@@ -343,6 +346,8 @@ def main():
     measure.add_argument("--model")
     measure.add_argument("--context", type=Path, help="explicit Megabrain context pack for discovery agents")
     measure.add_argument("--gpu", type=int, default=0)
+    measure.add_argument("--gpu-wait-seconds", type=float, default=1800, help="maximum startup wait for a busy GPU")
+    measure.add_argument("--gpu-poll-seconds", type=float, default=60, help="interval between GPU ownership checks")
     measure.add_argument("--date", help="ISO UTC report date, defaults to today")
     measure.add_argument("--case", action="append")
     measure.add_argument("--max-candidates", type=int, default=6)

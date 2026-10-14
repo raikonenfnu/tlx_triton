@@ -23,7 +23,7 @@ def commands(config, mode, pointer):
     for key in ("context", "runtimes", "model"):
         if config.get(key):
             command.extend(["--" + key, config[key]])
-    for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout"):
+    for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout", "gpu_wait_seconds", "gpu_poll_seconds"):
         if key in config:
             command.extend(["--" + key.replace("_", "-"), str(config[key])])
     if config.get("aiter_search", False):
