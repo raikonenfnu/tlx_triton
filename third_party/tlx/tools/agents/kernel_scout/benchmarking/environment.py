@@ -133,7 +133,16 @@ def assert_idle(device):
         raise RuntimeError(f"selected GPU has external processes: {foreign}")
 
 
-def runtime_identity(repository):
+def compiler_source_identity(module_path):
+    """Pin the imported compiler, including a separate backend checkout."""
+    root = Path(module_path).resolve().parent
+    repository = root.parent.parent
+    if root == repository / "python/triton" and (repository / ".git").exists():
+        return source_identity(repository)
+    return package_identity("triton")
+
+
+def runtime_identity():
     import torch
     import triton
     import triton._C.libtriton as native
@@ -156,7 +165,7 @@ def runtime_identity(repository):
             key: hashlib.sha256(Path(value).read_bytes()).hexdigest()
             for key, value in os.environ.items()
             if key.startswith("AITER_CONFIG_") and Path(value).is_file()
-        }, "triton_module": str(Path(triton.__file__).resolve()), "source": source_identity(repository)
+        }, "triton_module": str(Path(triton.__file__).resolve()), "source": compiler_source_identity(triton.__file__)
     }
     return identity
 
@@ -185,6 +194,11 @@ def package_identity(name):
     root = Path(spec.origin).resolve().parent
     try:
         repository = Path(command(["git", "-C", str(root), "rev-parse", "--show-toplevel"]))
+        # A wheel inside another repository is not that repository's source package.
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--",
+             str(Path(spec.origin).resolve().relative_to(repository))], cwd=repository, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         sha = command(["git", "-C", str(root), "rev-parse", "HEAD"])
         dirty = bool(command(["git", "-C", str(root), "status", "--porcelain"]))
     except subprocess.CalledProcessError:

@@ -124,7 +124,10 @@ def work(case, operation):
 
 
 def enforce_equal_inputs(results):
-    measured = [r for r in results.values() if r.get("status") in {"ok", "unstable"}]
+    # An all-unstable search summary has no measurement or input fingerprint.
+    measured = [
+        r for r in results.values() if r.get("status") == "ok" or (r.get("status") == "unstable" and "latency_ms" in r)
+    ]
     hashes = {r.get("input_sha256") for r in measured}
     if None in hashes or len(hashes) > 1:
         for result in measured:

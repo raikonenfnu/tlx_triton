@@ -249,6 +249,51 @@ def test_namespace_package_is_unavailable(monkeypatch):
     assert result["status"] == "unavailable" and "namespace" in result["error"]
 
 
+def test_compiler_source_uses_its_own_checkout(tmp_path):
+    from benchmarking.environment import compiler_source_identity
+
+    repository = tmp_path / "external-triton"
+    module = repository / "python/triton/__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("# compiler source\n")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C",
+        str(repository), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm",
+        "compiler fixture"
+    ], check=True)
+    sha = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+    initial = compiler_source_identity(module)
+    assert initial["git_sha"] == sha and not initial["dirty"]
+    module.write_text("# changed compiler source\n")
+    changed = compiler_source_identity(module)
+    assert changed["git_sha"] == sha and changed["dirty"]
+    assert changed["kernel_tree_sha256"] != initial["kernel_tree_sha256"]
+
+
+def test_package_wheel_does_not_borrow_parent_repository(tmp_path, monkeypatch):
+    import importlib.metadata
+
+    from benchmarking.environment import package_identity
+
+    (tmp_path / "tracked.py").write_text("")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C",
+        str(tmp_path), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "unrelated fixture"
+    ], check=True)
+    wheel = tmp_path / "venv/site-packages/triton/__init__.py"
+    wheel.parent.mkdir(parents=True)
+    wheel.write_text("# installed wheel\n")
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: SimpleNamespace(origin=str(wheel)))
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "wheel-version")
+    result = package_identity("triton")
+    assert result["git_sha"] is None and result["repository"] is None
+    assert result["version"] == "wheel-version"
+
+
 def test_proposal_source_and_budget_validation(tmp_path):
     response = {
         "status":
@@ -584,6 +629,31 @@ def test_input_fingerprints_gate_comparisons(hashes):
     enforce_equal_inputs(results)
     expected = "ok" if hashes == ("same", "same") else "failed"
     assert all(r["status"] == expected for r in results.values())
+
+
+def test_unstable_search_summary_does_not_reject_measured_inputs():
+    from contracts import enforce_equal_inputs
+
+    results = {
+        "aiter": {"status": "ok", "latency_ms": 1, "input_sha256":
+                  "same"}, "torch": {"status": "ok", "latency_ms": 2, "input_sha256": "same"}, "tlx":
+        {"status": "unstable", "error": "no stable correct candidate", "evaluated_candidates": 2}
+    }
+    enforce_equal_inputs(results)
+    assert results["aiter"]["status"] == results["torch"]["status"] == "ok"
+    assert results["tlx"]["status"] == "unstable"
+
+
+@pytest.mark.parametrize("fingerprint", [None, "different"])
+def test_unstable_measurement_still_checks_input_fingerprint(fingerprint):
+    from contracts import enforce_equal_inputs
+
+    results = {
+        "aiter": {"status": "ok", "latency_ms": 1, "input_sha256": "same"}, "tlx":
+        {"status": "unstable", "latency_ms": 2, "input_sha256": fingerprint}
+    }
+    enforce_equal_inputs(results)
+    assert all(r["status"] == "failed" for r in results.values())
 
 
 @pytest.mark.parametrize("operation", ["mm", "flash_attn", "flash_attn_varlen"])

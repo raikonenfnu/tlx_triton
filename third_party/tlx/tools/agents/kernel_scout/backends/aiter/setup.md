@@ -73,7 +73,7 @@ Save a runtime override outside the checkout:
 {
   "aiter": {
     "python": "/path/to/venv/aiter.venv/bin/python",
-    "pythonpath": "/path/to/triton/python:/path/to/aiter:/path/to/rocm-torch/site-packages"
+    "pythonpath": "/path/to/aiter-triton/python:/path/to/aiter:/path/to/rocm-torch/site-packages"
   }
 }
 ```
@@ -93,6 +93,9 @@ From the Kernel Scout directory, run a small weekly comparison:
 
 Set the main runtime's source-first `PYTHONPATH` before this command.
 Use the same override and environment for nightly reuse.
+Keep AITER's compiler checkout pinned during the week.
+Use a separate source-built compiler checkout when the main TLX checkout changes nightly.
+The worker records the compiler it actually imports.
 Check AITER's candidate measurements, input fingerprints, and selected confirmation.
 Run its report reproduction command before accepting the setup.
 Repeat with dense attention, GEMM, and the full packed-attention target.
