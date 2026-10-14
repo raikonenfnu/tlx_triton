@@ -53,6 +53,8 @@ def worker_environment(gpu, runtime):
         env.pop("ROCR_VISIBLE_DEVICES", None)
         env.pop("HIP_VISIBLE_DEVICES", None)
     env.pop("GPU_DEVICE_ORDINAL", None)
+    if runtime.get("python"):
+        env["PATH"] = str(Path(runtime["python"]).absolute().parent) + os.pathsep + env.get("PATH", "")
     if runtime.get("pythonpath"):
         env["PYTHONPATH"] = runtime["pythonpath"]
     return env
@@ -130,7 +132,7 @@ def evaluate(backend, target, case, candidate, directory, runtime, args):
     return result
 
 
-def scout(backend, target, case, directory, runtime, args):
+def scout(backend, target, case, directory, runtime, args, *, research=None):
     directory.mkdir(parents=True, exist_ok=True)
     seeds = candidates(backend, target["operation"])
     feedback = []
@@ -147,7 +149,8 @@ def scout(backend, target, case, directory, runtime, args):
         proposal_dir = directory / f"discovery_r{round_number}"
         proposal_dir.mkdir()
         response, proposals = discover(args.provider, backend, target, case, feedback, proposal_dir, remaining,
-                                       model=args.model, context=args.context, timeout=args.agent_timeout)
+                                       model=args.model, context=args.context, timeout=args.agent_timeout,
+                                       research=research)
         write_json(directory / f"discovery_{round_number}.json", response)
         discovery_status, discovery_summary = response["status"], response["summary"]
         remaining -= len(proposals)
@@ -252,6 +255,7 @@ def run(args):
                     continue
                 row = {"target": target, "case": case, "description": describe(target, case), "results": {}}
                 for backend, contract in registry.items():
+                    backend_identity = override_pins.get(backend, identity)
                     if args.mode == "nightly" and contract.get("cadence", "weekly") == "weekly":
                         result = dict(controls[(target["id"], case["id"])]["results"][backend])
                         result["frozen_date"] = baseline["date"]
@@ -259,12 +263,18 @@ def run(args):
                         result = {
                             "status": "unsupported", "error": "backend hardware/operation contract excludes this target"
                         }
-                    elif backend == "aiter" and identity["aiter"]["status"] == "unavailable" and backend not in runtimes:
-                        result = {"status": "unavailable", "error": "AITER is not installed in this runtime"}
+                    elif backend == "aiter" and backend_identity["aiter"]["status"] == "unavailable":
+                        result = {
+                            "status": "unavailable", "error":
+                            backend_identity["aiter"].get("error", "AITER is not installed in this runtime")
+                        }
                     else:
                         backend_runtime = {**runtime, **runtimes.get(backend, {})}
+                        research = {"runtime": backend_identity["runtime"], "worker_runtime": backend_runtime}
+                        if backend == "aiter":
+                            research["package"] = backend_identity["aiter"]
                         result = scout(backend, target, case, directory / target["id"] / case["id"] / backend,
-                                       backend_runtime, args)
+                                       backend_runtime, args, research=research)
                     row["results"][backend] = result
                     print(f"{target['id']}/{case['id']}: {backend} {result['status']}", flush=True)
                 enforce_equal_inputs(row["results"])

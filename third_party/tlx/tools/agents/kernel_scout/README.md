@@ -125,6 +125,8 @@ For separate backend environments, supply `--runtimes /path/to/runtimes.json`:
 
 Every runtime must select the same physical device and preserve the operation contract.
 Scout records runtime differences. Dependency installation and source builds remain deployment tasks.
+For AITER, follow [virtual environment setup](backends/aiter/setup.md) before running discovery.
+Its agent researches the installed AITER checkout and receives that runtime's source identity.
 
 ## Weekly state and operation
 

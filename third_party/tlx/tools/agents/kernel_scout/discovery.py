@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 
 from coding_agents import query_json
 from contracts import NAME, REPOSITORY, ROOT
@@ -57,10 +58,15 @@ def validate_proposals(response, directory, remaining):
     return result
 
 
-def discover(provider, backend, target, case, feedback, directory, remaining, *, model=None, context=None, timeout=300):
+def discover(provider, backend, target, case, feedback, directory, remaining, *, model=None, context=None, timeout=300,
+             research=None):
     instructions = (ROOT / "backends" / backend / "instructions.md").read_text()
     fairness = (ROOT / "skills/benchmark-fairness/SKILL.md").read_text()
     registration = (ROOT / "skills/register-backend/SKILL.md").read_text()
+    workspace = REPOSITORY
+    if backend == "aiter" and research and research.get("package", {}).get("status") == "available":
+        package = research["package"]
+        workspace = Path(package.get("repository") or package["module"])
     prompt = f"""Find the best observed existing kernel variants for this backend and exact target.
 Read source before selecting entry points. Do not install dependencies, edit source, run benchmarks,
 or publish memory. Return at most {remaining} adapter proposals. Return an empty list if no justified
@@ -79,11 +85,14 @@ Benchmark skill:
 {fairness}
 Registration contract:
 {registration}
+Installed runtime and source identity:
+{json.dumps(research, indent=2)}
+Research workspace: {workspace}
 Target and case:
 {json.dumps({'target': target, 'case': case}, indent=2)}
 Measured feedback (not a request to infer unmeasured performance):
 {json.dumps(feedback, indent=2)}
 """
-    response = query_json(provider, prompt, workspace=REPOSITORY, schema=SCHEMA, model=model, context_path=context,
+    response = query_json(provider, prompt, workspace=workspace, schema=SCHEMA, model=model, context_path=context,
                           timeout_seconds=timeout)
     return response, validate_proposals(response, directory, remaining)

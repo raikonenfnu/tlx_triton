@@ -147,14 +147,29 @@ def runtime_identity(repository):
         hashlib.sha256(Path(triton.testing.__file__).read_bytes()).hexdigest(), "performance_environment": {
             key: value
             for key, value in os.environ.items()
-            if key in {
+            if key.startswith(("AITER_", "FLYDSL_")) or key in {
                 "TORCH_BLAS_PREFER_HIPBLASLT", "PYTORCH_TUNABLEOP_ENABLED", "PYTORCH_TUNABLEOP_TUNING",
                 "NVIDIA_TF32_OVERRIDE", "HSA_OVERRIDE_GFX_VERSION", "TRITON_ALWAYS_COMPILE", "TRITON_DEFAULT_FP_FUSION",
-                "TRITON_ENABLE_C_CACHE"
+                "TRITON_ENABLE_C_CACHE", "ENABLE_CK", "CK_DIR", "GPU_ARCHS", "ROCM_PATH", "HIPCC_FLAGS_APPEND"
             }
+        }, "configuration_sha256": {
+            key: hashlib.sha256(Path(value).read_bytes()).hexdigest()
+            for key, value in os.environ.items()
+            if key.startswith("AITER_CONFIG_") and Path(value).is_file()
         }, "triton_module": str(Path(triton.__file__).resolve()), "source": source_identity(repository)
     }
     return identity
+
+
+def git_source_files(repository):
+    """Include tuning data and submodule sources, but exclude ignored JIT output."""
+    names = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"], repository).splitlines()
+    for name in sorted(set(names)):
+        path = repository / name
+        if path.is_file():
+            yield path
+        elif path.is_dir() and (path / ".git").exists():
+            yield from git_source_files(path)
 
 
 def package_identity(name):
@@ -165,21 +180,33 @@ def package_identity(name):
     spec = importlib.util.find_spec(name)
     if spec is None:
         return {"status": "unavailable"}
+    if spec.origin is None:
+        return {"status": "unavailable", "error": f"{name} resolves to a namespace; add its checkout to PYTHONPATH"}
     root = Path(spec.origin).resolve().parent
     try:
+        repository = Path(command(["git", "-C", str(root), "rev-parse", "--show-toplevel"]))
         sha = command(["git", "-C", str(root), "rev-parse", "HEAD"])
         dirty = bool(command(["git", "-C", str(root), "status", "--porcelain"]))
     except subprocess.CalledProcessError:
-        sha, dirty = None, None
+        repository, sha, dirty = None, None, None
     try:
-        version = importlib.metadata.version(name)
+        version = importlib.metadata.version("amd-aiter" if name == "aiter" else name)
     except importlib.metadata.PackageNotFoundError:
         version = None
+    dependencies = {}
+    if name == "aiter":
+        for dependency in ("flydsl", "numpy", "pandas", "einops", "ninja", "pybind11"):
+            try:
+                dependencies[dependency] = importlib.metadata.version(dependency)
+            except importlib.metadata.PackageNotFoundError:
+                dependencies[dependency] = None
     hasher = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.suffix in {".py", ".so"}):
-        hasher.update(str(path.relative_to(root)).encode())
+    files = git_source_files(repository) if repository else sorted(
+        p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts and "build" not in p.parts)
+    for path in files:
+        hasher.update(str(path.relative_to(repository or root)).encode() + b"\0")
         hasher.update(path.read_bytes())
     return {
         "status": "available", "git_sha": sha, "version": version, "dirty": dirty, "source_sha256": hasher.hexdigest(),
-        "module": str(root)
+        "module": str(root), "repository": str(repository) if repository else None, "dependencies": dependencies
     }
