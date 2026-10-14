@@ -86,3 +86,5 @@ publication. Publication checks a new weekly issue before linking and closing ea
 issues. Nightly updates one dated comment. Re-running publish is idempotent. Unrelated issues
 are excluded by campaign ownership markers. Raw logs, adapters, and reproducer requests remain
 local. Archive run directories separately if reports need to be reproduced on another machine.
+Long reports continue in labeled, verified comments without truncating table rows or reproducer commands.
+Publication retries update the owned parts. Obsolete continuation comments receive a superseded notice.
