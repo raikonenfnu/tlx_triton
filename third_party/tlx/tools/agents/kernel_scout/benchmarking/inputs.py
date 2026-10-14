@@ -1,8 +1,22 @@
 """The harness alone defines input data and the FP32 correctness oracle."""
 
+import ctypes
+import hashlib
 import itertools
+import json
 
 import torch
+
+
+def input_digest(inputs):
+    """Check actual tensor bits and strides across independently configured runtimes."""
+    hasher = hashlib.sha256()
+    for name, value in sorted(inputs.items()):
+        metadata = (name, str(value.dtype), tuple(value.shape), value.stride())
+        hasher.update(json.dumps(metadata).encode())
+        dense = value.detach().contiguous().cpu()
+        hasher.update(ctypes.string_at(dense.data_ptr(), dense.numel() * dense.element_size()))
+    return hasher.hexdigest()
 
 
 def make_inputs(case, operation, seed):

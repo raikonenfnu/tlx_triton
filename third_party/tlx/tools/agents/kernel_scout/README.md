@@ -15,7 +15,8 @@ Additional targets cover a16w16 GEMM and BF16 dense attention.
 ## Common benchmark contract
 
 Every backend receives the same seeded data, dtype, shapes, strides, mask semantics, and output
-layout. `benchmarking/inputs.py` owns generation and an independent FP32 oracle. At least two
+layout. Workers hash tensor bits and strides for every seed and reject different input fingerprints across backends.
+`benchmarking/inputs.py` owns generation and an independent FP32 oracle. At least two
 seeds check outputs, input mutation, finiteness, and output aliasing. Each timed call returns a
 new canonical output tensor. Required padding, packing, copies, and extraction are included.
 This matters for packed attention: a pre-padded Torch call and a packed TLX call have different

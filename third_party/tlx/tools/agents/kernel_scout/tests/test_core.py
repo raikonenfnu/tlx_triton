@@ -303,9 +303,10 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
         request = directory / "request.json"
         write_json(request, {"expected_identity": identity})
         return {
-            "status": "ok", "latency_ms": 1, "p20_ms": 0.9, "p80_ms": 1.1, "tflops": 1, "logical_tbps": 1, "runtime":
-            identity["runtime"], "backend_pin": {"git_sha": "source"}, "candidate": {"id": "seed"}, "reproducer":
-            str(request), "request_sha256": digest(json.loads(request.read_text())), "reproducer_command": "command"
+            "status": "ok", "input_sha256": "same-inputs", "latency_ms": 1, "p20_ms": 0.9, "p80_ms": 1.1, "tflops": 1,
+            "logical_tbps": 1, "runtime": identity["runtime"], "backend_pin": {"git_sha": "source"}, "candidate":
+            {"id": "seed"}, "reproducer": str(request), "request_sha256": digest(json.loads(request.read_text())),
+            "reproducer_command": "command"
         }
 
     monkeypatch.setattr(appctl, "scout", fake_scout)
@@ -322,6 +323,7 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     report_path = json.loads(args.report_pointer.read_text())["report"]
     nightly = json.loads(Path(report_path).read_text())
     controls = nightly["rows"][0]["results"]
+    assert all(controls[name]["status"] == "ok" for name in ("pytorch", "tlx_ops", "tlx_tutorials", "tlx_ops_baseline"))
     assert controls["pytorch"]["frozen_date"] == controls["tlx_ops_baseline"]["frozen_date"] == "2026-10-14"
     args.mode = "weekly"
     with pytest.raises(ValueError, match="immutable"):
@@ -434,3 +436,12 @@ def test_scout_keeps_failure_categories(status, tmp_path, monkeypatch, target):
     args = SimpleNamespace(provider="builtin", max_candidates=1, rounds=0)
     result = appctl.scout("tlx_ops", target, target["cases"][0], tmp_path / "ops", {}, args)
     assert result["status"] == status and result["error"] == "diagnostic"
+
+
+@pytest.mark.parametrize("hashes", [("same", "same"), ("a", "b"), ("a", None)])
+def test_input_fingerprints_gate_comparisons(hashes):
+    from contracts import enforce_equal_inputs
+    results = {str(i): {"status": "ok", "input_sha256": value} for i, value in enumerate(hashes)}
+    enforce_equal_inputs(results)
+    expected = "ok" if hashes == ("same", "same") else "failed"
+    assert all(r["status"] == expected for r in results.values())
