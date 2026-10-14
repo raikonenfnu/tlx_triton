@@ -59,7 +59,10 @@ uses known seed recipes without an LLM. Set `--provider codex` or `claude` for a
 ```
 
 `--case one_x_1000` selects a small PR smoke case. Use the same filter for weekly and nightly.
-`--gpu` is the physical GPU index. The worker exposes that device as logical GPU 0 before import.
+`--gpu` is the physical GPU index. On AMD, the worker sets ROCR visibility before HIP visibility.
+It checks Torch's PCI address against the selected physical device before measuring.
+The selected device appears as logical GPU 0. HIP visibility alone did not select the intended
+physical device in the checked ROCm 7.1 runtime.
 `--model`, `--agent-timeout`, and `--worker-timeout` bound each worker. `--max-candidates` includes
 seeds, and `--rounds` bounds discovery iterations. Authentication/provider failures stop the run.
 Unsupported or failed kernel candidates remain recorded. Missing AITER is unavailable.
@@ -104,7 +107,8 @@ See [deployment instructions](deploy/README.md) for the nightly runner and cron 
 
 ```bash
 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
-SCOUT_TEST_GPU=1 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
+ROCR_VISIBLE_DEVICES=2 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 SCOUT_PHYSICAL_GPU=2 \
+  SCOUT_TEST_GPU=1 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
 ```
 
 CPU tests cover contracts, arithmetic, selection, baseline checks, fake Codex/Claude protocols,
