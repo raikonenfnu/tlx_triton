@@ -175,12 +175,63 @@ def test_aiter_gemm_adapter_keeps_output_dtype_and_measured_packing(monkeypatch)
     module.gemm_a16w16 = lambda *a, **kw: calls.append((a, kw)) or "output"
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
-    run = build("aiter", "mm", {}, {"persistent": True})
+    run = build("aiter", "mm", {}, {"implementation": "triton", "persistent": True})
     assert not packed
     a = SimpleNamespace(dtype="float16")
     assert run({"a": a, "b": SimpleNamespace(T=weight)}) == "output"
     assert packed == ["packed"]
     assert calls == [((a, "weight"), {"dtype": "float16", "persistent": True})]
+
+
+def test_aiter_public_gemm_records_dispatch_and_preserves_contract(monkeypatch):
+    from backends.seeds import build
+
+    calls, packing = [], []
+    torch = ModuleType("torch")
+    torch.float16 = "float16"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    module = ModuleType("aiter.tuned_gemm")
+    module.get_GEMM_A16W16_config = lambda **kw: {"libtype": "torch", "kernelName": ""}
+    module.gemm_a16w16 = lambda *a, **kw: calls.append((a, kw)) or "output"
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    run = build("aiter", "mm", {"dtype": "float16", "m": 2, "n": 3, "k": 4}, {})
+    assert not packing
+    assert run.scout_metadata["implementation"] == "torch"
+    a = SimpleNamespace(dtype="float16")
+    weight = SimpleNamespace(contiguous=lambda: packing.append(True) or "weight")
+    assert run({"a": a, "b": SimpleNamespace(T=weight)}) == "output"
+    assert packing == [True] and calls == [((a, "weight"), {"otype": "float16"})]
+
+
+@pytest.mark.parametrize("operation", ["mm", "flash_attn", "flash_attn_varlen"])
+def test_aiter_defaults_to_one_public_operator(operation):
+    from backends.seeds import candidates
+
+    assert candidates("aiter", operation) == [{"id": "public_api", "params": {}}]
+    assert len(candidates("aiter", operation, search=True)) == 3
+
+
+@pytest.mark.parametrize("search", [False, True])
+def test_aiter_discovery_needs_explicit_search_flag(tmp_path, monkeypatch, target, search):
+    import appctl
+
+    calls = []
+    args = SimpleNamespace(provider="claude", aiter_search=search, max_candidates=6, rounds=1, model=None, context=None,
+                           agent_timeout=5)
+
+    def evaluate(*args):
+        return {"status": "ok", "latency_ms": 1, "candidate": args[3]}
+
+    def discover(*a, **kw):
+        calls.append("discovery")
+        return {"status": "complete", "summary": "source inspected", "candidates": []}, []
+
+    monkeypatch.setattr(appctl, "evaluate", evaluate)
+    monkeypatch.setattr(appctl, "discover", discover)
+    result = appctl.scout("aiter", target, target["cases"][0], tmp_path, {}, args)
+    assert result["status"] == "ok"
+    assert result["evaluated_candidates"] == (3 if search else 1)
+    assert calls == (["discovery"] if search else [])
 
 
 def test_aiter_discovery_uses_installed_checkout(tmp_path, monkeypatch, target):
@@ -531,6 +582,25 @@ def test_report_escapes_table_cells():
     text = render(r)
     assert "shape \\| value" in text and "a \\| b line" in text
     assert "| none |" in text
+
+
+def test_report_labels_public_gemm_torch_fallback():
+    from reporting import render
+
+    r = report()
+    result = {
+        **measurement(1), "tflops": 1, "candidate": {"id": "public_api"}, "backend_pin": {"git_sha": "aiter"},
+        "runtime": {"compiler_sha256": "compiler"}, "adapter_metadata": {"implementation": "torch"}
+    }
+    r.update(
+        device={"name": "GPU",
+                "arch": "gfx950", "physical_gpu": 0}, provider="builtin", columns=["aiter"], budget={}, rows=[{
+                    "description":
+                    "GEMM", "case": {"id": "one"}, "target": {"metric": "compute", "timing": {"tie_fraction": 0.03}},
+                    "results": {"aiter": result}
+                }])
+    text = render(r)
+    assert "Torch fallback" in text and "| Dispatch |" in text
 
 
 def test_weekly_publication_does_not_close_future_or_unrelated_issue():

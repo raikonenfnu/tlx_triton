@@ -26,6 +26,8 @@ def commands(config, mode, pointer):
     for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout"):
         if key in config:
             command.extend(["--" + key.replace("_", "-"), str(config[key])])
+    if config.get("aiter_search", False):
+        command.append("--aiter-search")
     return command
 
 

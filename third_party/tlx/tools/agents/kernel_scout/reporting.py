@@ -24,6 +24,7 @@ def render(report):
         f"# TLX Kernel Scout — {report['date']} ({report['mode']})", "",
         f"Device: {report['device']['name']}, {report['device']['arch']}, physical GPU {report['device']['physical_gpu']}.",
         f"Week: {report['week']}. Campaign: `{report['campaign']}`. Provider: {report['provider']}.",
+        f"AITER mode: {report.get('aiter_mode', 'search (legacy report)')}.",
         "Best observed among evaluated candidates; unavailable and unstable results cannot win.",
         "All calls use returned tensors, eager triton.testing.do_bench, and the same seeded logical inputs.",
         "Weekly controls are frozen observations, not simultaneous nightly measurements.", "",
@@ -38,7 +39,9 @@ def render(report):
                 metric = "tflops" if row["target"]["metric"] == "compute" else "logical_tbps"
                 unit = "TFLOP/s" if metric == "tflops" else "logical TB/s"
                 frozen = f"; frozen {result['frozen_date']}" if "frozen_date" in result else ""
-                values.append(f"{result[metric]:.3f} {unit}; {result['latency_ms'] * 1000:.2f} µs{frozen}")
+                fallback = "; Torch fallback" if result.get("adapter_metadata",
+                                                            {}).get("implementation") == "torch" else ""
+                values.append(f"{result[metric]:.3f} {unit}; {result['latency_ms'] * 1000:.2f} µs{frozen}{fallback}")
             else:
                 values.append(result["status"] + (": " + result.get("error", "")[:110] if result.get("error") else ""))
         results = {k: v for k, v in row["results"].items() if report["mode"] != "weekly" or k != "tlx_ops_baseline"}
@@ -61,7 +64,8 @@ def render(report):
         lines.append("| " + " | ".join(cell(v) for v in [row["description"], *values]) + " |")
     lines += [
         "", "## Provenance and search coverage", "",
-        "| Backend / case | Source commit | Compiler hash | Variant | Evaluated |", "| --- | --- | --- | --- | --- |"
+        "| Backend / case | Source commit | Compiler hash | Variant | Dispatch | Evaluated |",
+        "| --- | --- | --- | --- | --- | --- |"
     ]
     for row in report["rows"]:
         for backend, result in row["results"].items():
@@ -72,6 +76,7 @@ def render(report):
                     f"{backend} / {row['case']['id']}", result["backend_pin"].get("git_sha")
                     or "unknown (package hash in JSON)", result["runtime"]["compiler_sha256"][:16], result["candidate"]
                     ["id"],
+                    result.get("adapter_metadata", {}).get("implementation", "implementation defaults"),
                     f"{result.get('evaluated_candidates', 'weekly control')}; discovery {result.get('discovery_status', 'not_requested')}"
                 ]) + " |")
     lines += [
