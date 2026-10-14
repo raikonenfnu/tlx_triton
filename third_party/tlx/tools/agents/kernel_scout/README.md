@@ -35,6 +35,18 @@ existing implementations and supported launch knobs. Kernel rewriting belongs to
 kernel optimizer. Generated adapters are trusted executable Python. Inspect them when needed.
 Correctness tests do not establish that arbitrary code is honest or safe.
 
+## Add a target or operation
+
+Use [the target creation skill](skills/create-target/SKILL.md) when adding a workload or benchmarker.
+The [authoring guide](skills/create-target/references/target-authoring.md) maps each operation contract to its implementation files.
+Create a starter config with `appctl.py target-init`, edit its cases, and check it before GPU measurements.
+
+```bash
+python appctl.py target-init --id my_varlen_f16_fa \
+  --operation flash_attn_varlen --vendor amd --arch gfx950 \
+  --output targets/amd/gfx950/my_varlen_f16_fa.json
+```
+
 ## Run locally
 
 Use the source-built TLX environment. Put source Triton before any wheel Triton on PYTHONPATH:
