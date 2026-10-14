@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "vendor": "amd",
+    "architectures": [
+      "gfx950"
+    ]
+  },
+  "output_policy": "returned_tensor",
+  "metric": "compute",
+  "timing": {
+    "warmup_ms": 25,
+    "rep_ms": 100,
+    "repeats": 5,
+    "max_relative_spread": 0.15,
+    "tie_fraction": 0.03
+  },
+  "correctness": {
+    "seeds": [
+      17,
+      29
+    ],
+    "rtol": 0.02,
+    "atol": 0.02
+  },
+  "skills": [
+    "benchmark-fairness"
+  ],
+  "id": "bf16_fa",
+  "operation": "flash_attn",
+  "cases": [
+    {
+      "id": "dense_1024",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        1024
+      ],
+      "kv_lengths": [
+        1024
+      ],
+      "heads": 4,
+      "kv_heads": 4,
+      "head_dim": 128,
+      "causal": false
+    },
+    {
+      "id": "dense_1024_causal",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        1024
+      ],
+      "kv_lengths": [
+        1024
+      ],
+      "heads": 4,
+      "kv_heads": 4,
+      "head_dim": 128,
+      "causal": true
+    }
+  ]
+}

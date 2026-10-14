@@ -1,0 +1,37 @@
+# PyTorch reference implementations
+
+Find the fastest observed supported PyTorch implementation under the same inference contract.
+Read the installed Torch version and GPU library availability. Use public Torch operations.
+Do not import TLX/AITER or compiled custom kernels under this backend. The oracle is independent
+FP32 math. It is not the performance baseline. TF32 is disabled by the shared harness.
+
+For GEMM, begin with torch.mm on the provided A/B strides and FP16/BF16 dtype. Preserve dtype,
+no bias, and returned output allocation. Compare supported public alternatives only when they
+are materially different. Do not precompute B conversion outside run, silently enable reduced
+precision beyond the target, or reuse an output tensor when the contract requires allocation.
+Record the Torch source SHA and ROCm/CUDA runtime. The library may internally choose rocBLAS or
+hipBLASLt. Avoid attributing a specific low-level kernel without evidence.
+
+For dense attention, use torch.nn.functional.scaled_dot_product_attention with zero dropout,
+scale D**-0.5, and canonical BHSD output. Compare automatic selection with source-supported
+`torch.nn.attention.sdpa_kernel` choices for this installation and architecture. The seeds use
+auto and math. Test flash/efficient choices only when enabled in the installed runtime. An
+unsupported warning/error is evidence, not permission to fall back silently. For unequal Q/K
+lengths, do not assume `is_causal=True` has bottom-right alignment. Build the explicit mask.
+GQA must preserve the exact query-to-KV grouping. Required repetition remains inside run.
+
+For packed attention, there may be no supported native public varlen API. The seed slices each
+sequence, calls SDPA, and concatenates the packed THD output, all inside the timed callable.
+A useful competing variant pads to the actual batch maximum, builds a padding/causal mask,
+executes batched SDPA, and extracts the packed result. Include padding, mask construction,
+and extraction in every timed call. Compare these strategies. Small batches and length variance
+can change the winner. Do not measure pre-padded inputs against a TLX packed-input call.
+PR #3921's padded reference prepared tensors outside timing and used graph timing for its
+performance table. Those numbers cannot be imported into this campaign.
+
+Consider public torch.compile only as an explicitly labeled variant with its compiler/runtime
+pins and full semantics preserved. Compile and check it before timing, include graph breaks and
+packing that remain in execution, and record any backend dependency. Do not use graph replay
+under the eager target. Stop when remaining candidate budget has no justified alternative.
+The shared harness checks correctness on changed seeds, controls timing, and reports the
+best observed valid variant. Unsupported API paths remain visible in search logs.
