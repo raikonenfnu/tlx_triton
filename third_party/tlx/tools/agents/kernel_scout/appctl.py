@@ -11,7 +11,18 @@ import sys
 from pathlib import Path
 
 from backends.seeds import candidates
-from contracts import REPOSITORY, ROOT, applicable, backends, digest, harness_digest, load_target, read_json, write_json
+from contracts import (
+    REPOSITORY,
+    ROOT,
+    applicable,
+    backends,
+    digest,
+    enforce_equal_inputs,
+    harness_digest,
+    load_target,
+    read_json,
+    write_json,
+)
 from discovery import discover
 from publication import GitHub, publish
 from reporting import describe, render, reproduce_command
@@ -255,6 +266,7 @@ def run(args):
                                        backend_runtime, args)
                     row["results"][backend] = result
                     print(f"{target['id']}/{case['id']}: {backend} {result['status']}", flush=True)
+                enforce_equal_inputs(row["results"])
                 if args.mode == "nightly":
                     row["results"]["tlx_ops_baseline"] = dict(controls[(target["id"],
                                                                         case["id"])]["results"]["tlx_ops"])

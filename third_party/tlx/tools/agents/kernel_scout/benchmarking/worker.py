@@ -20,7 +20,7 @@ def measure(request):
     import triton.testing
     from backends.seeds import build, module
 
-    from benchmarking.inputs import make_inputs, reference
+    from benchmarking.inputs import input_digest, make_inputs, reference
 
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -44,8 +44,10 @@ def measure(request):
     if request.get("expected_identity") and identity != request["expected_identity"]:
         raise ValueError("reproducer source/runtime/device pins differ from the recorded run")
     checks = []
+    input_hashes = {}
     for seed in target["correctness"]["seeds"]:
         inputs = make_inputs(case, operation, seed)
+        input_hashes[str(seed)] = input_digest(inputs)
         original = {key: value.clone() for key, value in inputs.items()}
         expected = reference(case, operation, inputs)
         actual = fn(inputs)
@@ -65,6 +67,7 @@ def measure(request):
         checks.append(seed)
     # Restore one canonical seed for every backend's measured inputs.
     inputs = make_inputs(case, operation, 0)
+    input_hashes["timing_seed_0"] = input_digest(inputs)
     timing = target["timing"]
     before = conditions(device)
     samples = [
@@ -79,8 +82,9 @@ def measure(request):
     flops, logical_bytes = work(case, operation)
     return {
         "status": "ok" if spread <= timing["max_relative_spread"] else "unstable", **identity, "candidate": candidate,
-        "contract_sha256": digest({"target": target, "case": case}), "correctness_seeds": checks, "latency_ms": latency,
-        "p20_ms": statistics.median(s[0] for s in samples), "p80_ms": statistics.median(s[2] for s in samples),
+        "contract_sha256": digest({"target": target, "case": case
+                                   }), "correctness_seeds": checks, "input_sha256": digest(input_hashes), "latency_ms":
+        latency, "p20_ms": statistics.median(s[0] for s in samples), "p80_ms": statistics.median(s[2] for s in samples),
         "samples_ms": samples, "relative_spread": spread, "tflops": flops / (latency * 1e9), "logical_tbps":
         logical_bytes / (latency * 1e9), "conditions": {"before": before, "after": after}, "pid": os.getpid()
     }

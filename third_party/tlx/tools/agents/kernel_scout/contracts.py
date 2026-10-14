@@ -123,6 +123,15 @@ def work(case, operation):
     return 4 * h * d * pairs, logical_bytes
 
 
+def enforce_equal_inputs(results):
+    measured = [r for r in results.values() if r.get("status") in {"ok", "unstable"}]
+    hashes = {r.get("input_sha256") for r in measured}
+    if None in hashes or len(hashes) > 1:
+        for result in measured:
+            result.update(status="failed",
+                          error="backend input fingerprints differ or are missing. Comparison rejected")
+
+
 def select_winner(results, tie_fraction):
     valid = [(name, r) for name, r in results.items() if r.get("status") == "ok"]
     if not valid:
