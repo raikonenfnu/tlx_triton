@@ -16,6 +16,8 @@ Create an absolute-path configuration outside the source checkout:
   "state": "/path/to/scout-state",
   "repository": "raikonenfnu/tlx_triton",
   "gpu": 0,
+  "gpu_wait_seconds": 1800,
+  "gpu_poll_seconds": 60,
   "provider": "codex",
   "aiter_search": false,
   "rounds": 2,
@@ -51,7 +53,19 @@ CRON_TZ=UTC
 
 Check your cron implementation's CRON_TZ support, or use a host configured for UTC.
 Supply PATH for codex/claude/gh, authentication configuration, and the required library environment
-in the service account. The jobs take a nonblocking per-user physical-GPU lock and state lock. An overlapping job fails visibly. If weekly work exceeds one hour, move the nightly time later.
+in the service account. The jobs take a nonblocking per-user physical-GPU lock and state lock.
+An overlapping Scout job fails visibly.
+The GPU supervisor checks ownership immediately, then once per minute for up to 30 minutes.
+AMD checks use both AMD SMI and KFD ownership. NVIDIA checks use NVIDIA SMI ownership.
+An idle GPU starts measurement automatically. A busy GPU at the deadline fails the job without publication.
+Inspection errors fail immediately. The supervisor does not stop other jobs or change clocks.
+Each run stores supervisor state and check counts in `gpu_admission.json`.
+Configure `gpu_wait_seconds` and `gpu_poll_seconds` to change the startup wait.
+Set `gpu_wait_seconds` to zero for an immediate ownership check without retries.
+Manual `appctl.py run` commands use the same supervisor defaults as cron.
+The worker retains ownership checks before and after measurement.
+Startup waiting does not repair samples interrupted by competing jobs during measurement.
+If weekly work exceeds one hour, move the nightly time later.
 Monitor nonzero exits and logs. No report is published after a failed measurement.
 
 Weekly measures all registered backends and freezes controls. Nightly measures backends with
