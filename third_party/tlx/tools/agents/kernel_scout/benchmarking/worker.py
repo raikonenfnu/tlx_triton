@@ -82,10 +82,11 @@ def measure(request):
     flops, logical_bytes = work(case, operation)
     return {
         "status": "ok" if spread <= timing["max_relative_spread"] else "unstable", **identity, "candidate": candidate,
-        "contract_sha256": digest({"target": target, "case": case
-                                   }), "correctness_seeds": checks, "input_sha256": digest(input_hashes), "latency_ms":
-        latency, "p20_ms": statistics.median(s[0] for s in samples), "p80_ms": statistics.median(s[2] for s in samples),
-        "samples_ms": samples, "relative_spread": spread, "tflops": flops / (latency * 1e9), "logical_tbps":
+        "adapter_metadata": getattr(fn, "scout_metadata",
+                                    {}), "contract_sha256": digest({"target": target, "case": case}),
+        "correctness_seeds": checks, "input_sha256": digest(input_hashes), "latency_ms": latency, "p20_ms":
+        statistics.median(s[0] for s in samples), "p80_ms": statistics.median(s[2] for s in samples), "samples_ms":
+        samples, "relative_spread": spread, "tflops": flops / (latency * 1e9), "logical_tbps":
         logical_bytes / (latency * 1e9), "conditions": {"before": before, "after": after}, "pid": os.getpid()
     }
 

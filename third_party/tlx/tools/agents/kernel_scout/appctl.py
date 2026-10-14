@@ -134,7 +134,8 @@ def evaluate(backend, target, case, candidate, directory, runtime, args):
 
 def scout(backend, target, case, directory, runtime, args, *, research=None):
     directory.mkdir(parents=True, exist_ok=True)
-    seeds = candidates(backend, target["operation"])
+    search = backend != "aiter" or getattr(args, "aiter_search", False)
+    seeds = candidates(backend, target["operation"], search=search)
     feedback = []
     discovery_status, discovery_summary = "not_requested", ""
     proposals = seeds[:args.max_candidates]
@@ -144,7 +145,7 @@ def scout(backend, target, case, directory, runtime, args, *, research=None):
             result = evaluate(backend, target, case, candidate, directory / f"r{round_number}_{candidate['id']}",
                               runtime, args)
             feedback.append({"candidate": candidate, "result": result})
-        if args.provider == "builtin" or not remaining or round_number == args.rounds:
+        if not search or args.provider == "builtin" or not remaining or round_number == args.rounds:
             break
         proposal_dir = directory / f"discovery_r{round_number}"
         proposal_dir.mkdir()
@@ -180,6 +181,7 @@ def scout(backend, target, case, directory, runtime, args, *, research=None):
 
 
 def run(args):
+    aiter_search = getattr(args, "aiter_search", False)
     targets = [load_target(path) for path in args.targets]
     if args.case:
         targets = [{**t, "cases": [c for c in t["cases"] if c["id"] in args.case]} for t in targets]
@@ -230,7 +232,7 @@ def run(args):
             override_pins[backend] = pin
         key = digest({
             "contract": baseline_key(targets, device, identity["runtime"]), "runtimes": runtimes, "registry": registry,
-            "aiter": identity["aiter"], "override_pins": override_pins
+            "aiter": identity["aiter"], "override_pins": override_pins, "aiter_search": aiter_search
         })
         baseline_path = args.state / "baselines" / campaign / f"{week}.json"
         controls = {}
@@ -242,7 +244,8 @@ def run(args):
             raise ValueError("this week's immutable baseline already exists; use a new state directory to rerun")
         report = {
             "schema_version": 1, "mode": args.mode, "date": date.isoformat(), "week": week, "campaign": campaign,
-            "baseline_key": key, "device": device, "provider": args.provider, "budget": {
+            "baseline_key": key, "device": device, "provider": args.provider, "aiter_mode":
+            "search" if aiter_search else "public", "budget": {
                 "max_candidates": args.max_candidates, "rounds": args.rounds, "agent_timeout_s": args.agent_timeout,
                 "worker_timeout_s": args.worker_timeout
             }, "columns": list(registry) + ["tlx_ops_baseline"], "rows": []
@@ -335,6 +338,7 @@ def main():
     measure.add_argument("--runtimes", type=Path, help="JSON backend -> {python, pythonpath} overrides")
     measure.add_argument("--report-pointer", type=Path, help="write the completed report path for deployment")
     measure.add_argument("--provider", choices=["builtin", "codex", "claude"], default="builtin")
+    measure.add_argument("--aiter-search", action="store_true", help="search AITER variants instead of public ops only")
     measure.add_argument("--model")
     measure.add_argument("--context", type=Path, help="explicit Megabrain context pack for discovery agents")
     measure.add_argument("--gpu", type=int, default=0)

@@ -17,6 +17,7 @@ Create an absolute-path configuration outside the source checkout:
   "repository": "raikonenfnu/tlx_triton",
   "gpu": 0,
   "provider": "codex",
+  "aiter_search": false,
   "rounds": 2,
   "max_candidates": 6,
   "agent_timeout": 300,
@@ -57,6 +58,8 @@ Weekly measures all registered backends and freezes controls. Nightly measures b
 `cadence="nightly"`, then reuses matching weekly controls. A changed target/case selection,
 Torch/driver runtime, device, backend registry, or dependency identity requires a fresh campaign.
 The runner does not silently replace an existing weekly baseline.
+AITER uses public operators by default, without LLM discovery.
+Set `aiter_search` to true only for an explicit comparison of alternative AITER implementations.
 
 For fresh source, provide an optional `refresh_command` argument list that invokes YOUR deployment
 script to fetch/update a clean dedicated checkout and rebuild its environment. That script must

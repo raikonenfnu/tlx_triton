@@ -100,7 +100,11 @@ Check AITER's candidate measurements, input fingerprints, and selected confirmat
 Run its report reproduction command before accepting the setup.
 Repeat with dense attention, GEMM, and the full packed-attention target.
 
-Add `--provider claude` or `--provider codex` for source discovery.
+The default AITER baseline uses public operators and their own dispatch.
+It does not invoke an LLM, even when other backends use agent discovery.
+Add `--aiter-search` for alternative implementations.
+Also select `--provider claude` or `codex` for source discovery in that mode.
+Keep the same AITER mode for weekly and nightly runs.
 Scout gives the agent the installed AITER checkout as its research workspace.
 The prompt includes the runtime identity, source pin, and measured seed feedback.
 Use [backend instructions](instructions.md) for the search sequence.

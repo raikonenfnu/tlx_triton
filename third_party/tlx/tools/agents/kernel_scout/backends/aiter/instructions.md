@@ -1,5 +1,14 @@
-# AITER kernel discovery (AMD only)
+# AITER public ops and optional search (AMD only)
 
+By default, Scout measures one public AITER operator per target case.
+Attention uses the public dense or packed attention API.
+GEMM uses `aiter.tuned_gemm.gemm_a16w16`, which owns implementation selection.
+The report labels its dispatch, including Torch fallback.
+This baseline needs no LLM search or manual tuning.
+
+Enable `--aiter-search` only for a broader diagnostic comparison.
+Select `--provider claude` or `codex` when that comparison also needs agent proposals.
+The instructions below apply to this optional search.
 Find the fastest observed existing AITER variant for the exact target contract.
 The installed checkout takes precedence over online examples.
 Primary source: https://github.com/ROCm/aiter .
@@ -37,7 +46,7 @@ Do not infer a callable signature from a kernel name.
 5. Use measured feedback to refine later proposals.
 
 Attention seeds compare public dispatch, direct Triton MHA, and direct Gluon MHA.
-GEMM seeds compare standard and persistent Triton wrappers.
+GEMM search seeds compare public dispatch with standard and persistent Triton wrappers.
 A rejected seed remains evidence about that path, not the entire library.
 Prioritize viable alternatives when one path fails.
 The controller checks and measures every proposal, then independently remeasures its selection.

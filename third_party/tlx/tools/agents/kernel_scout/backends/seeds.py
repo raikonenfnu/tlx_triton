@@ -12,12 +12,20 @@ def module(path, name):
     return result
 
 
-def candidates(backend, operation):
+def candidates(backend, operation, *, search=False):
     if backend == "aiter":
+        public = {"id": "public_api", "params": {}}
+        if not search:
+            return [public]
         if operation == "mm":
-            return [{"id": "triton_gemm", "params": {}}, {"id": "triton_persistent", "params": {"persistent": True}}]
-        return [{"id": "public_api", "params": {}}, {"id": "triton_mha", "params": {"backend": "triton"}},
-                {"id": "gluon_mha", "params": {"backend": "gluon"}}]
+            return [
+                public, {"id": "triton_gemm", "params": {"implementation": "triton"}},
+                {"id": "triton_persistent", "params": {"implementation": "triton", "persistent": True}}
+            ]
+        return [
+            public, {"id": "triton_mha", "params": {"backend": "triton"}},
+            {"id": "gluon_mha", "params": {"backend": "gluon"}}
+        ]
     if backend == "tlx_tutorials" and operation == "flash_attn_varlen":
         # No independent packed-varlen tutorial at the initial source revision.
         return []
@@ -61,9 +69,24 @@ def build(backend, operation, case, params):
                                             config)
     if backend == "aiter":
         if operation == "mm":
+            if params.get("implementation") != "triton":
+                from aiter.tuned_gemm import gemm_a16w16 as public_gemm
+                from aiter.tuned_gemm import get_GEMM_A16W16_config
+                dtype = getattr(torch, case["dtype"])
+                config = get_GEMM_A16W16_config(M=case["m"], N=case["n"], K=case["k"], bias=False, dtype=str(dtype),
+                                                otype=str(dtype), scaleAB=False, bpreshuffle=False)
+
+                def public(x):
+                    return public_gemm(x["a"], x["b"].T.contiguous(), otype=x["a"].dtype)
+
+                public.scout_metadata = {
+                    "implementation": str(config["libtype"]), "kernel": str(config.get("kernelName", ""))
+                }
+                return public
             from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
             # AITER computes X @ W.T and defaults to BF16 output.
-            return lambda x: gemm_a16w16(x["a"], x["b"].T.contiguous(), dtype=x["a"].dtype, **params)
+            options = {key: value for key, value in params.items() if key != "implementation"}
+            return lambda x: gemm_a16w16(x["a"], x["b"].T.contiguous(), dtype=x["a"].dtype, **options)
         if params.get("backend"):
             from aiter.ops.triton.attention.mha import flash_attn_func, flash_attn_varlen_func
         else:
