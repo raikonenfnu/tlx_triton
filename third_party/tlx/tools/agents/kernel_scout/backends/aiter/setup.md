@@ -60,9 +60,11 @@ Keep these choices explicit and retain them with the results.
 
 Choose an idle physical GPU.
 Scout checks its PCI identity and competing processes before measurements.
+The `--gpu` option uses AMD SMI numbering. Scout maps that index to an HSA UUID before starting workers.
+For the manual import check, use the matching GPU UUID from `rocminfo`.
 
 ```bash
-ROCR_VISIBLE_DEVICES=2 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
+ROCR_VISIBLE_DEVICES=GPU-<uuid-from-rocminfo> HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
   "$SCOUT_AITER_VENV/bin/python" -c \
   'import aiter, torch, triton; print(aiter.__file__, torch.__version__, triton.__file__); print(aiter.flash_attn_varlen_func)'
 ```

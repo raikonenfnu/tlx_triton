@@ -116,13 +116,42 @@ def test_baseline_reproducer_digest_checked(tmp_path):
 
 def test_worker_environment_selects_same_physical_gpu(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr("appctl.rocr_device", lambda gpu: "GPU-abcd" if gpu == 3 else None)
     env = worker_environment(3, {"python": "/aiter-venv/bin/python", "pythonpath": "/source:/torch"})
-    assert env["ROCR_VISIBLE_DEVICES"] == env["SCOUT_PHYSICAL_GPU"] == "3"
+    assert env["ROCR_VISIBLE_DEVICES"] == "GPU-abcd"
+    assert env["SCOUT_PHYSICAL_GPU"] == "3"
     assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == "0"
     assert env["PYTHONPATH"] == "/source:/torch"
     assert env["PATH"] == "/aiter-venv/bin:/usr/bin"
     nvidia = worker_environment(3, {"vendor": "nvidia"})
     assert nvidia["CUDA_VISIBLE_DEVICES"] == "3" and "ROCR_VISIBLE_DEVICES" not in nvidia
+
+
+@pytest.mark.parametrize("info,expected", [
+    ("Agent 1\n Node: 2\n Uuid: GPU-1111\nAgent 2\n Node: 5\n Uuid: GPU-abcd\n", "GPU-abcd"),
+    ("Agent 1\n Node: 2\n Uuid: GPU-1111\n", None),
+    ("Agent 1\n Node: 5\n Uuid: GPU-abcd\nAgent 2\n Node: 5\n Uuid: GPU-2222\n", None),
+])
+def test_rocr_device_matches_node_and_rejects_ambiguous_mapping(monkeypatch, info, expected):
+    from benchmarking.environment import rocr_device
+
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "7")
+
+    def output(args, **kwargs):
+        assert not {"ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"} & kwargs["env"].keys()
+        return json.dumps([{"gpu": 3, "node_id": 5}]) if "amd-smi" in args[0] else info
+
+    monkeypatch.setattr(subprocess, "check_output", output)
+    rocr_device.cache_clear()
+    try:
+        if expected:
+            assert rocr_device(3) == expected
+        else:
+            with pytest.raises(RuntimeError, match="one HSA GPU UUID"):
+                rocr_device(3)
+    finally:
+        rocr_device.cache_clear()
 
 
 @pytest.mark.parametrize("backend", [None, "triton", "gluon"])

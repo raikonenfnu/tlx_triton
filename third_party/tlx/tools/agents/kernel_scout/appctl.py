@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from backends.seeds import candidates
+from benchmarking.environment import rocr_device
 from contracts import (
     REPOSITORY,
     ROOT,
@@ -46,8 +47,8 @@ def worker_environment(gpu, runtime):
     env = os.environ.copy()
     env["SCOUT_PHYSICAL_GPU"] = str(gpu)
     if runtime.get("vendor", "amd") == "amd":
-        # Select the physical HSA agent before HIP maps it to logical device zero.
-        env.update({"ROCR_VISIBLE_DEVICES": str(gpu), "HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "0"})
+        # AMD SMI and HSA can enumerate devices in different orders.
+        env.update({"ROCR_VISIBLE_DEVICES": rocr_device(gpu), "HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "0"})
     else:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env.pop("ROCR_VISIBLE_DEVICES", None)

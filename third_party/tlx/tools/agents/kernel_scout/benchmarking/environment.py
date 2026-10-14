@@ -4,12 +4,37 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
+from functools import cache
 from pathlib import Path
 
 
 def command(args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True, timeout=30).strip()
+
+
+@cache
+def rocr_device(physical):
+    """Map an AMD SMI device to its HSA UUID; their ordinal orders can differ."""
+    env = os.environ.copy()
+    for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"):
+        env.pop(name, None)
+    entries = json.loads(
+        subprocess.check_output(["/opt/rocm/bin/amd-smi", "list", "--json"], env=env, text=True, timeout=30))
+    entry = next((row for row in entries if int(row["gpu"]) == physical), None)
+    if entry is None:
+        raise RuntimeError(f"AMD SMI device {physical} is unavailable")
+    info = subprocess.check_output(["/opt/rocm/bin/rocminfo"], env=env, text=True, timeout=30)
+    matches = []
+    for agent in re.split(r"(?m)^Agent\s+\d+\s*$", info):
+        node = re.search(r"(?m)^\s*Node:\s*(\d+)\s*$", agent)
+        uuid = re.search(r"(?m)^\s*Uuid:\s*(GPU-[0-9a-fA-F]+)\s*$", agent)
+        if node and uuid and int(node[1]) == int(entry["node_id"]):
+            matches.append(uuid[1])
+    if len(matches) != 1:
+        raise RuntimeError(f"cannot map AMD SMI device {physical} to one HSA GPU UUID")
+    return matches[0]
 
 
 def source_identity(repository):

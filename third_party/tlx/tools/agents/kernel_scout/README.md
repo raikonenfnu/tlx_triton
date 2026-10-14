@@ -218,9 +218,11 @@ changes, also check a small GPU case and its pinned reproducer. The opt-in GPU t
 source-built TLX and rejects an incorrect adapter that mutates inputs:
 
 ```bash
-ROCR_VISIBLE_DEVICES=2 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 SCOUT_PHYSICAL_GPU=2 \
+ROCR_VISIBLE_DEVICES=GPU-<uuid-from-rocminfo> HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 SCOUT_PHYSICAL_GPU=2 \
   SCOUT_TEST_GPU=1 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
 ```
 
-Use your selected physical GPU index in both places. Live provider discovery needs a separate
+Use the HSA UUID for the selected AMD SMI physical GPU. Scout maps these identities automatically for `--gpu`.
+AMD SMI and HSA device ordinals can differ. See [ROCm GPU isolation](https://rocm.docs.amd.com/en/docs-6.0.2/conceptual/gpu-isolation.html).
+Live provider discovery needs a separate
 check because fake CLI tests establish protocol behavior only.
