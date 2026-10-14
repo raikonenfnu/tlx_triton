@@ -50,6 +50,7 @@ def inspect_device():
         entries = json.loads(command(["/opt/rocm/bin/amd-smi", "list", "--json"]))
         entry = next(row for row in entries if int(row["gpu"]) == physical)
         uuid, bdf = entry["uuid"], entry["bdf"]
+        check_pci_device(props, bdf)
     else:
         uuid, bdf = command(["nvidia-smi", "-i",
                              str(physical), "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"]).split(",")
@@ -58,6 +59,14 @@ def inspect_device():
         "total_memory": props.total_memory, "host": platform.node(), "physical_gpu": physical, "uuid": uuid.strip(),
         "bdf": bdf.strip(), "kfd_id": entry["kfd_id"] if target.backend == "hip" else None
     }
+
+
+def check_pci_device(properties, expected_bdf):
+    domain, bus, device = expected_bdf.split(":")
+    expected = (int(domain, 16), int(bus, 16), int(device.split(".")[0], 16))
+    actual = tuple(getattr(properties, name, None) for name in ("pci_domain_id", "pci_bus_id", "pci_device_id"))
+    if actual != expected:
+        raise RuntimeError(f"Torch selected PCI {actual}, expected {expected_bdf}; device visibility is inconsistent")
 
 
 def conditions(device):

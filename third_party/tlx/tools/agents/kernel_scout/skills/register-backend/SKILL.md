@@ -4,7 +4,8 @@ description: Add a hardware-scoped kernel discovery backend to TLX Kernel Scout 
 ---
 
 Create `backends/<id>/backend.json` and `instructions.md`. Use a lowercase directory id.
-Declare vendors, architectures, and supported operations. An empty architecture list means
+Declare vendors, architectures, and supported operations.
+Set cadence to weekly for frozen controls or nightly for variants that need daily measurements. An empty architecture list means
 any architecture of the declared vendors. It does not establish implementation availability.
 Restrict vendor-specific libraries explicitly. Unsupported hardware must be reported, not
 routed to another library under the backend's name.

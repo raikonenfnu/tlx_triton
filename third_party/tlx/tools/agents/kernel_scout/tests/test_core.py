@@ -115,8 +115,11 @@ def test_baseline_reproducer_digest_checked(tmp_path):
 
 def test_worker_environment_selects_same_physical_gpu():
     env = worker_environment(3, {"pythonpath": "/source:/torch"})
-    assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == env["SCOUT_PHYSICAL_GPU"] == "3"
+    assert env["ROCR_VISIBLE_DEVICES"] == env["SCOUT_PHYSICAL_GPU"] == "3"
+    assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == "0"
     assert env["PYTHONPATH"] == "/source:/torch"
+    nvidia = worker_environment(3, {"vendor": "nvidia"})
+    assert nvidia["CUDA_VISIBLE_DEVICES"] == "3" and "ROCR_VISIBLE_DEVICES" not in nvidia
 
 
 def test_proposal_source_and_budget_validation(tmp_path):
@@ -408,3 +411,26 @@ def test_deployment_uses_argument_lists_and_success_pointer(tmp_path):
     assert "/source/target with spaces.json" in argv
     assert argv[argv.index("--state") + 1] == "/state with spaces"
     assert argv[argv.index("--report-pointer") + 1] == str(tmp_path / "pointer.json")
+
+
+def test_pci_guard_rejects_wrong_physical_gpu():
+    from types import SimpleNamespace
+
+    from benchmarking.environment import check_pci_device
+    props = SimpleNamespace(pci_domain_id=0, pci_bus_id=0x66, pci_device_id=0)
+    check_pci_device(props, "0000:66:00.0")
+    with pytest.raises(RuntimeError, match="visibility is inconsistent"):
+        check_pci_device(props, "0000:16:00.0")
+    with pytest.raises(RuntimeError, match="visibility is inconsistent"):
+        check_pci_device(SimpleNamespace(), "0000:66:00.0")
+
+
+@pytest.mark.parametrize("status", ["failed", "unstable", "unavailable", "unsupported"])
+def test_scout_keeps_failure_categories(status, tmp_path, monkeypatch, target):
+    from types import SimpleNamespace
+
+    import appctl
+    monkeypatch.setattr(appctl, "evaluate", lambda *args: {"status": status, "error": "diagnostic"})
+    args = SimpleNamespace(provider="builtin", max_candidates=1, rounds=0)
+    result = appctl.scout("tlx_ops", target, target["cases"][0], tmp_path / "ops", {}, args)
+    assert result["status"] == status and result["error"] == "diagnostic"

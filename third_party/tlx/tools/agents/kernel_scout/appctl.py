@@ -32,7 +32,15 @@ def execute(command, *, env, log, timeout):
 
 def worker_environment(gpu, runtime):
     env = os.environ.copy()
-    env.update({"HIP_VISIBLE_DEVICES": str(gpu), "CUDA_VISIBLE_DEVICES": str(gpu), "SCOUT_PHYSICAL_GPU": str(gpu)})
+    env["SCOUT_PHYSICAL_GPU"] = str(gpu)
+    if runtime.get("vendor", "amd") == "amd":
+        # Select the physical HSA agent before HIP maps it to logical device zero.
+        env.update({"ROCR_VISIBLE_DEVICES": str(gpu), "HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "0"})
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env.pop("ROCR_VISIBLE_DEVICES", None)
+        env.pop("HIP_VISIBLE_DEVICES", None)
+    env.pop("GPU_DEVICE_ORDINAL", None)
     if runtime.get("pythonpath"):
         env["PYTHONPATH"] = runtime["pythonpath"]
     return env
@@ -81,6 +89,7 @@ def validate_baseline(baseline, *, campaign, week, key):
 
 
 def evaluate(backend, target, case, candidate, directory, runtime, args):
+    runtime = {**runtime, "vendor": target["hardware"]["vendor"]}
     directory.mkdir(parents=True, exist_ok=True)
     request_path, output = directory / "request.json", directory / "measurement.json"
     request = {
@@ -139,8 +148,10 @@ def scout(backend, target, case, directory, runtime, args):
             return {"status": "blocked", "error": discovery_summary, "evaluated_candidates": len(feedback)}
         if not feedback:
             return {"status": "unsupported", "error": "no seed adapter; enable an agent to research this backend"}
+        statuses = {f["result"]["status"] for f in feedback}
+        status = next(s for s in ("failed", "unstable", "unavailable", "unsupported") if s in statuses)
         return {
-            "status": "unavailable", "error": feedback[0]["result"].get("error", "no stable correct candidate"),
+            "status": status, "error": feedback[0]["result"].get("error", "no stable correct candidate"),
             "evaluated_candidates": len(feedback)
         }
     best = min(valid, key=lambda f: f["result"]["latency_ms"])
@@ -163,7 +174,10 @@ def run(args):
     if len({t["id"] for t in targets}) != len(targets):
         raise ValueError("target ids must be unique")
     # Resolving the executable's symlink would discard the virtual environment.
-    runtime = {"python": os.path.abspath(args.python), "pythonpath": args.pythonpath}
+    runtime = {
+        "python": os.path.abspath(args.python), "pythonpath": args.pythonpath, "vendor":
+        targets[0]["hardware"]["vendor"]
+    }
     runtimes = read_json(args.runtimes) if args.runtimes else {}
     date = dt.date.fromisoformat(args.date) if args.date else dt.datetime.now(dt.timezone.utc).date()
     week = (date - dt.timedelta(days=date.weekday())).isoformat()

@@ -104,7 +104,9 @@ def main():
         result = measure(read_json(args.request))
     except Exception as error:  # noqa: BLE001 - candidate failures become explicit artifacts
         traceback.print_exc()
-        result = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        status = "unavailable" if isinstance(error, ModuleNotFoundError) else (
+            "unsupported" if type(error).__name__ in {"UnsupportedOp", "InvalidInput"} else "failed")
+        result = {"status": status, "error": f"{type(error).__name__}: {error}"}
     write_json(args.output, result)
     return 0 if result["status"] in {"ok", "unstable"} else 1
 
