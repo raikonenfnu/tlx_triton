@@ -15,7 +15,7 @@ python appctl.py target-init --id my_varlen_f16_fa \
 python appctl.py validate targets/amd/gfx950/my_varlen_f16_fa.json
 ```
 
-Supported operations are `mm`, `flash_attn`, and `flash_attn_varlen`.
+Supported operations are `mm`, `addmm`, `bmm`, `flash_attn`, `flash_attn_varlen`, and `flash_attn_mxfp8`.
 The command refuses an existing output file.
 Starter dimensions do not establish hardware or backend support.
 Edit the cases to match the actual workload before interpreting performance.
@@ -27,7 +27,7 @@ Edit the cases to match the actual workload before interpreting performance.
 | `output_policy` | `returned_tensor`. Include required allocation, packing, conversion, and extraction in each call. |
 | `metric` | `compute` reports useful TFLOP/s. `memory` reports logical TB/s. Neither value proves the hardware bottleneck. |
 | `timing` | Warmup and repetition are milliseconds. Use at least three independent repeats. Define spread and tie thresholds. |
-| `correctness` | At least two distinct seeds and positive atol/rtol. Choose tolerances from numerical evidence. |
+| `correctness` | At least two distinct seeds and nonnegative atol/rtol, with at least one positive tolerance. |
 | `skills` | Keep `benchmark-fairness` with the target contract. |
 | `cases` | Freeze every case's dtype, dimensions, strides, and operation semantics. |
 | `source` | Optional evidence, source revision, shape suite, and notes. Avoid unbounded raw logs. |
@@ -36,11 +36,18 @@ Operation-specific fields:
 
 | Operation | Case fields and semantics |
 | --- | --- |
-| `mm` | `m`, `n`, `k`, `dtype`, `b_layout`. A is row-major. B is row-major or column-major. No bias. |
+| `mm` | `m`, `n`, `k`, `dtype`, `a_layout`, `b_layout`. A defaults to row-major. Both matrices allow column-major layout. |
+| `addmm` | MM fields plus `bias_layout="vector"`. Length-N bias, with alpha=beta=1. |
+| `bmm` | MM fields plus `batch` and `shared_a`. Shared A has a zero batch stride. |
 | `flash_attn` | `q_lengths`, `kv_lengths`, `heads`, `kv_heads`, `head_dim`, `causal`, `dtype`. Dense BHSD. All lengths must match. |
 | `flash_attn_varlen` | The same attention fields. Packed THD and int32 cumulative lengths. Q/KV lengths can differ. |
+| `flash_attn_mxfp8` | Dense BF16 BHSD, D=128, equal query/KV heads, and lengths divisible by 256. Quantization stays inside the op. |
 
-Attention uses scale D**-0.5 and zero dropout.
+Attention uses an explicit `sm_scale` when present, otherwise D**-0.5. Dropout is zero.
+Optional `a_std`, `b_std`, `bias_std`, and `qkv_std` specify normal input standard deviations.
+Their default is one. Input generation remains shared across backends.
+Optional `correctness.max_relative_rms_error` bounds RMS output error relative to the FP32 reference's RMS.
+Use it when small reference magnitudes make an absolute tolerance insufficient.
 The query head count must be divisible by the KV head count.
 Each KV head serves one consecutive group of query heads.
 Causal packed attention uses bottom-right alignment.

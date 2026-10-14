@@ -190,7 +190,8 @@ def runtime_identity():
             key: hashlib.sha256(Path(value).read_bytes()).hexdigest()
             for key, value in os.environ.items()
             if key.startswith("AITER_CONFIG_") and Path(value).is_file()
-        }, "triton_module": str(Path(triton.__file__).resolve()), "source": compiler_source_identity(triton.__file__)
+        }, "triton_module": str(Path(triton.__file__).resolve()), "torch_module": str(Path(torch.__file__).resolve()),
+        "source": compiler_source_identity(triton.__file__)
     }
     return identity
 

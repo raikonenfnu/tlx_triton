@@ -9,7 +9,9 @@
   "operations": [
     "mm",
     "flash_attn",
-    "flash_attn_varlen"
+    "flash_attn_varlen",
+    "addmm",
+    "bmm"
   ],
   "cadence": "nightly"
 }

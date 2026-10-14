@@ -16,7 +16,7 @@ to propose an adapter. Extend operation validation, common inputs, and the FP32 
 when introducing a new operation. Do not add backend-owned timing code.
 
 Adapters export `build(case, params)` -> `run(inputs)` -> canonical output tensor.
-The common input dictionary uses a/b for mm, q/k/v for attention, and also cu_q/cu_k for packed
+The common input dictionary uses a/b for MM/BMM, a/b/bias for ADDMM, q/k/v for attention, and also cu_q/cu_k for packed
 attention. Include every conversion required by the target in run. Preserve canonical output
 layout. A tuple-returning library must extract its output explicitly and document any auxiliary
 work that the API computes. Source selection must stay within the registered backend.

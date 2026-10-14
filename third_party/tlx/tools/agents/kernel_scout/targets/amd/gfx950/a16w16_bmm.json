@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "vendor": "amd",
+    "architectures": [
+      "gfx950"
+    ]
+  },
+  "output_policy": "returned_tensor",
+  "metric": "compute",
+  "timing": {
+    "warmup_ms": 25,
+    "rep_ms": 100,
+    "repeats": 5,
+    "max_relative_spread": 0.15,
+    "tie_fraction": 0.03
+  },
+  "correctness": {
+    "seeds": [
+      17,
+      29
+    ],
+    "rtol": 0.02,
+    "atol": 0.02,
+    "max_relative_rms_error": 0.02
+  },
+  "skills": [
+    "benchmark-fairness"
+  ],
+  "id": "a16w16_bmm",
+  "operation": "bmm",
+  "cases": [
+    {
+      "id": "priority_bmm_b3072_448x160x931_bf16",
+      "m": 448,
+      "n": 160,
+      "k": 931,
+      "a_layout": "row_major",
+      "b_layout": "row_major",
+      "source_issue": "https://github.com/raikonenfnu/tlx_triton/issues/21",
+      "source_weight": 1,
+      "batch": 3072,
+      "shared_a": true,
+      "dtype": "bfloat16",
+      "source_case": "priority_bmm_b3072_448x160x931"
+    },
+    {
+      "id": "priority_bmm_b3072_448x160x931_fp16",
+      "m": 448,
+      "n": 160,
+      "k": 931,
+      "a_layout": "row_major",
+      "b_layout": "row_major",
+      "source_issue": "https://github.com/raikonenfnu/tlx_triton/issues/21",
+      "source_weight": 1,
+      "batch": 3072,
+      "shared_a": true,
+      "dtype": "float16",
+      "source_case": "priority_bmm_b3072_448x160x931"
+    }
+  ],
+  "source": {
+    "issues": [
+      "https://github.com/raikonenfnu/tlx_triton/issues/20",
+      "https://github.com/raikonenfnu/tlx_triton/issues/21",
+      "https://github.com/raikonenfnu/tlx_triton/issues/22"
+    ],
+    "suite_repository": "https://github.com/raikonenfnu/tlx_triton",
+    "suite_revision": "555e565bbe9e15d3270c86832581e6f156dee362",
+    "notes": [
+      "Issue data uses BF16. FP16 counterparts preserve dimensions, layout, and input scaling.",
+      "MM, ADDMM, and shared-A BMM keep separate operation contracts.",
+      "Source weights are metadata. Scout does not aggregate weighted performance.",
+      "Historical timings and tuned fork variants are not imported as baseline measurements.",
+      "Scout also requires relative RMS output error at most 0.02 for scaled inputs."
+    ]
+  }
+}

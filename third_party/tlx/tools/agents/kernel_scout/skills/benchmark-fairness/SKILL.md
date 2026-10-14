@@ -13,12 +13,19 @@ inside the call. Descriptor construction and JIT compilation can precede measure
 scratch buffer can match the library's steady-state behavior. A cached answer cannot.
 Do not move data-dependent computation into `build(case, params)`.
 
-GEMM inputs are A row-major and B in the declared layout. Attention has scale `head_dim**-0.5`,
+GEMM inputs use the declared A/B layouts. An omitted A layout means row-major.
+ADDMM includes its vector bias. BMM preserves batch strides, including shared A with a zero batch stride.
+Attention uses an explicit `sm_scale` when present, otherwise `head_dim**-0.5`,
 zero dropout, no bias, and inference-only forward semantics. Dense tensors use BHSD.
 Packed tensors use THD and int32 cumulative lengths. Causal packed attention is bottom-right
 aligned: query i sees key j when j <= i + kv_length - q_length. Fully masked rows return zero.
 GQA repeats each KV head over its consecutive query-head group. Do not change FP16 to BF16
 when one backend has a faster BF16 kernel. Use a separate target.
+
+The MXFP8 public-op target takes BF16 inputs and includes Q/K/V quantization inside timing.
+TLX uses MXFP8 internally. AITER and PyTorch are explicit BF16 attention references.
+Use the target's input standard deviation, softmax scale, and numerical tolerance.
+Do not replace this contract with pre-quantized inputs or a different probability/V scaling recipe.
 
 The harness generates identical CPU-seeded data for each backend, transfers it to the selected GPU,
 and checks at least two seeds against an independent FP32 oracle. It checks tensor shape, dtype,

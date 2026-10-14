@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "vendor": "amd",
+    "architectures": [
+      "gfx950"
+    ]
+  },
+  "output_policy": "returned_tensor",
+  "metric": "compute",
+  "timing": {
+    "warmup_ms": 25,
+    "rep_ms": 100,
+    "repeats": 5,
+    "max_relative_spread": 0.15,
+    "tie_fraction": 0.03
+  },
+  "correctness": {
+    "seeds": [
+      17,
+      29
+    ],
+    "atol": 0.2,
+    "rtol": 0.0,
+    "max_relative_rms_error": 0.1
+  },
+  "skills": [
+    "benchmark-fairness"
+  ],
+  "id": "mxfp8_fa",
+  "operation": "flash_attn_mxfp8",
+  "cases": [
+    {
+      "id": "b4_h32_s1024",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "kv_lengths": [
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": false,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s1024_causal",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "kv_lengths": [
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": true,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s2048",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        2048,
+        2048,
+        2048,
+        2048
+      ],
+      "kv_lengths": [
+        2048,
+        2048,
+        2048,
+        2048
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": false,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s2048_causal",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        2048,
+        2048,
+        2048,
+        2048
+      ],
+      "kv_lengths": [
+        2048,
+        2048,
+        2048,
+        2048
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": true,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s4096",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        4096,
+        4096,
+        4096,
+        4096
+      ],
+      "kv_lengths": [
+        4096,
+        4096,
+        4096,
+        4096
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": false,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s4096_causal",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        4096,
+        4096,
+        4096,
+        4096
+      ],
+      "kv_lengths": [
+        4096,
+        4096,
+        4096,
+        4096
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": true,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s8192",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        8192,
+        8192,
+        8192,
+        8192
+      ],
+      "kv_lengths": [
+        8192,
+        8192,
+        8192,
+        8192
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": false,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    },
+    {
+      "id": "b4_h32_s8192_causal",
+      "dtype": "bfloat16",
+      "q_lengths": [
+        8192,
+        8192,
+        8192,
+        8192
+      ],
+      "kv_lengths": [
+        8192,
+        8192,
+        8192,
+        8192
+      ],
+      "heads": 32,
+      "kv_heads": 32,
+      "head_dim": 128,
+      "causal": true,
+      "sm_scale": 0.5,
+      "qkv_std": 0.5
+    }
+  ],
+  "source": {
+    "url": "https://github.com/facebookexperimental/triton/pull/3824",
+    "merge_commit": "a05314cb02afddf4bd617eb072e7a2641b6de172",
+    "suite": "gfx950_1",
+    "suite_file": "third_party/tlx/ops/kernels/flash_attn_mxfp8/_shapes.py",
+    "benchmark_file": "python/test/tlx_benchmark/bench_flash_attn_mxfp8.py",
+    "notes": [
+      "Forward-only public-op comparison with BF16 BHSD inputs and BF16 output.",
+      "TLX quantizes Q/K/V inside every timed call. No pre-quantized kernel-only measurements.",
+      "AITER and PyTorch are labeled BF16 attention references, not matching MXFP8 recipes.",
+      "Scale 0.5, input standard deviation 0.5, and atol 0.2/rtol 0 follow the source benchmark.",
+      "CPU-seeded input bits are shared across backends. They do not reproduce the PR random seeds.",
+      "Useful causal FLOPs use exact triangular work. PR graph and clock-pinned timings are not imported.",
+      "Scout also requires relative RMS output error at most 0.1 to reject trivial outputs under the absolute tolerance."
+    ]
+  }
+}

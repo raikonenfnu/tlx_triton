@@ -129,3 +129,18 @@ Each rationale must identify:
 Return no proposals when no justified variant remains.
 Never infer performance from a source comment or an unrelated published benchmark.
 The shared harness owns correctness, input agreement, timing, and winner selection.
+
+## Imported ADDMM/BMM and MXFP8 public-op comparisons
+
+ADDMM uses `aiter.tuned_gemm.gemm_a16w16` with the supplied vector bias and explicit output dtype.
+Set bias=true when inspecting its dispatch record. Preserve unit alpha/beta.
+Required column-major-A conversion and B packing belong inside each call.
+Shared-A BMM uses the public `batched_gemm_bf16_CK` wrapper on BF16 inputs.
+Keep the zero A batch stride. Convert B to the wrapper's BNK layout inside timing.
+Its CK instances use BF16 inputs. Keep FP16 unsupported rather than converting it to BF16.
+
+For `flash_attn_mxfp8`, this backend supplies a labeled BF16 public attention reference.
+Use the case's BF16 inputs, explicit softmax scale, and causal flag.
+Do not claim this path implements TLX's block-scaled Q/K/V/P recipe.
+PR #3824's pre-quantized AITER code-object comparison uses another recipe and graph timing.
+Do not import those numbers into the eager public-op target.
