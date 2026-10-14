@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -113,13 +114,139 @@ def test_baseline_reproducer_digest_checked(tmp_path):
         validate_baseline(baseline, campaign="c", week="2026-10-12", key="k")
 
 
-def test_worker_environment_selects_same_physical_gpu():
-    env = worker_environment(3, {"pythonpath": "/source:/torch"})
+def test_worker_environment_selects_same_physical_gpu(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = worker_environment(3, {"python": "/aiter-venv/bin/python", "pythonpath": "/source:/torch"})
     assert env["ROCR_VISIBLE_DEVICES"] == env["SCOUT_PHYSICAL_GPU"] == "3"
     assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == "0"
     assert env["PYTHONPATH"] == "/source:/torch"
+    assert env["PATH"] == "/aiter-venv/bin:/usr/bin"
     nvidia = worker_environment(3, {"vendor": "nvidia"})
     assert nvidia["CUDA_VISIBLE_DEVICES"] == "3" and "ROCR_VISIBLE_DEVICES" not in nvidia
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "gluon"])
+@pytest.mark.parametrize("operation", ["flash_attn", "flash_attn_varlen"])
+def test_aiter_attention_adapters_preserve_contract(monkeypatch, backend, operation):
+    from backends.seeds import build
+
+    calls = []
+
+    class Tensor:
+
+        def __init__(self, name):
+            self.name = name
+
+        def transpose(self, a, b):
+            return Tensor(f"{self.name}.transpose({a},{b})")
+
+        def contiguous(self):
+            return Tensor(f"{self.name}.contiguous()")
+
+    def attention(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Tensor("output")
+
+    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
+    path = "aiter.ops.triton.attention.mha" if backend else "aiter"
+    module = ModuleType(path)
+    module.flash_attn_func = module.flash_attn_varlen_func = attention
+    monkeypatch.setitem(sys.modules, path, module)
+    case = {"head_dim": 128, "causal": True, "q_lengths": [3, 5], "kv_lengths": [4, 7]}
+    inputs = {key: Tensor(key) for key in ("q", "k", "v", "cu_q", "cu_k")}
+    params = {"backend": backend} if backend else {}
+    result = build("aiter", operation, case, params)(inputs)
+    args, options = calls[0]
+    assert options == {"dropout_p": 0.0, "softmax_scale": 128**-0.5, "causal": True, **params}
+    if operation == "flash_attn_varlen":
+        assert args == (inputs["q"], inputs["k"], inputs["v"], inputs["cu_q"], inputs["cu_k"], 5, 7)
+        assert result.name == "output"
+    else:
+        assert [arg.name for arg in args] == [f"{key}.transpose(1,2)" for key in ("q", "k", "v")]
+        assert result.name == "output.transpose(1,2).contiguous()"
+
+
+def test_aiter_gemm_adapter_keeps_output_dtype_and_measured_packing(monkeypatch):
+    from backends.seeds import build
+
+    calls, packed = [], []
+    weight = SimpleNamespace(contiguous=lambda: packed.append("packed") or "weight")
+    module = ModuleType("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    module.gemm_a16w16 = lambda *a, **kw: calls.append((a, kw)) or "output"
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
+    run = build("aiter", "mm", {}, {"persistent": True})
+    assert not packed
+    a = SimpleNamespace(dtype="float16")
+    assert run({"a": a, "b": SimpleNamespace(T=weight)}) == "output"
+    assert packed == ["packed"]
+    assert calls == [((a, "weight"), {"dtype": "float16", "persistent": True})]
+
+
+def test_aiter_discovery_uses_installed_checkout(tmp_path, monkeypatch, target):
+    import discovery
+
+    checkout = tmp_path / "aiter-source"
+    checkout.mkdir()
+    research = {"package": {"status": "available", "repository": str(checkout), "git_sha": "aiter-sha"}}
+
+    def query(provider, prompt, **kwargs):
+        assert kwargs["workspace"] == checkout
+        assert "aiter-sha" in prompt
+        assert "Measured feedback" in prompt
+        return {"status": "complete", "summary": "source inspected", "candidates": []}
+
+    monkeypatch.setattr(discovery, "query_json", query)
+    response, proposals = discovery.discover("claude", "aiter", target, target["cases"][0], [], tmp_path, 2,
+                                             research=research)
+    assert response["status"] == "complete" and proposals == []
+
+
+def test_package_identity_tracks_tuning_and_excludes_jit_output(tmp_path, monkeypatch):
+    import importlib.metadata
+
+    from benchmarking.environment import package_identity
+
+    repository = tmp_path / "source"
+    module = repository / "aiter"
+    module.mkdir(parents=True)
+    (module / "__init__.py").write_text("")
+    config = repository / "configs/tuned.csv"
+    config.parent.mkdir()
+    config.write_text("shape,kernel\n512,first\n")
+    (repository / ".gitignore").write_text("aiter/jit/\n")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C",
+        str(repository), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "test fixture"
+    ], check=True)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: SimpleNamespace(origin=str(module / "__init__.py")))
+
+    def version(name):
+        if name == "amd-aiter":
+            return "test-version"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    initial = package_identity("aiter")
+    assert initial["version"] == "test-version" and initial["repository"] == str(repository)
+    assert "flydsl" in initial["dependencies"]
+    cache = module / "jit/build"
+    cache.mkdir(parents=True)
+    (cache / "kernel.so").write_bytes(b"compiled cache")
+    assert package_identity("aiter") == initial
+    config.write_text("shape,kernel\n512,second\n")
+    changed = package_identity("aiter")
+    assert changed["source_sha256"] != initial["source_sha256"] and changed["dirty"]
+
+
+def test_namespace_package_is_unavailable(monkeypatch):
+    from benchmarking.environment import package_identity
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: SimpleNamespace(origin=None))
+    result = package_identity("aiter")
+    assert result["status"] == "unavailable" and "namespace" in result["error"]
 
 
 def test_proposal_source_and_budget_validation(tmp_path):
@@ -276,7 +403,8 @@ def test_blocked_discovery_is_not_unsupported(tmp_path):
         validate_proposals(response, tmp_path, 2)
 
 
-def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, target):
+@pytest.mark.parametrize("aiter_override", [False, True])
+def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, target, aiter_override):
     import argparse
 
     import appctl
@@ -289,15 +417,23 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
         {"status": "unavailable"}
     }
     identity["runtime"]["triton_module"] = str(appctl.REPOSITORY / "python/triton/__init__.py")
-    monkeypatch.setattr(appctl, "probe", lambda *args: identity)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     venv_python = tmp_path / "venv/bin/python"
     venv_python.parent.mkdir(parents=True)
     venv_python.symlink_to(sys.executable)
+    override = {**identity, "aiter": {"status": "available", "repository": "/aiter", "git_sha": "aiter-source"}}
+    aiter_python = tmp_path / "aiter/bin/python"
+    monkeypatch.setattr(appctl, "probe", lambda runtime, *args: override
+                        if runtime["python"] == str(aiter_python) else identity)
+    runtimes = tmp_path / "runtimes.json"
+    write_json(runtimes, {"aiter": {"python": str(aiter_python)}})
     calls = []
 
-    def fake_scout(backend, t, case, directory, runtime, args):
-        assert runtime["python"] == str(venv_python)  # Do not resolve the venv's interpreter symlink.
+    def fake_scout(backend, t, case, directory, runtime, args, *, research=None):
+        expected_python = aiter_python if backend == "aiter" else venv_python
+        assert runtime["python"] == str(expected_python)  # Preserve the virtual environment's interpreter path.
+        if backend == "aiter":
+            assert research["package"] == override["aiter"]
         calls.append(backend)
         directory.mkdir(parents=True)
         request = directory / "request.json"
@@ -311,11 +447,12 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
 
     monkeypatch.setattr(appctl, "scout", fake_scout)
     args = argparse.Namespace(targets=[target_path], case=["one_x_1000"], state=tmp_path / "state",
-                              python=str(venv_python), pythonpath="/source", runtimes=None, date="2026-10-14",
-                              execute=True, mode="weekly", gpu=0, provider="builtin", max_candidates=3, rounds=0,
-                              agent_timeout=10, worker_timeout=10, report_pointer=tmp_path / "pointer.json")
+                              python=str(venv_python), pythonpath="/source",
+                              runtimes=runtimes if aiter_override else None, date="2026-10-14", execute=True,
+                              mode="weekly", gpu=0, provider="builtin", max_candidates=3, rounds=0, agent_timeout=10,
+                              worker_timeout=10, report_pointer=tmp_path / "pointer.json")
     appctl.run(args)
-    assert calls == ["pytorch", "tlx_ops", "tlx_tutorials"]
+    assert calls == (["aiter"] if aiter_override else []) + ["pytorch", "tlx_ops", "tlx_tutorials"]
     calls.clear()
     args.mode, args.date = "nightly", "2026-10-15"
     appctl.run(args)
@@ -325,6 +462,8 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     controls = nightly["rows"][0]["results"]
     assert all(controls[name]["status"] == "ok" for name in ("pytorch", "tlx_ops", "tlx_tutorials", "tlx_ops_baseline"))
     assert controls["pytorch"]["frozen_date"] == controls["tlx_ops_baseline"]["frozen_date"] == "2026-10-14"
+    assert controls["aiter"]["status"] == ("ok" if aiter_override else "unavailable")
+    assert controls["aiter"]["frozen_date"] == "2026-10-14"
     args.mode = "weekly"
     with pytest.raises(ValueError, match="immutable"):
         appctl.run(args)

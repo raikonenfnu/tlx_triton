@@ -13,6 +13,11 @@ def module(path, name):
 
 
 def candidates(backend, operation):
+    if backend == "aiter":
+        if operation == "mm":
+            return [{"id": "triton_gemm", "params": {}}, {"id": "triton_persistent", "params": {"persistent": True}}]
+        return [{"id": "public_api", "params": {}}, {"id": "triton_mha", "params": {"backend": "triton"}},
+                {"id": "gluon_mha", "params": {"backend": "gluon"}}]
     if backend == "tlx_tutorials" and operation == "flash_attn_varlen":
         # No independent packed-varlen tutorial at the initial source revision.
         return []
@@ -58,18 +63,21 @@ def build(backend, operation, case, params):
         if operation == "mm":
             from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
             # AITER computes X @ W.T and defaults to BF16 output.
-            return lambda x: gemm_a16w16(x["a"], x["b"].T.contiguous(), dtype=x["a"].dtype)
-        from aiter import flash_attn_func, flash_attn_varlen_func
+            return lambda x: gemm_a16w16(x["a"], x["b"].T.contiguous(), dtype=x["a"].dtype, **params)
+        if params.get("backend"):
+            from aiter.ops.triton.attention.mha import flash_attn_func, flash_attn_varlen_func
+        else:
+            from aiter import flash_attn_func, flash_attn_varlen_func
+        options = {"dropout_p": 0.0, "softmax_scale": case["head_dim"]**-0.5, "causal": case["causal"], **params}
         if operation == "flash_attn":
 
             def dense(x):
-                out = flash_attn_func(*(x[k].transpose(1, 2) for k in ("q", "k", "v")), dropout_p=0.0,
-                                      causal=case["causal"])
+                out = flash_attn_func(*(x[k].transpose(1, 2) for k in ("q", "k", "v")), **options)
                 return out.transpose(1, 2).contiguous()
 
             return dense
         return lambda x: flash_attn_varlen_func(x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], max(case["q_lengths"]),
-                                                max(case["kv_lengths"]), dropout_p=0.0, causal=case["causal"])
+                                                max(case["kv_lengths"]), **options)
     if backend != "pytorch":
         raise ValueError(f"no seed adapter for {backend}")
     if operation == "mm":

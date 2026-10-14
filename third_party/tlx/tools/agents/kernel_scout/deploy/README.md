@@ -2,6 +2,7 @@
 
 Use a dedicated benchmark checkout and virtual environment. Build TLX from source with the
 repository's build instructions. Configure AITER in a separate environment when necessary.
+Follow [AITER setup](../backends/aiter/setup.md) and supply its runtime override through `runtimes` in the deployment configuration.
 Install and authenticate `codex` or `claude` for the selected provider and `gh` for publication.
 Check the installed CLI flags against `coding_agents.py`. Do not put tokens in the JSON file.
 
