@@ -13,7 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from contracts import digest, harness_digest, read_json, work, write_json
 
-from benchmarking.environment import assert_idle, conditions, inspect_device, package_identity, runtime_identity
+from benchmarking.environment import (
+    GPUOccupiedError,
+    assert_idle,
+    conditions,
+    inspect_device,
+    package_identity,
+    runtime_identity,
+)
 
 
 def measure(request):
@@ -107,9 +114,15 @@ def main():
     parser.add_argument("--probe", type=Path)
     args = parser.parse_args()
     if args.probe:
-        device = inspect_device()
-        assert_idle(device)
-        write_json(args.probe, {"device": device, "runtime": runtime_identity(), "aiter": package_identity("aiter")})
+        try:
+            device = inspect_device()
+            assert_idle(device)
+            identity = {"device": device, "runtime": runtime_identity(), "aiter": package_identity("aiter")}
+            assert_idle(device)
+        except GPUOccupiedError as error:
+            write_json(args.probe, {"status": "busy", "error": str(error)})
+            return 2
+        write_json(args.probe, identity)
         return 0
     if args.request is None or args.output is None:
         parser.error("request and output are required for a measurement")

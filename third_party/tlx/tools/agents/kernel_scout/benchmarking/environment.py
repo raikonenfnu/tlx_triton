@@ -10,6 +10,10 @@ from functools import cache
 from pathlib import Path
 
 
+class GPUOccupiedError(RuntimeError):
+    """A selected GPU has another process that prevents exclusive measurement."""
+
+
 def command(args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True, timeout=30).strip()
 
@@ -155,7 +159,7 @@ def assert_idle(device):
         pids = [int(row.split(",")[1]) for row in rows if row.split(",")[0].strip() == uuid]
     foreign = [pid for pid in pids if pid != os.getpid()]
     if foreign:
-        raise RuntimeError(f"selected GPU has external processes: {foreign}")
+        raise GPUOccupiedError(f"selected GPU has external processes: {foreign}")
 
 
 def compiler_source_identity(module_path):

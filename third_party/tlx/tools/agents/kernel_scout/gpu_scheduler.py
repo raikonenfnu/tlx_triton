@@ -4,7 +4,7 @@ import json
 import math
 import time
 
-from benchmarking.environment import assert_idle, command
+from benchmarking.environment import GPUOccupiedError, assert_idle, command
 from contracts import write_json
 
 
@@ -28,8 +28,8 @@ def busy_reason(physical, vendor):
     return None
 
 
-def wait_for_gpu(physical, vendor, *, wait_seconds=1800, poll_seconds=60, status_path=None):
-    """Poll immediately and once per interval until idle or the deadline expires."""
+def wait_for_gpu(physical, vendor, *, wait_seconds=1800, poll_seconds=60, status_path=None, ready=None):
+    """Poll ownership and an optional runtime probe until ready or the deadline expires."""
     if not math.isfinite(wait_seconds) or wait_seconds < 0:
         raise ValueError("GPU wait seconds must be finite and nonnegative")
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
@@ -39,8 +39,14 @@ def wait_for_gpu(physical, vendor, *, wait_seconds=1800, poll_seconds=60, status
     checks = 0
     while True:
         checks += 1
+        value = None
         try:
             reason = busy_reason(physical, vendor)
+            if reason is None and ready is not None:
+                try:
+                    value = ready()
+                except GPUOccupiedError as error:
+                    reason = str(error)
         except Exception as error:
             if status_path:
                 write_json(status_path,
@@ -56,7 +62,7 @@ def wait_for_gpu(physical, vendor, *, wait_seconds=1800, poll_seconds=60, status
                 })
         if reason is None:
             print(f"GPU {physical} is idle. Starting the benchmark job.", flush=True)
-            return
+            return value
         if not remaining:
             raise TimeoutError(f"GPU {physical} stayed busy for {wait_seconds:g}s: {reason}")
         next_check = min(next_check + poll_seconds, deadline)
