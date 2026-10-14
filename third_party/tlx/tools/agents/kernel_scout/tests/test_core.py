@@ -37,6 +37,163 @@ def test_targets_and_vendor_eligibility(target):
     assert len(target["cases"]) == 6
 
 
+def test_mxfp8_focus_shapes_and_reference_capabilities():
+    target = load_target(ROOT / "targets/amd/gfx950/mxfp8_fa.json")
+    assert target["operation"] == "flash_attn_mxfp8"
+    assert target["correctness"] == {"seeds": [17, 29], "atol": 0.2, "rtol": 0.0, "max_relative_rms_error": 0.1}
+    assert {(c["q_lengths"][0], c["causal"])
+            for c in target["cases"]} == {(n, causal)
+                                          for n in (1024, 2048, 4096, 8192)
+                                          for causal in (False, True)}
+    for case in target["cases"]:
+        assert case["q_lengths"] == case["kv_lengths"] == [case["q_lengths"][0]] * 4
+        assert (case["heads"], case["kv_heads"], case["head_dim"], case["dtype"]) == (32, 32, 128, "bfloat16")
+        assert case["sm_scale"] == case["qkv_std"] == 0.5
+    registry = backends()
+    device = {"vendor": "amd", "arch": "gfx950"}
+    assert all(applicable(registry[b], target, device) for b in ("tlx_ops", "aiter", "pytorch"))
+    assert not applicable(registry["tlx_tutorials"], target, device)
+
+
+@pytest.mark.parametrize("change", [
+    lambda c: c.update(dtype="float16"),
+    lambda c: c.update(head_dim=64),
+    lambda c: c.update(kv_heads=16),
+    lambda c: c.update(q_lengths=[384] * 4, kv_lengths=[384] * 4),
+    lambda c: c.update(sm_scale=-0.5),
+    lambda c: c.update(qkv_std=float("nan")),
+])
+def test_mxfp8_contract_rejects_incompatible_shapes(change, tmp_path):
+    target = load_target(ROOT / "targets/amd/gfx950/mxfp8_fa.json")
+    change(target["cases"][0])
+    path = tmp_path / "target.json"
+    write_json(path, target)
+    with pytest.raises(ValueError):
+        load_target(path)
+
+
+def test_issue_gemm_targets_preserve_operations_layouts_and_dtypes():
+    counts = {}
+    for filename, operation in [("a16w16_gemm.json", "mm"), ("a16w16_addmm.json", "addmm"), ("a16w16_bmm.json", "bmm")]:
+        target = load_target(ROOT / "targets/amd/gfx950" / filename)
+        assert target["operation"] == operation
+        for case in target["cases"]:
+            if "source_issue" not in case:
+                continue
+            issue = int(case["source_issue"].rsplit("/", 1)[1])
+            counts[(issue, operation, case["dtype"])] = counts.get((issue, operation, case["dtype"]), 0) + 1
+            if operation == "addmm":
+                assert (case["a_layout"], case["b_layout"], case["bias_layout"]) == ("row_major", "column_major",
+                                                                                     "vector")
+            if operation == "bmm":
+                assert (case["batch"], case["m"], case["n"], case["k"], case["shared_a"]) == (3072, 448, 160, 931, True)
+            if operation != "bmm":
+                assert case["a_std"] == case["k"]**-0.5 and case["b_std"] == case["n"]**-0.5
+    assert counts == {
+        (issue, operation, dtype): count
+        for (issue, operation
+             ), count in {(20, "mm"): 8, (20, "addmm"): 3, (21, "addmm"): 7, (21, "bmm"): 1, (22, "mm"): 2}.items()
+        for dtype in ("bfloat16", "float16")
+    }
+
+
+def test_gemm_work_counts_shared_storage_and_bias():
+    case = {"m": 2, "n": 3, "k": 4, "batch": 5, "shared_a": True}
+    assert work(case, "addmm") == (48, 58)
+    assert work(case, "bmm") == (240, 196)
+    assert work({**case, "shared_a": False}, "bmm") == (240, 260)
+
+
+@pytest.mark.parametrize("filename,change", [
+    ("a16w16_addmm.json", lambda c: c.update(alpha=2)),
+    ("a16w16_addmm.json", lambda c: c.update(bias_layout="matrix")),
+    ("a16w16_bmm.json", lambda c: c.update(batch=0)),
+    ("a16w16_bmm.json", lambda c: c.update(shared_a="true")),
+])
+def test_matrix_contract_rejects_changed_bias_or_batch_semantics(tmp_path, filename, change):
+    target = load_target(ROOT / "targets/amd/gfx950" / filename)
+    change(target["cases"][0])
+    path = tmp_path / "target.json"
+    write_json(path, target)
+    with pytest.raises(ValueError):
+        load_target(path)
+
+
+def test_aiter_bmm_does_not_convert_fp16_to_bf16(monkeypatch):
+    from backends.seeds import build
+
+    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
+    with pytest.raises(NotImplementedError, match="BF16 inputs only"):
+        build("aiter", "bmm", {"dtype": "float16"}, {})
+
+
+@pytest.mark.parametrize("operation", ["mm", "addmm", "bmm"])
+def test_cpu_inputs_keep_matrix_layout_and_shared_batch(operation):
+    torch = pytest.importorskip("torch")
+    from benchmarking.inputs import input_digest, make_inputs
+
+    case = {
+        "dtype": "bfloat16", "m": 2, "n": 3, "k": 4, "a_layout": "column_major", "b_layout": "row_major", "batch": 3,
+        "shared_a": True
+    }
+    inputs = make_inputs(case, operation, 17, device="cpu")
+    again = make_inputs(case, operation, 17, device="cpu")
+    assert inputs["a"].dtype == inputs["b"].dtype == torch.bfloat16
+    assert inputs["a"].stride(-2) == 1 and inputs["b"].stride(-1) == 1
+    if operation == "addmm":
+        assert inputs["bias"].shape == (3, )
+    if operation == "bmm":
+        assert inputs["a"].shape == (3, 2, 4) and inputs["a"].stride(0) == 0
+        assert inputs["a"].untyped_storage().nbytes() == 2 * 4 * 2
+    assert input_digest(inputs) == input_digest(again)
+    if operation == "bmm":
+        again["a"][0, 0, 0] += 1
+    else:
+        again["a"][0, 0] += 1
+    assert input_digest(inputs) != input_digest(again)
+
+
+def test_cpu_oracle_keeps_vector_bias_and_batch_semantics():
+    torch = pytest.importorskip("torch")
+    from benchmarking.inputs import reference
+
+    a = torch.tensor([[1, 2], [3, 4]], dtype=torch.float16)
+    b = torch.tensor([[5, 6], [7, 8]], dtype=torch.float16)
+    bias = torch.tensor([1, -1], dtype=torch.float16)
+    assert torch.equal(reference({}, "addmm", {"a": a, "b": b, "bias": bias}), torch.tensor([[20, 21], [44, 49]]))
+    batched = {"a": a.expand(2, -1, -1), "b": torch.stack([b, torch.eye(2, dtype=torch.float16)])}
+    expected = torch.tensor([[[19, 22], [43, 50]], [[1, 2], [3, 4]]])
+    assert torch.equal(reference({}, "bmm", batched), expected)
+
+
+def test_relative_rms_guard_rejects_zero_outputs_despite_loose_absolute_tolerance():
+    torch = pytest.importorskip("torch")
+    from benchmarking.inputs import relative_rms_error
+
+    reference = torch.tensor([1e-5, -2e-5])
+    zeros = torch.zeros_like(reference)
+    torch.testing.assert_close(zeros, reference, atol=0.02, rtol=0.02)
+    assert relative_rms_error(zeros, reference) == pytest.approx(1.0)
+    assert relative_rms_error(reference, reference) == 0
+    assert relative_rms_error(zeros, zeros) == 0
+    assert relative_rms_error(reference, zeros) == float("inf")
+
+
+def test_mxfp8_seed_keeps_quantization_inside_the_measured_call(monkeypatch):
+    from backends.seeds import build
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
+    ops = SimpleNamespace(flash_attn_mxfp8=lambda *a, **kw: calls.append((a, kw)) or "output")
+    monkeypatch.setitem(sys.modules, "triton.tlx", SimpleNamespace(ops=ops))
+    case = {"head_dim": 128, "causal": True, "sm_scale": 0.5}
+    run = build("tlx_ops", "flash_attn_mxfp8", case, {})
+    assert not calls
+    inputs = {key: key for key in ("q", "k", "v")}
+    assert run(inputs) == "output"
+    assert calls == [(("q", "k", "v"), {"causal": True, "sm_scale": 0.5, "space": "full"})]
+
+
 @pytest.mark.parametrize("change", [
     lambda t: t.update(output_policy="preallocated"),
     lambda t: t["timing"].update(rep_ms=float("nan")),
@@ -280,6 +437,23 @@ def test_aiter_discovery_uses_installed_checkout(tmp_path, monkeypatch, target):
     response, proposals = discovery.discover("claude", "aiter", target, target["cases"][0], [], tmp_path, 2,
                                              research=research)
     assert response["status"] == "complete" and proposals == []
+
+
+def test_pytorch_discovery_reads_the_installed_package(tmp_path, monkeypatch, target):
+    import discovery
+
+    package = tmp_path / "torch"
+    package.mkdir()
+    research = {"runtime": {"torch_module": str(package / "__init__.py")}}
+
+    def query(provider, prompt, **kwargs):
+        assert kwargs["workspace"] == package
+        return {"status": "complete", "summary": "Torch source inspected", "candidates": []}
+
+    monkeypatch.setattr(discovery, "query_json", query)
+    response, _ = discovery.discover("claude", "pytorch", target, target["cases"][0], [], tmp_path, 1,
+                                     research=research)
+    assert response["status"] == "complete"
 
 
 def test_package_identity_tracks_tuning_and_excludes_jit_output(tmp_path, monkeypatch):
@@ -831,7 +1005,7 @@ def test_unstable_measurement_still_checks_input_fingerprint(fingerprint):
     assert all(r["status"] == "failed" for r in results.values())
 
 
-@pytest.mark.parametrize("operation", ["mm", "flash_attn", "flash_attn_varlen"])
+@pytest.mark.parametrize("operation", ["mm", "addmm", "bmm", "flash_attn", "flash_attn_varlen", "flash_attn_mxfp8"])
 def test_target_init_cli_creates_valid_contract(operation, tmp_path):
     output = tmp_path / operation / "target.json"
     subprocess.run([

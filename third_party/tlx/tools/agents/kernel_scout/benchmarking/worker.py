@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import math
 import os
 import statistics
 import sys
@@ -20,7 +21,7 @@ def measure(request):
     import triton.testing
     from backends.seeds import build, module
 
-    from benchmarking.inputs import input_digest, make_inputs, reference
+    from benchmarking.inputs import input_digest, make_inputs, reference, relative_rms_error
 
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -44,6 +45,7 @@ def measure(request):
     if request.get("expected_identity") and identity != request["expected_identity"]:
         raise ValueError("reproducer source/runtime/device pins differ from the recorded run")
     checks = []
+    numerical_errors = {}
     input_hashes = {}
     for seed in target["correctness"]["seeds"]:
         inputs = make_inputs(case, operation, seed)
@@ -60,6 +62,12 @@ def measure(request):
             raise ValueError("output contains non-finite values")
         torch.testing.assert_close(actual.float(), expected, rtol=target["correctness"]["rtol"],
                                    atol=target["correctness"]["atol"])
+        rms_limit = target["correctness"].get("max_relative_rms_error")
+        if rms_limit is not None:
+            error = relative_rms_error(actual, expected)
+            numerical_errors[str(seed)] = {"relative_rms_error": error}
+            if not math.isfinite(error) or error > rms_limit:
+                raise ValueError(f"relative RMS error {error:g} exceeds {rms_limit:g}")
         if any(not torch.equal(inputs[key], value) for key, value in original.items()):
             raise ValueError("candidate changed a harness input")
         if any(actual.untyped_storage().data_ptr() == value.untyped_storage().data_ptr() for value in inputs.values()):
@@ -83,8 +91,9 @@ def measure(request):
     return {
         "status": "ok" if spread <= timing["max_relative_spread"] else "unstable", **identity, "candidate": candidate,
         "adapter_metadata": getattr(fn, "scout_metadata",
-                                    {}), "contract_sha256": digest({"target": target, "case": case}),
-        "correctness_seeds": checks, "input_sha256": digest(input_hashes), "latency_ms": latency, "p20_ms":
+                                    {}), "contract_sha256": digest({"target": target, "case":
+                                                                    case}), "correctness_seeds": checks,
+        "numerical_errors": numerical_errors, "input_sha256": digest(input_hashes), "latency_ms": latency, "p20_ms":
         statistics.median(s[0] for s in samples), "p80_ms": statistics.median(s[2] for s in samples), "samples_ms":
         samples, "relative_spread": spread, "tflops": flops / (latency * 1e9), "logical_tbps":
         logical_bytes / (latency * 1e9), "conditions": {"before": before, "after": after}, "pid": os.getpid()
@@ -108,8 +117,8 @@ def main():
         result = measure(read_json(args.request))
     except Exception as error:  # noqa: BLE001 - candidate failures become explicit artifacts
         traceback.print_exc()
-        status = "unavailable" if isinstance(error, ModuleNotFoundError) else (
-            "unsupported" if type(error).__name__ in {"UnsupportedOp", "InvalidInput"} else "failed")
+        status = "unavailable" if isinstance(error, ModuleNotFoundError) else ("unsupported" if isinstance(
+            error, NotImplementedError) or type(error).__name__ in {"UnsupportedOp", "InvalidInput"} else "failed")
         result = {"status": status, "error": f"{type(error).__name__}: {error}"}
     write_json(args.output, result)
     return 0 if result["status"] in {"ok", "unstable"} else 1

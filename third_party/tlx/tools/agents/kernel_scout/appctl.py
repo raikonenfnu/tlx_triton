@@ -13,6 +13,7 @@ from pathlib import Path
 from backends.seeds import candidates
 from benchmarking.environment import rocr_device
 from contracts import (
+    OPERATIONS,
     REPOSITORY,
     ROOT,
     applicable,
@@ -328,7 +329,7 @@ def main():
     validate.add_argument("targets", nargs="+", type=Path)
     initialize = sub.add_parser("target-init", help="create a validated starter target for an existing operation")
     initialize.add_argument("--id", required=True)
-    initialize.add_argument("--operation", choices=["mm", "flash_attn", "flash_attn_varlen"], required=True)
+    initialize.add_argument("--operation", choices=sorted(OPERATIONS), required=True)
     initialize.add_argument("--vendor", choices=["amd", "nvidia"], required=True)
     initialize.add_argument("--arch", required=True)
     initialize.add_argument("--metric", choices=["compute", "memory"], default="compute")

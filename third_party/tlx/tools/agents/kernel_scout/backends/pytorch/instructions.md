@@ -35,3 +35,17 @@ packing that remain in execution, and record any backend dependency. Do not use 
 under the eager target. Stop when remaining candidate budget has no justified alternative.
 The shared harness checks correctness on changed seeds, controls timing, and reports the
 best observed valid variant. Unsupported API paths remain visible in search logs.
+
+## Imported bias/batched GEMM and MXFP8 reference targets
+
+ADDMM uses `torch.addmm(bias,a,b)` with a length-N bias and unit alpha/beta.
+BMM uses `torch.bmm(a,b)` with the supplied batch strides.
+Keep shared A as a zero-stride view rather than distinct batch matrices.
+Preserve both MM operand layouts, including column-major A.
+
+For `flash_attn_mxfp8`, PyTorch supplies a labeled BF16 attention reference, not an MXFP8 kernel.
+Use the explicit case scale and canonical BHSD tensors. Equal-length dense causal attention permits native `is_causal=True`.
+The source benchmark uses scale 0.5 and input standard deviation 0.5.
+The controller also checks relative RMS error against its independent FP32 oracle.
+Research begins in the installed Torch package supplied by the runtime identity.
+Source-read failures remain blocked discovery. Measured seeds can still supply valid observations.

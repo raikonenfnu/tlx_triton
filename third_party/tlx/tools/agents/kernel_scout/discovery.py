@@ -67,6 +67,8 @@ def discover(provider, backend, target, case, feedback, directory, remaining, *,
     if backend == "aiter" and research and research.get("package", {}).get("status") == "available":
         package = research["package"]
         workspace = Path(package.get("repository") or package["module"])
+    if backend == "pytorch" and research and research.get("runtime", {}).get("torch_module"):
+        workspace = Path(research["runtime"]["torch_module"]).parent
     prompt = f"""Find the best observed existing kernel variants for this backend and exact target.
 Read source before selecting entry points. Do not install dependencies, edit source, run benchmarks,
 or publish memory. Return at most {remaining} adapter proposals. Return an empty list if no justified

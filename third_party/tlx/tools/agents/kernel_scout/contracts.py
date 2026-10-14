@@ -9,7 +9,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parents[4]
 NAME = re.compile(r"^[a-z][a-z0-9_]*$")
-OPERATIONS = {"mm", "flash_attn", "flash_attn_varlen"}
+OPERATIONS = {"mm", "addmm", "bmm", "flash_attn", "flash_attn_varlen", "flash_attn_mxfp8"}
+GEMM_OPERATIONS = {"mm", "addmm", "bmm"}
+DENSE_ATTENTION = {"flash_attn", "flash_attn_mxfp8"}
 
 
 def digest(value):
@@ -38,6 +40,10 @@ def positive(value, label):
         raise ValueError(f"{label} must be finite and positive")
 
 
+def attention_scale(case):
+    return case.get("sm_scale", case["head_dim"]**-0.5)
+
+
 def load_target(path):
     target = read_json(path)
     if target.get("schema_version") != 1 or not NAME.fullmatch(target.get("id", "")):
@@ -56,7 +62,13 @@ def load_target(path):
     if not isinstance(timing["repeats"], int) or timing["repeats"] < 3:
         raise ValueError("at least three independent timing repeats are required")
     for key in ("atol", "rtol"):
-        positive(target["correctness"][key], key)
+        value = target["correctness"][key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{key} must be finite and nonnegative")
+    if not max(target["correctness"][key] for key in ("atol", "rtol")):
+        raise ValueError("at least one correctness tolerance must be positive")
+    if "max_relative_rms_error" in target["correctness"]:
+        positive(target["correctness"]["max_relative_rms_error"], "maximum relative RMS error")
     seeds = target["correctness"]["seeds"]
     if len(set(seeds)) < 2 or any(not isinstance(s, int) or s < 0 for s in seeds):
         raise ValueError("at least two distinct nonnegative correctness seeds are required")
@@ -66,14 +78,28 @@ def load_target(path):
     for case in cases:
         if not NAME.fullmatch(case["id"]) or case["dtype"] not in {"float16", "bfloat16"}:
             raise ValueError("invalid case id or dtype")
-        keys = ("m", "n", "k") if target["operation"] == "mm" else ("heads", "kv_heads", "head_dim")
+        operation = target["operation"]
+        keys = ("m", "n", "k") if operation in GEMM_OPERATIONS else ("heads", "kv_heads", "head_dim")
         for key in keys:
             if not isinstance(case[key], int):
                 raise TypeError(f"{key} must be an integer")
             positive(case[key], key)
-        if target["operation"] == "mm":
-            if case["b_layout"] not in {"row_major", "column_major"}:
-                raise ValueError("invalid B layout")
+        for key in ("a_std", "b_std", "bias_std", "qkv_std"):
+            if key in case:
+                positive(case[key], key)
+        if operation in GEMM_OPERATIONS:
+            if case.get("a_layout", "row_major") not in {"row_major", "column_major"
+                                                         } or case["b_layout"] not in {"row_major", "column_major"}:
+                raise ValueError("invalid A or B layout")
+            if operation == "addmm" and (case.get("bias_layout") != "vector" or any(
+                    type(case.get(key, 1)) not in {int, float} or case.get(key, 1) != 1 for key in ("alpha", "beta"))):
+                raise ValueError("addmm requires a vector bias with alpha=beta=1")
+            if operation == "bmm":
+                if type(case.get("batch")) is not int:
+                    raise ValueError("bmm batch must be an integer")
+                positive(case["batch"], "batch")
+                if type(case.get("shared_a")) is not bool:
+                    raise ValueError("bmm must declare shared_a")
         else:
             if case["heads"] % case["kv_heads"] or type(case["causal"]) is not bool:
                 raise ValueError("invalid GQA or causal contract")
@@ -82,8 +108,12 @@ def load_target(path):
                 raise ValueError("sequence lengths must be paired nonnegative integers")
             if not sum(q) or not sum(k):
                 raise ValueError("the target must contain query and key tokens")
-            if target["operation"] == "flash_attn" and (len(set(q + k)) != 1 or q != k):
+            positive(attention_scale(case), "attention scale")
+            if operation in DENSE_ATTENTION and (len(set(q + k)) != 1 or q != k):
                 raise ValueError("dense attention requires equal sequence lengths")
+            if operation == "flash_attn_mxfp8" and (case["dtype"] != "bfloat16" or case["head_dim"] != 128
+                                                    or case["heads"] != case["kv_heads"] or q[0] % 256):
+                raise ValueError("MXFP8 attention requires BF16, D=128, equal heads, and lengths divisible by 256")
     return target
 
 
@@ -112,9 +142,13 @@ def applicable(backend, target, device):
 
 def work(case, operation):
     """Useful FLOPs and logical input/output bytes, not hardware counters."""
-    if operation == "mm":
+    if operation in GEMM_OPERATIONS:
         m, n, k = (case[key] for key in ("m", "n", "k"))
-        return 2 * m * n * k, 2 * (m * k + k * n + m * n)
+        batch = case["batch"] if operation == "bmm" else 1
+        a_count = m * k if operation != "bmm" or case["shared_a"] else batch * m * k
+        bias_count = n if operation == "addmm" else 0
+        # Keep the conventional GEMM FLOP count; bias traffic remains included.
+        return 2 * batch * m * n * k, 2 * (a_count + batch * (k * n + m * n) + bias_count)
     pairs = 0
     for q, k in zip(case["q_lengths"], case["kv_lengths"]):
         pairs += sum(max(0, min(k, i + k - q + 1)) for i in range(q)) if case["causal"] else q * k

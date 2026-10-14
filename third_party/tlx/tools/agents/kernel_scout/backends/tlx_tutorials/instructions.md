@@ -34,3 +34,14 @@ create new algorithms, or time calls in the discovery agent. The artifact adapte
 existing variants and launch parameters. A tuning proposal must cite the existing source caller
 that establishes its validity. The harness checks independent inputs and checks the selected
 winner in a fresh measurement process.
+
+## ADDMM, shared-A BMM, and MXFP8 availability
+
+ADDMM uses `amd_addmm_gfx950.py`: inspect `available_paths` and `addmm` before selecting a path.
+Pass the harness bias and preserve row-major A, column-major B, and unit alpha/beta.
+Search existing register, persistent, and inter-wave paths only when their guards permit the case.
+Shared-A BMM uses `amd_bmm_shared_a.py` and its `bmm(a,b)` wrapper.
+Keep A's zero batch stride and row-major B. Include output allocation and any required conversion in each call.
+Check the minimum K pipeline depth and partial-tile support.
+No independent gfx950 MXFP8 attention tutorial exists in the registered checkout.
+Its manifest excludes `flash_attn_mxfp8`. Do not rename the public ops implementation as a tutorial result.

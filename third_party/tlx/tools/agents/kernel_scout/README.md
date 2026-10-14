@@ -11,6 +11,8 @@ BF16 dense attention. See [example output and measurement scope](https://github.
 
 ## Architecture
 
+The [gfx950 target index](targets/amd/gfx950/README.md) lists the attention and GEMM workloads, source shapes, and numerical contracts.
+
 The controller owns measurements, selection, baselines, and reports. Codex or Claude researches
 source code and proposes adapters for existing implementations and supported kernel parameters.
 The worker measures those adapters through one shared harness. Agent-reported timings never determine a winner.

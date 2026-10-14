@@ -2,7 +2,7 @@
 
 import shlex
 
-from contracts import ROOT, select_winner
+from contracts import GEMM_OPERATIONS, ROOT, attention_scale, select_winner
 
 
 def cell(value):
@@ -11,11 +11,16 @@ def cell(value):
 
 def describe(target, case):
     prefix = f"{target['id']}/{case['id']}, {case['dtype']}"
-    if target["operation"] == "mm":
-        return f"{prefix}, M={case['m']} N={case['n']} K={case['k']}, B {case['b_layout']}"
+    if target["operation"] in GEMM_OPERATIONS:
+        batch = f", batch={case['batch']} shared_A={case['shared_a']}" if target["operation"] == "bmm" else ""
+        bias = ", vector bias" if target["operation"] == "addmm" else ""
+        return (f"{prefix}, {target['operation']}, M={case['m']} N={case['n']} K={case['k']}, "
+                f"A {case.get('a_layout', 'row_major')} B {case['b_layout']}{batch}{bias}")
     q, k = case["q_lengths"], case["kv_lengths"]
-    return (f"{prefix}, B={len(q)} Q={min(q)}–{max(q)} KV={min(k)}–{max(k)}, "
-            f"H={case['heads']}/{case['kv_heads']} D={case['head_dim']}, causal={case['causal']}")
+    return (
+        f"{prefix}, B={len(q)} Q={min(q)}–{max(q)} KV={min(k)}–{max(k)}, "
+        f"H={case['heads']}/{case['kv_heads']} D={case['head_dim']}, causal={case['causal']}, scale={attention_scale(case):g}"
+    )
 
 
 def render(report):
@@ -41,7 +46,10 @@ def render(report):
                 frozen = f"; frozen {result['frozen_date']}" if "frozen_date" in result else ""
                 fallback = "; Torch fallback" if result.get("adapter_metadata",
                                                             {}).get("implementation") == "torch" else ""
-                values.append(f"{result[metric]:.3f} {unit}; {result['latency_ms'] * 1000:.2f} µs{frozen}{fallback}")
+                reference = "; BF16 reference" if result.get(
+                    "adapter_metadata", {}).get("implementation") == "bf16_attention_reference" else ""
+                values.append(
+                    f"{result[metric]:.3f} {unit}; {result['latency_ms'] * 1000:.2f} µs{frozen}{fallback}{reference}")
             else:
                 values.append(result["status"] + (": " + result.get("error", "")[:110] if result.get("error") else ""))
         results = {k: v for k, v in row["results"].items() if report["mode"] != "weekly" or k != "tlx_ops_baseline"}

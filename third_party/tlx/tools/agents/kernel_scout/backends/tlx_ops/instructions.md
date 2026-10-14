@@ -33,3 +33,18 @@ one fixed configuration exists, say so. Do not fabricate knobs or claim that a s
 proves global optimality. Public seed failures must remain visible even if a private adapter wins.
 The shared harness decides correctness and latency. Return an empty proposal list when there is
 no credible existing variant. Record aliases and identical kernel bodies to avoid overstating coverage.
+
+## MXFP8, bias GEMM, and batched GEMM targets
+
+For `flash_attn_mxfp8`, use the public `tlx.ops.flash_attn_mxfp8` on BF16 BHSD tensors.
+Pass the case's explicit softmax scale and causal flag. Quantization remains inside each timed call.
+Do not substitute BF16 flash attention under the TLX MXFP8 column.
+The gfx950 target requires D=128, equal heads, and sequence lengths divisible by 256.
+Its non-causal exp2 approximation remains subject to the target's absolute and relative RMS error limits.
+
+For ADDMM, call `tlx.ops.addmm(bias, a, b)` with the supplied length-N bias and unit alpha/beta.
+Preserve both matrix layouts. Include packing and any additional allocation inside `run`.
+For shared-A BMM, the existing catalog provider resides in `ops/kernels/bmm/gfx950_torch.py`.
+Use `mode="force"` and disable `triton.cudagraphs`. A stock Inductor fallback cannot count as a TLX result.
+Record this provider as TorchTLX. Missing TorchTLX compiler integration is a dependency limitation.
+The A batch stride is zero. Do not replace it with distinct batch data or pre-materialize it outside timing.
