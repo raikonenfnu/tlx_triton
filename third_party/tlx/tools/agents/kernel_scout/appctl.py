@@ -4,14 +4,16 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import math
 import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from backends.seeds import candidates
-from benchmarking.environment import rocr_device
+from benchmarking.environment import GPUOccupiedError, rocr_device
 from contracts import (
     OPERATIONS,
     REPOSITORY,
@@ -76,11 +78,22 @@ def locked(path):
 
 def probe(runtime, gpu, directory):
     output, log = directory / "device.json", directory / "probe.log"
+    output.unlink(missing_ok=True)
     command = [runtime["python"], str(ROOT / "benchmarking/worker.py"), "--probe", str(output)]
     code = execute(command, env=worker_environment(gpu, runtime), log=log, timeout=120)
     if code:
+        if output.is_file():
+            failure = read_json(output)
+            if failure.get("status") == "busy":
+                raise GPUOccupiedError(failure["error"])
         raise RuntimeError(f"GPU probe failed; see {log}")
     return read_json(output)
+
+
+def admitted_probe(runtime, gpu, directory, args, deadline):
+    return wait_for_gpu(gpu, runtime["vendor"], wait_seconds=max(0, deadline - time.monotonic()),
+                        poll_seconds=getattr(args, "gpu_poll_seconds", 60),
+                        status_path=directory / "gpu_admission.json", ready=lambda: probe(runtime, gpu, directory))
 
 
 def baseline_key(targets, device, runtime):
@@ -216,9 +229,8 @@ def run(args):
     # One lock per physical GPU across state directories used by this user.
     gpu_lock = Path.home() / ".cache/tlx-kernel-scout" / f"gpu-{args.gpu}.lock"
     with locked(gpu_lock), locked(args.state / "controller.lock"):
-        wait_for_gpu(args.gpu, runtime["vendor"], wait_seconds=getattr(args, "gpu_wait_seconds", 1800),
-                     poll_seconds=getattr(args, "gpu_poll_seconds", 60), status_path=directory / "gpu_admission.json")
-        identity = probe(runtime, args.gpu, directory)
+        admission_deadline = time.monotonic() + getattr(args, "gpu_wait_seconds", 1800)
+        identity = admitted_probe(runtime, args.gpu, directory, args, admission_deadline)
         if not Path(identity["runtime"]["triton_module"]).is_relative_to(REPOSITORY / "python"):
             raise ValueError("base runtime must import source TLX from this checkout; check PYTHONPATH")
         device = identity["device"]
@@ -231,7 +243,7 @@ def run(args):
         for backend, override in runtimes.items():
             runtime_dir = directory / f"probe_{backend}"
             runtime_dir.mkdir()
-            pin = probe({**runtime, **override}, args.gpu, runtime_dir)
+            pin = admitted_probe({**runtime, **override}, args.gpu, runtime_dir, args, admission_deadline)
             if pin["device"] != device:
                 raise ValueError(f"{backend} runtime selected a different device")
             override_pins[backend] = pin
@@ -373,6 +385,10 @@ def main():
             print(load_target(path)["id"])
         print("backends:", ", ".join(backends()))
     elif args.command == "run":
+        if not math.isfinite(args.gpu_wait_seconds) or args.gpu_wait_seconds < 0:
+            parser.error("GPU wait seconds must be finite and nonnegative")
+        if not math.isfinite(args.gpu_poll_seconds) or args.gpu_poll_seconds <= 0:
+            parser.error("GPU poll seconds must be finite and positive")
         if args.max_candidates < 1 or args.rounds < 0 or min(args.agent_timeout,
                                                              args.worker_timeout) <= 0 or args.gpu < 0:
             parser.error("budgets must be positive; rounds and GPU must be nonnegative")

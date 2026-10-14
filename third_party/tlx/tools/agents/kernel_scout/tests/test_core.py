@@ -763,7 +763,7 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
 
     import appctl
 
-    monkeypatch.setattr(appctl, "wait_for_gpu", lambda *args, **kwargs: None)
+    monkeypatch.setattr(appctl, "wait_for_gpu", lambda *args, **kwargs: kwargs["ready"]())
 
     target_path = tmp_path / "target.json"
     write_json(target_path, target)
@@ -991,6 +991,69 @@ def test_gpu_scheduler_does_not_wait_on_an_inspection_failure(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="KFD process ownership"):
         gpu_scheduler.wait_for_gpu(1, "amd", status_path=path)
     assert json.loads(path.read_text())["state"] == "failed"
+
+
+def test_gpu_scheduler_recovers_when_the_worker_probe_finds_new_ownership(tmp_path, monkeypatch):
+    import gpu_scheduler
+    from benchmarking.environment import GPUOccupiedError
+
+    now, calls = [0.0], []
+    monkeypatch.setattr(gpu_scheduler, "busy_reason", lambda *args: None)
+    monkeypatch.setattr(gpu_scheduler.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(gpu_scheduler.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    def ready():
+        calls.append(now[0])
+        if len(calls) == 1:
+            now[0] += 10  # Framework startup takes time before it observes contention.
+            raise GPUOccupiedError("selected GPU has external processes: [123]")
+        return {"device": "checked"}
+
+    assert gpu_scheduler.wait_for_gpu(1, "amd", ready=ready,
+                                      status_path=tmp_path / "state.json") == {"device": "checked"}
+    assert calls == [0, 60]
+
+
+def test_probe_does_not_reuse_a_stale_busy_result(tmp_path, monkeypatch):
+    import appctl
+    from benchmarking.environment import GPUOccupiedError
+
+    monkeypatch.setattr(appctl, "worker_environment", lambda *args: {})
+
+    def busy(*args, **kwargs):
+        write_json(tmp_path / "device.json", {"status": "busy", "error": "another process"})
+        return 2
+
+    monkeypatch.setattr(appctl, "execute", busy)
+    with pytest.raises(GPUOccupiedError):
+        appctl.probe({"python": "python"}, 1, tmp_path)
+    monkeypatch.setattr(appctl, "execute", lambda *a, **kw: 1)
+    with pytest.raises(RuntimeError, match="GPU probe failed") as failure:
+        appctl.probe({"python": "python"}, 1, tmp_path)
+    assert not isinstance(failure.value, GPUOccupiedError)
+
+
+@pytest.mark.parametrize("busy_check", [1, 2])
+def test_worker_probe_reports_contention_before_or_after_fingerprinting(tmp_path, monkeypatch, busy_check):
+    from benchmarking import worker
+    from benchmarking.environment import GPUOccupiedError
+
+    path = tmp_path / "device.json"
+    checks = []
+
+    def check(device):
+        checks.append(device)
+        if len(checks) == busy_check:
+            raise GPUOccupiedError("selected GPU has external processes: [123]")
+
+    monkeypatch.setattr(sys, "argv", ["worker.py", "--probe", str(path)])
+    monkeypatch.setattr(worker, "inspect_device", lambda: {"physical_gpu": 7})
+    monkeypatch.setattr(worker, "assert_idle", check)
+    monkeypatch.setattr(worker, "runtime_identity", dict)
+    monkeypatch.setattr(worker, "package_identity", lambda name: {})
+    assert worker.main() == 2
+    assert json.loads(path.read_text()) == {"status": "busy", "error": "selected GPU has external processes: [123]"}
+    assert len(checks) == busy_check
 
 
 @pytest.mark.parametrize("wait,poll", [(-1, 60), (float("nan"), 60), (1800, 0), (1800, float("inf"))])

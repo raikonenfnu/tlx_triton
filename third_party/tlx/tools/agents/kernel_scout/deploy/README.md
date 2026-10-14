@@ -56,6 +56,8 @@ Supply PATH for codex/claude/gh, authentication configuration, and the required 
 in the service account. The jobs take a nonblocking per-user physical-GPU lock and state lock.
 An overlapping Scout job fails visibly.
 The GPU supervisor checks ownership immediately, then once per minute for up to 30 minutes.
+Runtime probes share this deadline and retry if another process occupies the GPU during startup.
+The probe checks ownership before and after runtime fingerprinting.
 AMD checks use both AMD SMI and KFD ownership. NVIDIA checks use NVIDIA SMI ownership.
 An idle GPU starts measurement automatically. A busy GPU at the deadline fails the job without publication.
 Inspection errors fail immediately. The supervisor does not stop other jobs or change clocks.
