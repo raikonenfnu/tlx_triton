@@ -445,3 +445,43 @@ def test_input_fingerprints_gate_comparisons(hashes):
     enforce_equal_inputs(results)
     expected = "ok" if hashes == ("same", "same") else "failed"
     assert all(r["status"] == expected for r in results.values())
+
+
+@pytest.mark.parametrize("operation", ["mm", "flash_attn", "flash_attn_varlen"])
+def test_target_init_cli_creates_valid_contract(operation, tmp_path):
+    output = tmp_path / operation / "target.json"
+    subprocess.run([
+        sys.executable,
+        str(ROOT / "appctl.py"), "target-init", "--id", "my_target", "--operation", operation, "--vendor", "amd",
+        "--arch", "gfx950", "--output",
+        str(output)
+    ], check=True)
+    target = load_target(output)
+    assert target["operation"] == operation and target["id"] == "my_target"
+    assert target["hardware"] == {"vendor": "amd", "architectures": ["gfx950"]}
+    assert target["output_policy"] == "returned_tensor"
+    assert work(target["cases"][0], operation)[0] > 0
+
+
+def test_target_init_refuses_overwrite_and_rejects_unknown_operation(tmp_path):
+    from target_templates import create_target
+    path = tmp_path / "target.json"
+    kwargs = {"name": "my_target", "operation": "mm", "vendor": "amd", "architecture": "gfx950", "metric": "compute"}
+    create_target(path, **kwargs)
+    original = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        create_target(path, **kwargs)
+    assert path.read_bytes() == original
+    with pytest.raises(ValueError):
+        create_target(tmp_path / "new.json", **{**kwargs, "operation": "layer_norm"})
+    assert not (tmp_path / "new.json").exists()
+
+
+def test_target_templates_are_independent_and_support_memory_metrics(tmp_path):
+    from target_templates import create_target
+    kwargs = {"operation": "flash_attn_varlen", "vendor": "amd", "architecture": "gfx950", "metric": "memory"}
+    first = create_target(tmp_path / "first.json", name="first", **kwargs)
+    first["cases"][0]["q_lengths"][0] = 999
+    second = create_target(tmp_path / "second.json", name="second", **kwargs)
+    assert second["cases"][0]["q_lengths"] == [33, 65]
+    assert second["metric"] == "memory"

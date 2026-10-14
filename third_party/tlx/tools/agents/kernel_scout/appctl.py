@@ -26,6 +26,7 @@ from contracts import (
 from discovery import discover
 from publication import GitHub, publish
 from reporting import describe, render, reproduce_command
+from target_templates import create_target
 
 
 def execute(command, *, env, log, timeout):
@@ -308,6 +309,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     validate = sub.add_parser("validate")
     validate.add_argument("targets", nargs="+", type=Path)
+    initialize = sub.add_parser("target-init", help="create a validated starter target for an existing operation")
+    initialize.add_argument("--id", required=True)
+    initialize.add_argument("--operation", choices=["mm", "flash_attn", "flash_attn_varlen"], required=True)
+    initialize.add_argument("--vendor", choices=["amd", "nvidia"], required=True)
+    initialize.add_argument("--arch", required=True)
+    initialize.add_argument("--metric", choices=["compute", "memory"], default="compute")
+    initialize.add_argument("--output", type=Path, required=True)
     measure = sub.add_parser("run")
     measure.add_argument("--mode", choices=["weekly", "nightly"], required=True)
     measure.add_argument("--targets", nargs="+", type=Path, required=True)
@@ -335,7 +343,11 @@ def main():
     publication.add_argument("--repo", required=True)
     publication.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    if args.command == "validate":
+    if args.command == "target-init":
+        create_target(args.output, name=args.id, operation=args.operation, vendor=args.vendor, architecture=args.arch,
+                      metric=args.metric)
+        print(args.output)
+    elif args.command == "validate":
         for path in args.targets:
             print(load_target(path)["id"])
         print("backends:", ", ".join(backends()))
