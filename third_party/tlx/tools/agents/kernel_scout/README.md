@@ -1,45 +1,198 @@
 # TLX Kernel Scout
 
-Scout finds the best observed existing kernel variants for a target and compares TLX ops,
-TLX tutorials, AITER, and PyTorch. An `appctl.py` controller owns measurements, frozen weekly
-controls, reports, and GitHub publication. Python Codex/Claude adapters own bounded source
-research and variant proposals. This keeps measurement reproducible and limits agent cost.
+Kernel Scout compares existing kernel variants for the same workload across TLX ops, TLX tutorials,
+AITER, and PyTorch. It reports the best observed variant per backend, performance, source identity,
+and reproduction commands. Weekly reference measurements make nightly TLX progress cheaper to track.
 
-The first target is `targets/amd/gfx950/varlen_f16_fa.json`, from
-[PR #3921](https://github.com/facebookexperimental/triton/pull/3921). It freezes the five
-`gfx950_1` focus shapes and their realized lengths, plus a causal control. The original op is
-already present in the initial main checkout (`302d051fe`). Scout measures the current implementation.
-The PR's graph timings and BF16 assembly results are not imported as FP16/eager controls.
-Additional targets cover a16w16 GEMM and BF16 dense attention.
+The first target is [FP16 variable-length attention](targets/amd/gfx950/varlen_f16_fa.json), from
+[PR #3921](https://github.com/facebookexperimental/triton/pull/3921). Its cases freeze the five
+`gfx950_1` focus shapes and realized lengths, plus a causal control. Other targets cover GEMM and
+BF16 dense attention. See [example output and measurement scope](https://github.com/raikonenfnu/tlx_triton/issues/27).
 
-## Common benchmark contract
+## Architecture
 
-Every backend receives the same seeded data, dtype, shapes, strides, mask semantics, and output
-layout. Workers hash tensor bits and strides for every seed and reject different input fingerprints across backends.
-`benchmarking/inputs.py` owns generation and an independent FP32 oracle. At least two
-seeds check outputs, input mutation, finiteness, and output aliasing. Each timed call returns a
-new canonical output tensor. Required padding, packing, copies, and extraction are included.
-This matters for packed attention: a pre-padded Torch call and a packed TLX call have different
-input contracts. Torch seeds compare per-sequence SDPA and padded batched SDPA with all conversion
-work included. Read [the fairness skill](skills/benchmark-fairness/SKILL.md) for the complete contract.
+The controller owns measurements, selection, baselines, and reports. Codex or Claude researches
+source code and proposes adapters for existing implementations and supported kernel parameters.
+The worker measures those adapters through one shared harness. Agent-reported timings never determine a winner.
 
-Timing uses the same eager `triton.testing.do_bench` warmup/rep milliseconds, cache-clearing
-behavior, quantiles, and independent repeats. Candidates must be correct and stable. A selected
-variant is checked in a new process. Winners use latency and uncertainty. Throughput reports
-use useful TFLOP/s or logical TB/s. Neither metric is a hardware counter. Device admission checks,
-clock/power/temperature snapshots, source commits, package/runtime versions, compiler hashes,
-and candidate digests are saved in JSON. Clocks are not changed automatically.
+```mermaid
+flowchart TD
+    T[Target JSON + backend manifests] --> C[appctl.py: check hardware and contracts]
+    C --> S[Seed recipes + optional agent proposals]
+    S --> W[Worker: common inputs, correctness, timing]
+    W --> F[Measured feedback]
+    F --> S
+    F --> B[Select best variant + remeasure in a new worker]
+    B --> R[Local reports + pinned reproducers]
+    R --> K[Weekly baseline / nightly reuse]
+    R --> P[Explicit GitHub publication]
+```
 
-This is a bounded search, not a proof that every possible variant was evaluated. Agents select
-existing implementations and supported launch knobs. Kernel rewriting belongs to the existing
-kernel optimizer. Generated adapters are trusted executable Python. Inspect them when needed.
-Correctness tests do not establish that arbitrary code is honest or safe.
+For each target case and eligible backend, Scout measures seed recipes first. Optional discovery
+uses those results for a bounded search. Scout remeasures the fastest correct, stable candidate in
+a new process. Reports compare those independent measurements and account for timing uncertainty.
 
-## Add a target or operation
+| Component | Responsibility |
+| --- | --- |
+| [appctl.py](appctl.py) | CLI, hardware admission, search loop, worker orchestration, and weekly/nightly state |
+| [contracts.py](contracts.py) | Target checks, backend eligibility, work counts, input agreement, and winner rules |
+| [backends/](backends/) | Capability manifests and research instructions. [seeds.py](backends/seeds.py) supplies known variants. |
+| [discovery.py](discovery.py), [coding_agents.py](coding_agents.py) | Prompt context, structured proposals, provider permissions, and timeouts |
+| [benchmarking/inputs.py](benchmarking/inputs.py) | Seeded inputs, tensor fingerprints, and independent FP32 reference outputs |
+| [benchmarking/worker.py](benchmarking/worker.py) | Adapter execution, correctness, common timing, and measurement evidence |
+| [benchmarking/environment.py](benchmarking/environment.py) | Physical GPU identity, competing GPU processes, runtime pins, and device snapshots |
+| [reporting.py](reporting.py), [publication.py](publication.py) | Performance/reproducer tables and idempotent GitHub issue updates |
+| [deploy/](deploy/), [tests/](tests/) | Scheduled runner instructions and core checks |
 
-Use [the target creation skill](skills/create-target/SKILL.md) when adding a workload or benchmarker.
-The [authoring guide](skills/create-target/references/target-authoring.md) maps each operation contract to its implementation files.
-Create a starter config with `appctl.py target-init`, edit its cases, and check it before GPU measurements.
+The adapter interface is small:
+
+```python
+def build(case, params):
+    # Select and prepare an existing implementation outside the timed call.
+    def run(inputs):
+        # Perform the operation and return a new canonical output tensor.
+        ...
+    return run
+```
+
+The worker calls `build` once and times `run(inputs)`. Input-dependent padding, packing, copies,
+and output extraction belong inside `run`. An adapter must not cache answers or change harness
+inputs. Seed and generated adapters use the same contract. Kernel rewriting belongs to the kernel optimizer.
+
+## Benchmark contract
+
+All backends receive the same dtype, shapes, strides, masks, and seeded tensor values. Scout checks
+actual input fingerprints across backends, including frozen controls. At least two correctness
+seeds check the FP32 reference, output shape/dtype/device, finiteness, input mutation, and output aliasing.
+
+Timing uses eager `triton.testing.do_bench` with common warmup, duration, cache behavior, quantiles,
+and repeats. Unstable candidates cannot win. Reports show latency and useful TFLOP/s or logical
+TB/s. These throughput metrics count workload operations or bytes, not hardware counters.
+Scout records device conditions and source/compiler/runtime identities without changing clocks.
+
+Read [benchmark fairness](skills/benchmark-fairness/SKILL.md) before changing a measured operation.
+Search budgets limit coverage. A missing seed does not establish that a backend lacks a compatible
+implementation. Generated adapters are executable Python, and correctness checks do not prove arbitrary code is honest.
+
+## Run locally
+
+Use a source-built TLX checkout and its virtual environment. Place source Triton before wheel
+Triton on `PYTHONPATH`. The controller rejects a base runtime that imports Triton outside this checkout.
+
+```bash
+cd third_party/tlx/tools/agents/kernel_scout
+export PYTHONPATH=/path/to/triton/python:/path/to/torch/site-packages
+/path/to/venv/tlx.venv/bin/python appctl.py validate targets/amd/gfx950/*.json
+
+# Preview a small weekly run.
+/path/to/venv/tlx.venv/bin/python appctl.py run --mode weekly \
+  --targets targets/amd/gfx950/varlen_f16_fa.json --case one_x_1000 \
+  --gpu 2 --state /path/to/scout-state
+
+# Measure all eligible backends and freeze the weekly baseline.
+/path/to/venv/tlx.venv/bin/python appctl.py run --mode weekly --execute \
+  --targets targets/amd/gfx950/varlen_f16_fa.json --case one_x_1000 \
+  --gpu 2 --state /path/to/scout-state
+
+# Measure current TLX against the same week's controls.
+/path/to/venv/tlx.venv/bin/python appctl.py run --mode nightly --execute \
+  --targets targets/amd/gfx950/varlen_f16_fa.json --case one_x_1000 \
+  --gpu 2 --state /path/to/scout-state
+```
+
+Choose an available physical GPU index for `--gpu`. Scout maps it to logical GPU 0 and checks its
+PCI identity. On AMD, it sets ROCR visibility before HIP visibility. Keep the same targets,
+case filter, GPU, and state directory for weekly and nightly runs. Remove `--case` for all cases.
+Preview creates a run directory but performs no discovery or GPU measurement.
+
+The default `--provider builtin` measures known recipes without an LLM. Add these options to a
+run for discovery:
+
+```bash
+--provider claude --context /path/to/megabrain/context.md --rounds 2 --max-candidates 6
+```
+
+`codex` is also supported. Authenticate the selected CLI first. `--context` explicitly supplies
+project knowledge to each agent invocation. Discovery restricts agents to source research.
+`--max-candidates` includes seeds, and `--rounds` bounds discovery iterations. Use `--model`,
+`--agent-timeout`, and `--worker-timeout` to configure provider and process limits.
+
+For separate backend environments, supply `--runtimes /path/to/runtimes.json`:
+
+```json
+{"aiter": {"python": "/path/to/aiter/bin/python", "pythonpath": "/path/to/aiter-triton/python:/path/to/torch/site-packages"}}
+```
+
+Every runtime must select the same physical device and preserve the operation contract.
+Scout records runtime differences. Dependency installation and source builds remain deployment tasks.
+
+## Weekly state and operation
+
+| Mode | Fresh measurements | Reused measurements |
+| --- | --- | --- |
+| Weekly | All eligible backends | None. Freeze PyTorch, AITER, and the selected TLX ops baseline. |
+| Nightly | Backends with `cadence="nightly"`, currently TLX ops and tutorials | Weekly PyTorch/AITER controls and `tlx_ops_baseline` |
+
+A campaign identifies the architecture and effective target configurations, including selected cases.
+Weeks start Monday in UTC. Baselines are immutable. Nightly permits current TLX source changes
+but requires compatible target, harness, device/runtime, dependency, and backend registry identities.
+Changed contracts require a fresh weekly baseline. Use a new state directory to repeat an existing week's weekly run.
+
+Frozen controls retain their measurement dates. Nightly tables track trends against those controls.
+Run a fresh weekly comparison when every backend must have a current measurement.
+
+```text
+STATE/
+  baselines/<campaign>/<week>.json       # Immutable weekly report
+  runs/<date>_<mode>_<timestamp>/
+    report.md / report.json             # Tables and structured results
+    device.json / probe.log             # Hardware and runtime evidence
+    <target>/<case>/<backend>/
+      search.json                       # All evaluated candidates and feedback
+      discovery_*                       # Agent responses and generated adapters
+      r*/                               # Candidate request, measurement, and worker log
+      confirmation/                     # Selected variant's independent remeasurement
+```
+
+Start investigation with `report.md`, then inspect the backend's `search.json` and candidate logs.
+The report includes reproduction commands. They reject changed source, compiler, runtime, harness,
+adapter, or device pins. Preserve original checkouts, environments, and artifacts for reproduction.
+
+| Symptom | Next action |
+| --- | --- |
+| `unsupported` | Check the hardware/operation manifest and seed coverage. Enable discovery when a seed is missing. |
+| `unavailable` | Install the missing dependency in the intended runtime. AITER requires supported AMD hardware. |
+| `blocked` discovery or provider error | Check provider authentication, permissions, and discovery logs. |
+| `failed` or `unstable` candidate | Inspect correctness errors or timing spread in its measurement and worker log. |
+| Baseline mismatch | Check changed contracts and runtime identities. Create a compatible weekly baseline. |
+| Device admission or lock failure | Check the selected GPU, competing processes, and overlapping Scout jobs. |
+
+Publication is a separate command and previews by default:
+
+```bash
+/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton
+/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton --execute
+```
+
+Weekly publication checks the new owned issue before linking and closing previous campaign weeks.
+Nightly publication updates one dated comment on that week's open issue. Local artifacts remain
+the detailed evidence. See [deployment instructions](deploy/README.md) for configuration, cron,
+optional source refresh, and failure handling. The runner measures before publishing and does not install cron or update Megabrain automatically.
+
+## Extend and check
+
+Read the relevant skill before changing a contract:
+
+| Change | Entry point |
+| --- | --- |
+| Add workload cases for an existing operation | [Create-target skill](skills/create-target/SKILL.md) and target JSON |
+| Add an operation or benchmarker | [Authoring guide](skills/create-target/references/target-authoring.md): contracts, inputs, oracle, work counts, and backend support |
+| Add a backend or existing variant | [Registration skill](skills/register-backend/SKILL.md), backend manifest/instructions, and `backends/seeds.py` |
+| Change agent search | `discovery.py` and `coding_agents.py`. Keep timing in the worker. |
+| Change timing or reporting | [Fairness skill](skills/benchmark-fairness/SKILL.md), worker, contracts, and reporting |
+| Change schedules or publication | `deploy/run.py`, deployment configuration, and `publication.py` |
+
+Create a starter target with the existing operation contract:
 
 ```bash
 python appctl.py target-init --id my_varlen_f16_fa \
@@ -47,84 +200,22 @@ python appctl.py target-init --id my_varlen_f16_fa \
   --output targets/amd/gfx950/my_varlen_f16_fa.json
 ```
 
-## Run locally
-
-Use the source-built TLX environment. Put source Triton before any wheel Triton on PYTHONPATH:
-
-```bash
-cd third_party/tlx/tools/agents/kernel_scout
-export PYTHONPATH=/path/to/triton/python:/path/to/torch/site-packages
-/path/to/venv/tlx.venv/bin/python appctl.py validate targets/amd/gfx950/*.json
-/path/to/venv/tlx.venv/bin/python appctl.py run --mode weekly \
-  --targets targets/amd/gfx950/varlen_f16_fa.json --state /path/to/scout-state
-```
-
-The last command previews. Add `--execute` for measurements. The default `--provider builtin`
-uses known seed recipes without an LLM. Set `--provider codex` or `claude` for agentic discovery:
-
-```bash
-/path/to/python appctl.py run --mode weekly --execute --provider codex \
-  --context /path/to/megabrain/context.md --rounds 2 --max-candidates 6 \
-  --targets targets/amd/gfx950/varlen_f16_fa.json --state /path/to/scout-state
-/path/to/python appctl.py run --mode nightly --execute --provider codex \
-  --context /path/to/megabrain/context.md \
-  --targets targets/amd/gfx950/varlen_f16_fa.json --state /path/to/scout-state
-```
-
-`--case one_x_1000` selects a small PR smoke case. Use the same filter for weekly and nightly.
-`--gpu` is the physical GPU index. On AMD, the worker sets ROCR visibility before HIP visibility.
-It checks Torch's PCI address against the selected physical device before measuring.
-The selected device appears as logical GPU 0. HIP visibility alone did not select the intended
-physical device in the checked ROCm 7.1 runtime.
-`--model`, `--agent-timeout`, and `--worker-timeout` bound each worker. `--max-candidates` includes
-seeds, and `--rounds` bounds discovery iterations. Authentication/provider failures stop the run.
-Unsupported or failed kernel candidates remain recorded. Missing AITER is unavailable.
-There is no known independent packed-varlen tutorial seed at the initial source revision. Agent discovery can investigate it, and must report unsupported when none exists.
-
-Use `--runtimes /path/to/runtimes.json` for per-backend environments:
-
-```json
-{"aiter": {"python": "/path/to/aiter/bin/python", "pythonpath": "/path/to/aiter-triton/python:/path/to/torch/site-packages"}}
-```
-
-Keep device and operation contracts consistent across runtimes. Scout does not install dependencies.
-Source revision and native compiler pins show implementation differences. Vendor restrictions are
-in `backends/*/backend.json`. Add backends with [the registration skill](skills/register-backend/SKILL.md).
-The detailed backend instructions are injected into every discovery prompt.
-
-## Artifacts and publication
-
-Each run writes report.md/report.json, per-candidate logs, search manifests, proposals, and
-reproducer requests under `STATE/runs/`. The Markdown has a performance table, winner column,
-reproducer-command table, and provenance/coverage table. Commands reject changed source,
-compiler, runtime, or physical-device pins. Keep old environments/checkouts for weekly reproduction.
-
-Weekly freezes PyTorch, AITER, and the selected TLX ops baseline in an immutable baseline file.
-Nightly measures current TLX ops/tutorials and labels reused controls with their original dates.
-Target, timing, case selection, device/runtime, and registry mismatches reject reuse. These are
-trend comparisons. For a simultaneous comparison rerun all backends in a fresh state/campaign.
-Local artifacts are authoritative evidence. GitHub receives Markdown summaries only.
-
-```bash
-/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton
-/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton --execute
-```
-
-Publication previews by default. Weekly creates or updates one owned issue, checks it, then
-links and closes earlier weeks of that campaign. Nightly creates or updates one dated comment
-on the owned open weekly issue. The repository is explicit and configurable. Publication tests
-use a fake API. Running tests never creates or closes real issues.
-See [deployment instructions](deploy/README.md) for the nightly runner and cron schedule.
-
-## Tests
+Replace starter cases with the intended workload. Check the config before GPU measurement.
+Run CPU tests for core behavior changes:
 
 ```bash
 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
+```
+
+Tests cover contracts, work counts, selection, baseline compatibility, fake provider protocols,
+and GitHub publication transitions. Tests do not publish real issues. For harness or adapter
+changes, also check a small GPU case and its pinned reproducer. The opt-in GPU test exercises
+source-built TLX and rejects an incorrect adapter that mutates inputs:
+
+```bash
 ROCR_VISIBLE_DEVICES=2 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 SCOUT_PHYSICAL_GPU=2 \
   SCOUT_TEST_GPU=1 /path/to/venv/tlx.venv/bin/python -m pytest tests -s --tb=short
 ```
 
-CPU tests cover contracts, arithmetic, selection, baseline checks, fake Codex/Claude protocols,
-and weekly/nightly publication transitions. The opt-in GPU test runs source-built TLX through
-the actual common harness and rejects a deliberately incorrect mutating adapter.
-Live provider discovery is separate from fake CLI protocol validation.
+Use your selected physical GPU index in both places. Live provider discovery needs a separate
+check because fake CLI tests establish protocol behavior only.
