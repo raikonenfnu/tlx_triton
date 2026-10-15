@@ -110,6 +110,10 @@ def render(report):
             for key in ("setup", "preparation", "correctness", "compiler_cleanup", "benchmark_and_checks")
         }
         lines += [f"Worker phase seconds: {phases}. Remaining worker time includes imports and process startup.", ""]
+    if "elapsed_seconds" in report:
+        lines += [f"Elapsed wall time: {report['elapsed_seconds']:.1f}s, including interruptions after resume.", ""]
+    if report.get("resumed_cases"):
+        lines += [f"Retained {report['resumed_cases']} completed cases from the same pinned campaign.", ""]
     return "\n".join(lines)
 
 

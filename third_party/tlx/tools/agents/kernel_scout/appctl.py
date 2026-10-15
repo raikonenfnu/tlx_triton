@@ -122,6 +122,35 @@ def validate_baseline(baseline, *, campaign, week, key):
                     raise ValueError("weekly baseline reproducer is missing or changed")
 
 
+def resume_progress(path, report, targets):
+    """Reuse only a complete case prefix with identical source, runtime, and search pins."""
+    previous = read_json(path)
+    if previous.get("complete") is not False or previous.get("resume_key") != report["resume_key"]:
+        raise ValueError("resume requires an incomplete report with identical source, runtime, and search pins")
+    for key in ("mode", "date", "campaign", "baseline_key"):
+        if previous[key] != report[key]:
+            raise ValueError(f"resume report differs in {key}")
+    expected = [(target, case) for target in targets for case in target["cases"]]
+    rows = previous["rows"]
+    if len(rows) > len(expected):
+        raise ValueError("resume contains more cases than this campaign")
+    for row, (target, case) in zip(rows, expected):
+        if row["target"] != target or row["case"] != case or set(row["results"]) != set(report["columns"]):
+            raise ValueError("resume rows must be a complete ordered case prefix")
+        if any(
+                r.get("failure_kind") == "infrastructure" or "GPUOccupiedError" in r.get("error", "")
+                for r in row["results"].values()):
+            raise ValueError("resume contains an infrastructure failure")
+        enforce_equal_inputs(row["results"])
+    validate_baseline(previous, campaign=report["campaign"], week=report["week"], key=report["baseline_key"])
+    started = dt.datetime.fromisoformat(previous["started_utc"])
+    if started.tzinfo is None:
+        raise ValueError("resume start time must include its timezone")
+    report.update(rows=rows, started_utc=previous["started_utc"], resume_from=str(Path(path).resolve()),
+                  resumed_cases=len(rows))
+    return max(0, (dt.datetime.now(dt.timezone.utc) - started).total_seconds())
+
+
 def evaluate(backend, target, case, candidate, directory, runtime, args, *, pool=None, timing_phase="full"):
     started = time.monotonic()
     runtime = {**runtime, "vendor": target["hardware"]["vendor"]}
@@ -269,6 +298,7 @@ def scout(backend, target, case, directory, runtime, args, *, research=None, cac
 
 def run(args):
     job_started = time.monotonic()
+    started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     aiter_search = getattr(args, "aiter_search", False)
     targets = [load_target(path) for path in args.targets]
     if args.case:
@@ -346,9 +376,9 @@ def run(args):
         elif baseline_path.exists():
             raise ValueError("this week's immutable baseline already exists; use a new state directory to rerun")
         report = {
-            "schema_version": 1, "complete": False, "mode": args.mode, "date": date.isoformat(), "week": week,
-            "campaign": campaign, "baseline_key": key, "device": device, "provider": args.provider, "aiter_mode":
-            "search" if aiter_search else "public", "budget": {
+            "schema_version": 1, "complete": False, "started_utc": started_utc, "mode": args.mode, "date":
+            date.isoformat(), "week": week, "campaign": campaign, "baseline_key": key, "device": device, "provider":
+            args.provider, "aiter_mode": "search" if aiter_search else "public", "budget": {
                 "max_candidates": args.max_candidates, "rounds": args.rounds, "agent_timeout_s": args.agent_timeout,
                 "worker_timeout_s": args.worker_timeout
             }, "columns": list(registry) + ["tlx_ops_baseline"], "rows": []
@@ -366,8 +396,23 @@ def run(args):
         context_hash = digest(context.read_text()) if context else None
         preferred = [name for name in ("tlx_ops", "tlx_tutorials", "aiter", "pytorch") if name in registry]
         report["columns"] = preferred + [name for name in registry if name not in preferred] + ["tlx_ops_baseline"]
+        report["resume_key"] = digest({
+            "identity": identity, "override_pins": override_pins, "runtime": runtime, "baseline":
+            digest(baseline) if args.mode == "nightly" else None, "controller": digest(Path(__file__).read_text()),
+            "pool": digest((ROOT / "worker_pool.py").read_text()), "budget": report["budget"], "provider":
+            args.provider, "model": getattr(args, "model", None), "context": context_hash, "discovery": discovery_scope,
+            "refresh_discovery": getattr(args, "refresh_discovery", False)
+        })
+        if getattr(args, "resume_from", None):
+            elapsed = resume_progress(args.resume_from, report, targets)
+            run_started = time.monotonic() - elapsed
+            print(f"Resuming after {len(report['rows'])} complete cases", flush=True)
+        completed = {(row["target"]["id"], row["case"]["id"]) for row in report["rows"]}
+        write_json(directory / "progress.json", report)
         for target in targets:
             for case in target["cases"]:
+                if (target["id"], case["id"]) in completed:
+                    continue
                 if args.case and case["id"] not in args.case:
                     continue
                 row = {"target": target, "case": case, "description": describe(target, case), "results": {}}
@@ -479,6 +524,8 @@ def main():
     measure.add_argument("--pythonpath", default=os.environ.get("PYTHONPATH", ""))
     measure.add_argument("--runtimes", type=Path, help="JSON backend -> {python, pythonpath} overrides")
     measure.add_argument("--report-pointer", type=Path, help="write the completed report path for deployment")
+    measure.add_argument("--resume-from", type=Path,
+                         help="retain complete cases from a matching partial progress.json after interruption")
     measure.add_argument("--provider", choices=["builtin", "codex", "claude"], default="builtin")
     measure.add_argument("--execution", choices=["isolated", "persistent"], default="isolated",
                          help="use fresh processes or serialized runtime workers with shared case preparation")

@@ -20,7 +20,7 @@ def commands(config, mode, pointer):
         config.get("provider", "codex"), "--report-pointer",
         str(pointer), "--execute"
     ]
-    for key in ("context", "runtimes", "model", "candidate_cache"):
+    for key in ("context", "runtimes", "model", "candidate_cache", "resume_from"):
         if config.get(key):
             command.extend(["--" + key.replace("_", "-"), config[key]])
     command.extend(["--discovery", config.get("discovery", "target")])

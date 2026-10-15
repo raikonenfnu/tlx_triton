@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from appctl import baseline_key, validate_baseline, worker_environment
 from coding_agents import query_json
-from contracts import applicable, backends, digest, load_target, select_winner, work, write_json
+from contracts import applicable, backends, digest, load_target, read_json, select_winner, work, write_json
 from discovery import validate_proposals
 from publication import publish
 
@@ -828,6 +828,81 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     args.mode, args.case = "nightly", ["ten_x_1000"]
     with pytest.raises(FileNotFoundError):
         appctl.run(args)
+
+
+@pytest.mark.parametrize("changed", [None, "source", "request", "rows", "mode", "complete", "policy"])
+def test_controller_resumes_complete_cases_and_rejects_drift(tmp_path, monkeypatch, target, changed):
+    import datetime as dt
+
+    import appctl
+
+    target = {**target, "cases": target["cases"][:2]}
+    target_path = tmp_path / "target.json"
+    write_json(target_path, target)
+    identity = {
+        "device": {"vendor": "amd", "arch": "gfx950", "physical_gpu": 0, "name": "GPU"}, "runtime":
+        {"compiler_sha256": "original", "triton_module":
+         str(appctl.REPOSITORY / "python/triton/__init__.py")}, "aiter": {"status": "unavailable"}
+    }
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(appctl, "wait_for_gpu", lambda *a, **kw: kw["ready"]())
+    monkeypatch.setattr(appctl, "probe", lambda *a: identity)
+    monkeypatch.setattr(appctl, "backends", lambda: {"tlx_ops": backends()["tlx_ops"]})
+    calls = []
+    interrupted = True
+
+    def scout(backend, t, case, directory, runtime, args, **kwargs):
+        calls.append(case["id"])
+        if interrupted and case == target["cases"][1]:
+            raise appctl.GPUOccupiedError("external job arrived")
+        directory.mkdir(parents=True)
+        request = directory / "request.json"
+        write_json(request, {"expected_identity": identity})
+        return {
+            **measurement(1), "input_sha256": "same-inputs", "candidate": {"id": "seed"}, "backend_pin":
+            {"git_sha": "source"}, "runtime": identity["runtime"], "tflops": 1, "logical_tbps": 1, "reproducer":
+            str(request), "request_sha256": digest(read_json(request)), "reproducer_command": "command"
+        }
+
+    monkeypatch.setattr(appctl, "scout", scout)
+    args = SimpleNamespace(targets=[target_path], case=None, state=tmp_path / "state", python=sys.executable,
+                           pythonpath="/source", runtimes=None, date="2026-10-15", execute=True, mode="weekly", gpu=0,
+                           provider="builtin", max_candidates=3, rounds=0, agent_timeout=10, worker_timeout=10,
+                           report_pointer=tmp_path / "pointer.json")
+    with pytest.raises(appctl.GPUOccupiedError):
+        appctl.run(args)
+    assert not args.report_pointer.exists() and not list(args.state.glob("baselines/**/*.json"))
+    partial = next(args.state.glob("runs/*/progress.json"))
+    previous = read_json(partial)
+    assert not previous["complete"] and len(previous["rows"]) == 1
+    previous["started_utc"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=120)).isoformat()
+    if changed == "source":
+        identity["runtime"]["compiler_sha256"] = "changed"
+    elif changed == "request":
+        write_json(Path(previous["rows"][0]["results"]["tlx_ops"]["reproducer"]), {})
+    elif changed == "rows":
+        previous["rows"][0]["case"] = target["cases"][1]
+    elif changed == "mode":
+        previous["mode"] = "nightly"
+    elif changed == "complete":
+        previous["complete"] = True
+    elif changed == "policy":
+        args.max_candidates += 1
+    write_json(partial, previous)
+    args.resume_from = partial
+    interrupted = False
+    calls.clear()
+    if changed:
+        with pytest.raises(ValueError, match="resume|reproducer"):
+            appctl.run(args)
+        assert not calls and not args.report_pointer.exists()
+        return
+    appctl.run(args)
+    result = read_json(read_json(args.report_pointer)["report"])
+    assert calls == [target["cases"][1]["id"]]
+    assert result["complete"] and result["resumed_cases"] == 1 and len(result["rows"]) == 2
+    assert result["rows"][0] == previous["rows"][0]
+    assert result["elapsed_seconds"] >= 120  # Include the interruption rather than reporting only resumed work.
 
 
 def test_report_escapes_table_cells():
