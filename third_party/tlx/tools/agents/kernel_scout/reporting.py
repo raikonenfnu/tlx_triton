@@ -31,11 +31,11 @@ def render(report):
         f"Week: {report['week']}. Campaign: `{report['campaign']}`. Provider: {report['provider']}.",
         f"AITER mode: {report.get('aiter_mode', 'search (legacy report)')}.",
         f"Discovery scope: {report.get('discovery_scope', 'case (legacy report)')}.",
+        f"Execution: {report.get('execution_mode', 'isolated')}. Candidate screening: {report.get('screen_candidates', False)}.",
         "Best observed among evaluated candidates; unavailable and unstable results cannot win.",
         "All calls use returned tensors, eager triton.testing.do_bench, and the same seeded logical inputs.",
-        "Weekly controls are frozen observations, not simultaneous nightly measurements.", "",
-        "| Problem | " + " | ".join(columns) + " | Winner |",
-        "| --- | " + " | ".join("---" for _ in columns) + " | --- |"
+        "Weekly controls are frozen observations, not simultaneous nightly measurements.", "", "| Problem | " +
+        " | ".join(columns) + " | Winner |", "| --- | " + " | ".join("---" for _ in columns) + " | --- |"
     ]
     for row in report["rows"]:
         values = []
@@ -103,7 +103,13 @@ def render(report):
     if searches:
         lines += [(f"Search overhead: {sum(s['agent_calls'] for s in searches)} agent calls, "
                    f"{sum(s['discovery_seconds'] for s in searches):.1f}s in discovery, "
-                   f"{sum(s['worker_seconds'] for s in searches):.1f}s in isolated workers."), ""]
+                   f"{sum(s['worker_seconds'] for s in searches):.1f}s in measurement workers."), ""]
+        phases = {
+            key: sum(s.get("phase_seconds", {}).get(key, 0)
+                     for s in searches)
+            for key in ("setup", "preparation", "correctness", "benchmark_and_checks")
+        }
+        lines += [f"Worker phase seconds: {phases}. Remaining worker time includes imports and process startup.", ""]
     return "\n".join(lines)
 
 

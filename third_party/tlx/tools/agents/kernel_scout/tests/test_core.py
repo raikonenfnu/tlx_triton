@@ -785,7 +785,7 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     write_json(runtimes, {"aiter": {"python": str(aiter_python)}})
     calls = []
 
-    def fake_scout(backend, t, case, directory, runtime, args, *, research=None, cache=None):
+    def fake_scout(backend, t, case, directory, runtime, args, *, research=None, cache=None, pool=None):
         expected_python = aiter_python if backend == "aiter" else venv_python
         assert runtime["python"] == str(expected_python)  # Preserve the virtual environment's interpreter path.
         if backend == "aiter":
@@ -879,7 +879,7 @@ def test_report_search_cost_excludes_frozen_controls_and_baseline_copy():
             "results": {"tlx_ops": fresh, "pytorch": frozen, "tlx_ops_baseline": fresh}
         }])
     text = render(r)
-    assert "2 agent calls, 3.0s in discovery, 4.0s in isolated workers" in text
+    assert "2 agent calls, 3.0s in discovery, 4.0s in measurement workers" in text
     assert "Discovery scope: target" in text
 
 
@@ -1127,6 +1127,184 @@ def test_full_corpus_research_count_scales_with_targets_not_shapes(cached_scout,
         assert len(s.calls) - before == {"target": 17, "off": 0, "case": 172}[scope]
     assert research_groups == 17
     assert sum(len(t["cases"]) for t in targets) == 60
+
+
+@pytest.mark.parametrize("operation", ["mm", "addmm", "bmm"])
+def test_shared_inputs_preserve_bits_layouts_and_zero_stride_batches(tmp_path, monkeypatch, operation):
+    torch = pytest.importorskip("torch")
+    from benchmarking import inputs
+
+    case = {
+        "dtype": "bfloat16", "m": 3, "n": 4, "k": 5, "batch": 2, "shared_a": True, "a_layout": "column_major",
+        "b_layout": "column_major"
+    }
+    expected = inputs.make_inputs(case, operation, 17, device="cpu")
+    first, fingerprint = inputs.cached_inputs(case, operation, 17, tmp_path, device="cpu")
+    assert inputs.input_digest(expected) == fingerprint == inputs.input_digest(first)
+    monkeypatch.setattr(inputs, "make_inputs", lambda *a, **kw: pytest.fail("cache hit regenerated random data"))
+    second, actual_hash = inputs.cached_inputs(case, operation, 17, tmp_path, device="cpu")
+    assert actual_hash == fingerprint
+    for name in expected:
+        assert second[name].stride() == expected[name].stride()
+        assert torch.equal(second[name], expected[name])
+    if operation == "bmm":
+        assert second["a"].stride(0) == 0
+    host = torch.load(next(tmp_path.glob("*.pt")), weights_only=True)
+    host["a"].flatten()[0] += 1
+    # Modify the unique storage even for a column-major or expanded view.
+    host["b"].zero_()
+    torch.save(host, next(tmp_path.glob("*.pt")))
+    with pytest.raises(ValueError, match="cache content differs"):
+        inputs.cached_inputs(case, operation, 17, tmp_path, device="cpu")
+
+
+def test_prepared_case_reuses_oracles_and_discards_mutated_inputs(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from benchmarking import inputs, worker
+
+    original = inputs.cached_inputs
+    calls = []
+
+    def cached(*args, **kwargs):
+        calls.append(args[2])
+        return original(*args, device="cpu", **kwargs)
+
+    monkeypatch.setattr(inputs, "cached_inputs", cached)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = load_target(ROOT / "targets/amd/gfx950/a16w16_gemm.json")
+    request = {"target": target, "case": {**target["cases"][0], "m": 3, "n": 4, "k": 5}, "input_cache": str(tmp_path)}
+    session = worker.MeasurementSession()
+    prepared = session.prepare(request)
+    expected = prepared[17]["expected"]
+    assert calls == [17, 29, 0]
+    assert session.prepare(request)[17]["expected"] is expected
+    assert calls == [17, 29, 0]
+    prepared[17]["inputs"]["a"].zero_()
+    session.discard_mutated_inputs()
+    assert session.case_key is None and not session.data
+    recovered = session.prepare(request)
+    torch.testing.assert_close(recovered[17]["expected"], expected)
+
+
+def test_session_rejects_changed_source_and_harness(monkeypatch):
+    from benchmarking import worker
+
+    session = worker.MeasurementSession()
+    session.runtime, session.harness = {"compiler": "pinned"}, "harness"
+    monkeypatch.setattr(worker, "harness_digest", lambda: "harness")
+    monkeypatch.setattr(worker, "runtime_identity", lambda: {"compiler": "changed"})
+    with pytest.raises(ValueError, match="runtime changed"):
+        session.verify()
+    monkeypatch.setattr(worker, "harness_digest", lambda: "changed")
+    with pytest.raises(ValueError, match="harness changed"):
+        session.verify()
+
+
+def test_gpu_ownership_excludes_only_registered_peer_workers(monkeypatch):
+    from benchmarking import environment
+
+    rows = ["gpu,11"]
+    monkeypatch.setattr(environment, "command", lambda args: "gpu" if "--query-gpu=uuid" in args else "\n".join(rows))
+    device = {"vendor": "nvidia", "physical_gpu": 0}
+    with pytest.raises(environment.GPUOccupiedError):
+        environment.assert_idle(device)
+    environment.assert_idle(device, allowed_pids=[11])
+    rows.append("gpu,12")
+    with pytest.raises(environment.GPUOccupiedError, match="12"):
+        environment.assert_idle(device, allowed_pids=[11])
+
+
+@pytest.fixture
+def fake_worker_server(tmp_path, monkeypatch):
+    import worker_pool
+
+    script = tmp_path / "benchmarking/worker.py"
+    script.parent.mkdir()
+    script.write_text("""import argparse,json,os,sys,time
+from pathlib import Path
+p=argparse.ArgumentParser();p.add_argument('--serve',action='store_true');p.add_argument('--response-fd',type=int)
+args=p.parse_args();responses=os.fdopen(args.response_fd,'w',buffering=1)
+print('backend output must not corrupt acknowledgements',flush=True)
+for line in sys.stdin:
+ msg=json.loads(line)
+ if not msg.get('verify'):
+  request=json.loads(Path(msg['request']).read_text())
+  if request.get('sleep'):time.sleep(request['sleep'])
+  Path(msg['output']).write_text(json.dumps({'status':'ok','pid':os.getpid(),'peers':msg['peers']}))
+ responses.write(json.dumps({'exit_code':0})+'\\n');responses.flush()
+""")
+    monkeypatch.setattr(worker_pool, "ROOT", tmp_path)
+    return worker_pool.WorkerPool(tmp_path / "workers", lambda *a: os.environ.copy(), 2)
+
+
+def test_worker_pool_reuses_processes_and_keeps_logs_out_of_protocol(tmp_path, fake_worker_server):
+    pool = fake_worker_server
+    request, output, log = (tmp_path / name for name in ("request.json", "measurement.json", "worker.log"))
+    write_json(request, {})
+    runtime = {"python": sys.executable}
+    with pool:
+        pool.evaluate(runtime, 0, request, output, log)
+        first = json.loads(output.read_text())
+        pool.evaluate(runtime, 0, request, output, log)
+        assert json.loads(output.read_text())["pid"] == first["pid"]
+        pool.evaluate({**runtime, "pythonpath": "different-runtime"}, 0, request, output, log)
+        second = json.loads(output.read_text())
+        assert second["pid"] != first["pid"]
+        assert set(second["peers"]) == {first["pid"], second["pid"]}
+    assert pool.verified
+    assert all(w["process"].poll() == 0 for w in pool.workers.values())
+    assert "backend output" in next((tmp_path / "workers").glob("*.log")).read_text()
+
+
+def test_worker_pool_timeout_terminates_its_process(tmp_path, fake_worker_server):
+    pool = fake_worker_server
+    pool.timeout = 0.05
+    request, output, log = (tmp_path / name for name in ("request.json", "measurement.json", "worker.log"))
+    write_json(request, {"sleep": 30})
+    with pytest.raises(RuntimeError, match="exceeded"), pool:
+        pool.evaluate({"python": sys.executable}, 0, request, output, log)
+    assert all(w["process"].poll() is not None for w in pool.workers.values())
+    assert not output.exists()
+
+
+def test_screening_promotes_unstable_fast_candidate_and_reports_only_full_timing(tmp_path, monkeypatch, target):
+    import appctl
+
+    args = SimpleNamespace(provider="builtin", discovery="off", max_candidates=3, rounds=0, screen_candidates=True,
+                           finalists=2)
+    calls = []
+
+    def evaluate(backend, target, case, candidate, directory, runtime, args, *, timing_phase="full"):
+        calls.append((candidate["id"], timing_phase, directory.name))
+        latency = {"sdpa_auto": 1, "sdpa_math": 9, "sdpa_padded": 2}[candidate["id"]]
+        return {
+            "status": "unstable" if timing_phase == "screen" and latency == 1 else "ok", "latency_ms": latency,
+            "candidate": candidate, "timing_phase": timing_phase, "worker_seconds": 1
+        }
+
+    monkeypatch.setattr(appctl, "evaluate", evaluate)
+    result = appctl.scout("pytorch", target, target["cases"][0], tmp_path, {}, args)
+    assert result["status"] == "ok" and result["timing_phase"] == "full"
+    assert result["candidate"]["id"] == "sdpa_auto"
+    assert [c[0] for c in calls if c[2].startswith("final_")] == ["sdpa_auto", "sdpa_padded"]
+    assert calls[-1] == ("sdpa_auto", "full", "confirmation")
+    assert result["search"]["worker_seconds"] == 6
+
+
+def test_baseline_keys_separate_execution_and_screening_protocols(target):
+    assert baseline_key([target], {}, {}) != baseline_key([target], {}, {}, execution="persistent")
+    assert baseline_key([target], {}, {}) != baseline_key([target], {}, {}, screening=True)
+
+
+def test_publication_rejects_partial_progress_and_screening_results():
+    api = FakeGitHub()
+    partial = {**report(), "complete": False}
+    with pytest.raises(ValueError, match="partial progress"):
+        publish(api, partial, "partial")
+    screened = {**report(), "rows": [{"results": {"backend": {"status": "ok", "timing_phase": "screen"}}}]}
+    with pytest.raises(ValueError, match="screening timings"):
+        publish(api, screened, "screen")
+    assert not api.issues
 
 
 def test_deployment_uses_argument_lists_and_success_pointer(tmp_path):

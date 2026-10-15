@@ -171,6 +171,33 @@ Discovery receives compact measurement feedback. Full device snapshots and prove
 
 ## Weekly state and operation
 
+### Faster measurement
+
+Use `--execution persistent --screen-candidates --discovery off` for routine measurements with a prepared adapter cache.
+This path preserves the target's full timing protocol for finalists and the reported winner.
+Source builds and new variant research remain separate operations. A missing research cache uses seeds only.
+
+Persistent execution keeps one worker per Python runtime and serializes every GPU request.
+Workers share canonical CPU input files across runtimes. Each worker prepares GPU inputs and FP32 references once per case.
+CPU preparation uses at most three seed workers and eight Torch threads by default.
+Set `SCOUT_CPU_THREADS` consistently across jobs to change the Torch thread limit. Scout records it for baseline compatibility.
+Every candidate still receives both correctness seeds, mutation checks, output checks, and GPU ownership checks.
+The controller removes shared input files after each case. Reproducers regenerate them in temporary storage.
+The GPU check permits only the controller's own live, idle peer workers to retain contexts.
+It still rejects all other GPU owners. The controller never runs two measurement requests simultaneously.
+Source and harness checks run between cases and before report completion. Failed verification prevents baseline creation and publication.
+
+Candidate screening uses three repeats, at most 5 ms warmup, and at most 20 ms measurement per repeat.
+Correct but noisy screening results remain eligible. The fastest two screened candidates receive the full target timing protocol.
+The winner receives another independent full measurement. Screening timings cannot become performance-table results.
+Use `--finalists N` to increase shortlist coverage. Disable screening for exhaustive full-duration measurement of every proposed variant.
+Screening can miss a narrow win when short samples misrank candidates. Reports still describe the best observed variant.
+
+Persistent adapters must restore any global runtime options they change. Use isolated execution when investigating unknown adapter side effects.
+The default `--execution isolated` retains fresh processes. Execution and screening choices form part of weekly baseline compatibility.
+The report records setup, input/reference preparation, correctness, and benchmark/check time separately.
+Worker time outside those phases includes imports and process startup.
+
 | Mode | Fresh measurements | Reused measurements |
 | --- | --- | --- |
 | Weekly | All eligible backends | None. Freeze PyTorch, AITER, and the selected TLX ops baseline. |

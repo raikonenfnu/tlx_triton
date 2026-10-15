@@ -24,9 +24,13 @@ def commands(config, mode, pointer):
         if config.get(key):
             command.extend(["--" + key.replace("_", "-"), config[key]])
     command.extend(["--discovery", config.get("discovery", "target")])
+    command.extend(["--execution", config.get("execution", "isolated")])
+    if config.get("screen_candidates", False):
+        command.append("--screen-candidates")
     if config.get("refresh_discovery", False):
         command.append("--refresh-discovery")
-    for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout", "gpu_wait_seconds", "gpu_poll_seconds"):
+    for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout", "gpu_wait_seconds", "gpu_poll_seconds",
+                "finalists"):
         if key in config:
             command.extend(["--" + key.replace("_", "-"), str(config[key])])
     if config.get("aiter_search", False):
