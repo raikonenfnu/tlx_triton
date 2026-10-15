@@ -20,9 +20,12 @@ def commands(config, mode, pointer):
         config.get("provider", "codex"), "--report-pointer",
         str(pointer), "--execute"
     ]
-    for key in ("context", "runtimes", "model"):
+    for key in ("context", "runtimes", "model", "candidate_cache"):
         if config.get(key):
-            command.extend(["--" + key, config[key]])
+            command.extend(["--" + key.replace("_", "-"), config[key]])
+    command.extend(["--discovery", config.get("discovery", "target")])
+    if config.get("refresh_discovery", False):
+        command.append("--refresh-discovery")
     for key in ("max_candidates", "rounds", "agent_timeout", "worker_timeout", "gpu_wait_seconds", "gpu_poll_seconds"):
         if key in config:
             command.extend(["--" + key.replace("_", "-"), str(config[key])])

@@ -785,7 +785,7 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     write_json(runtimes, {"aiter": {"python": str(aiter_python)}})
     calls = []
 
-    def fake_scout(backend, t, case, directory, runtime, args, *, research=None):
+    def fake_scout(backend, t, case, directory, runtime, args, *, research=None, cache=None):
         expected_python = aiter_python if backend == "aiter" else venv_python
         assert runtime["python"] == str(expected_python)  # Preserve the virtual environment's interpreter path.
         if backend == "aiter":
@@ -815,6 +815,8 @@ def test_controller_freezes_controls_and_preserves_venv(tmp_path, monkeypatch, t
     assert calls == ["tlx_ops", "tlx_tutorials"]
     report_path = json.loads(args.report_pointer.read_text())["report"]
     nightly = json.loads(Path(report_path).read_text())
+    progress = json.loads((Path(report_path).parent / "progress.json").read_text())
+    assert progress == nightly
     controls = nightly["rows"][0]["results"]
     assert all(controls[name]["status"] == "ok" for name in ("pytorch", "tlx_ops", "tlx_tutorials", "tlx_ops_baseline"))
     assert controls["pytorch"]["frozen_date"] == controls["tlx_ops_baseline"]["frozen_date"] == "2026-10-14"
@@ -861,6 +863,24 @@ def test_report_labels_public_gemm_torch_fallback():
                 }])
     text = render(r)
     assert "Torch fallback" in text and "| Dispatch |" in text
+
+
+def test_report_search_cost_excludes_frozen_controls_and_baseline_copy():
+    from reporting import render
+
+    r = report()
+    fresh = {"status": "failed", "search": {"agent_calls": 2, "discovery_seconds": 3, "worker_seconds": 4}}
+    frozen = {**fresh, "frozen_date": "2026-10-14"}
+    r.update(
+        device={"name": "GPU", "arch": "gfx950", "physical_gpu": 0}, provider="claude", budget={},
+        discovery_scope="target", columns=["tlx_ops", "pytorch", "tlx_ops_baseline"], rows=[{
+            "description": "shape", "case": {"id":
+                                             "one"}, "target": {"metric": "compute", "timing": {"tie_fraction": 0.03}},
+            "results": {"tlx_ops": fresh, "pytorch": frozen, "tlx_ops_baseline": fresh}
+        }])
+    text = render(r)
+    assert "2 agent calls, 3.0s in discovery, 4.0s in isolated workers" in text
+    assert "Discovery scope: target" in text
 
 
 def test_weekly_publication_does_not_close_future_or_unrelated_issue():
@@ -915,13 +935,208 @@ def test_scout_confirms_selected_candidate_and_records_blocked_search(tmp_path, 
     assert result["status"] == "blocked"
 
 
+@pytest.fixture
+def cached_scout(tmp_path, monkeypatch, target):
+    import appctl
+    from discovery import DiscoveryCache
+
+    calls, evaluations = [], []
+    args = SimpleNamespace(provider="claude", discovery="target", max_candidates=3, rounds=1, model=None, context=None,
+                           agent_timeout=5)
+
+    def discover(*a, **kwargs):
+        calls.append(kwargs["scope"])
+        response = {
+            "status":
+            "complete", "summary":
+            "checked all shapes", "candidates": [{
+                "id": "generic", "params": {}, "adapter_source":
+                "def build(case, params):\n    return lambda inputs: inputs['q']\n", "rationale": "test source"
+            }]
+        }
+        return response, validate_proposals(response, a[5], a[6])
+
+    def evaluate(backend, target, case, candidate, directory, runtime, args):
+        evaluations.append((case["id"], candidate["id"], directory.name))
+        # A cached proposal must still fail when it is invalid for a different shape.
+        if "adapter" in candidate and case.get("causal", False):
+            return {"status": "failed", "error": "incorrect output", "worker_seconds": 2}
+        return {
+            "status": "ok", "latency_ms": 0.5 if "adapter" in candidate else 1, "candidate": candidate,
+            "worker_seconds": 2
+        }
+
+    monkeypatch.setattr(appctl, "discover", discover)
+    monkeypatch.setattr(appctl, "evaluate", evaluate)
+    cache = DiscoveryCache(tmp_path / "cache")
+    case = target["cases"][0]
+
+    def run(name, *, case=case, cache=cache, research=None):
+        return appctl.scout("tlx_ops", target, case, tmp_path / name, {}, args, research=research, cache=cache)
+
+    return SimpleNamespace(run=run, calls=calls, evaluations=evaluations, args=args, cache=cache, target=target)
+
+
+def test_target_discovery_reuses_adapters_but_rechecks_each_shape(cached_scout, tmp_path):
+    from discovery import DiscoveryCache
+
+    s = cached_scout
+    first = s.run("first")
+    second = s.run("second", case={**s.target["cases"][0], "id": "causal", "causal": True})
+    assert s.calls == ["target"]
+    assert first["candidate"]["id"] == "agent_generic"
+    assert first["search"]["worker_seconds"] == 6  # Two candidates and independent confirmation.
+    assert second["search"]["cache_hit"] and second["search"]["agent_calls"] == 0
+    assert second["candidate"]["id"] == "public_api"  # Reject the cached proposal on this shape.
+    assert any(case == "causal" and candidate.startswith("agent_cached_") for case, candidate, _ in s.evaluations)
+    # A later process reuses the saved source without another agent call.
+    s.args.discovery = "off"
+    third = s.run("later", cache=DiscoveryCache(tmp_path / "cache"))
+    assert third["search"]["cache_hit"] and third["evaluated_candidates"] == 2
+    assert s.calls == ["target"]
+    assert Path(third["candidate"]["adapter"]).is_relative_to(tmp_path / "later")
+
+
+def test_target_discovery_reuses_a_completed_empty_search(cached_scout, monkeypatch):
+    import appctl
+
+    calls = []
+
+    def empty(*a, **kwargs):
+        calls.append(1)
+        return {"status": "complete", "summary": "public API has no tuning surface", "candidates": []}, []
+
+    monkeypatch.setattr(appctl, "discover", empty)
+    cached_scout.run("first")
+    second = cached_scout.run("second")
+    assert calls == [1] and second["search"]["cache_hit"]
+    assert second["evaluated_candidates"] == 1
+
+
+def test_blocked_target_discovery_retries_next_run_not_each_shape(cached_scout, tmp_path, monkeypatch):
+    import appctl
+    from discovery import DiscoveryCache
+
+    calls = []
+
+    def blocked(*a, **kwargs):
+        calls.append(1)
+        return {"status": "blocked", "summary": "permission denied", "candidates": []}, []
+
+    monkeypatch.setattr(appctl, "discover", blocked)
+    cached_scout.run("first")
+    assert cached_scout.run("second")["discovery_status"] == "blocked"
+    assert calls == [1] and not list((tmp_path / "cache").glob("*.json"))
+    cached_scout.run("later", cache=DiscoveryCache(tmp_path / "cache"))
+    assert calls == [1, 1]
+
+
+@pytest.mark.parametrize("scope", ["off", "case"])
+def test_discovery_scope_controls_research(cached_scout, scope):
+    s = cached_scout
+    s.args.discovery = scope
+    # Case discovery deliberately bypasses the target cache, as the controller does.
+    cache = None if scope == "case" else s.cache
+    for i in range(2):
+        s.run(str(i), cache=cache)
+    assert len(s.calls) == (2 if scope == "case" else 0)
+
+
+def test_refresh_discovery_replaces_cache_once_per_target(cached_scout, tmp_path):
+    from discovery import DiscoveryCache
+
+    s = cached_scout
+    s.run("original")
+    refreshed = DiscoveryCache(tmp_path / "cache", refresh=True)
+    assert not s.run("refresh", cache=refreshed)["search"]["cache_hit"]
+    assert s.run("same_run", cache=refreshed)["search"]["cache_hit"]
+    assert s.calls == ["target", "target"]
+
+
+def test_discovery_cache_invalidates_changed_target_runtime_and_device(tmp_path, target):
+    from discovery import DiscoveryCache
+
+    cache = DiscoveryCache(tmp_path)
+    research = {"runtime": {"compiler_sha256": "old"}, "device": {"arch": "gfx950"}, "context_sha256": "old"}
+    key = cache.key("tlx_ops", target, research)
+    cache.save(key, "complete", "no additional variants", [])
+    assert cache.load(key) is not None
+    for field in research:
+        changed = {**research, field: "changed"}
+        assert cache.load(cache.key("tlx_ops", target, changed)) is None
+    changed_target = copy.deepcopy(target)
+    changed_target["cases"][0]["heads"] += 1
+    assert cache.load(cache.key("tlx_ops", changed_target, research)) is None
+    assert cache.load(cache.key("pytorch", target, research)) is None
+
+
+def test_discovery_cache_rejects_changed_content(cached_scout, tmp_path):
+    from discovery import DiscoveryCache
+
+    cached_scout.run("first")
+    path = next((tmp_path / "cache").glob("*.json"))
+    saved = json.loads(path.read_text())
+    saved["response"]["candidates"][0]["adapter_source"] = "raise RuntimeError('changed')"
+    write_json(path, saved)
+    with pytest.raises(ValueError, match="content differs"):
+        cached_scout.run("later", cache=DiscoveryCache(tmp_path / "cache"))
+
+
+def test_target_discovery_prompt_is_compact_and_covers_all_cases(monkeypatch, tmp_path, target):
+    import discovery
+
+    def query(provider, prompt, **kwargs):
+        assert "Research all cases in target.cases" in prompt
+        assert "conditions" not in prompt and "UNNECESSARY_DEVICE_DUMP" not in prompt
+        assert "GPUOccupiedError" in prompt and "latency_ms" in prompt
+        assert target["cases"][-1]["id"] in prompt
+        return {"status": "complete", "summary": "no alternatives", "candidates": []}
+
+    monkeypatch.setattr(discovery, "query_json", query)
+    feedback = [{
+        "candidate": {"id": "seed"}, "result": {
+            "status": "failed", "error": "GPUOccupiedError", "latency_ms": 1, "conditions": "UNNECESSARY_DEVICE_DUMP",
+            "runtime": {"source": "huge"}
+        }
+    }]
+    discovery.discover("claude", "tlx_ops", target, target["cases"][0], feedback, tmp_path, 2, scope="target")
+
+
+def test_full_corpus_research_count_scales_with_targets_not_shapes(cached_scout, tmp_path):
+    import appctl
+    from discovery import DiscoveryCache
+
+    s = cached_scout
+    s.args.max_candidates = 6
+    registry = backends()
+    targets = [load_target(p) for p in sorted((ROOT / "targets/amd/gfx950").glob("*.json"))]
+    research_groups = 0
+    for scope in ("target", "off", "case"):
+        s.args.discovery = scope
+        cache = None if scope == "case" else DiscoveryCache(tmp_path / "corpus_cache")
+        before = len(s.calls)
+        for target in targets:
+            for backend, contract in registry.items():
+                if backend == "aiter" or not applicable(contract, target, {"vendor": "amd", "arch": "gfx950"}):
+                    continue
+                if scope == "target":
+                    research_groups += 1
+                for case in target["cases"]:
+                    appctl.scout(backend, target, case, tmp_path / scope / target["id"] / backend / case["id"], {},
+                                 s.args, cache=cache)
+        assert len(s.calls) - before == {"target": 17, "off": 0, "case": 172}[scope]
+    assert research_groups == 17
+    assert sum(len(t["cases"]) for t in targets) == 60
+
+
 def test_deployment_uses_argument_lists_and_success_pointer(tmp_path):
     spec = importlib.util.spec_from_file_location("scout_deploy", ROOT / "deploy/run.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     config = {
         "python": "/venv/bin/python", "targets": ["/source/target with spaces.json"], "state": "/state with spaces",
-        "provider": "claude", "model": "model", "rounds": 1, "gpu_wait_seconds": 1800, "gpu_poll_seconds": 60
+        "provider": "claude", "model": "model", "rounds": 1, "gpu_wait_seconds": 1800, "gpu_poll_seconds": 60,
+        "discovery": "off", "candidate_cache": "/cache with spaces"
     }
     argv = module.commands(config, "nightly", tmp_path / "pointer.json")
     assert "/source/target with spaces.json" in argv
@@ -929,6 +1144,21 @@ def test_deployment_uses_argument_lists_and_success_pointer(tmp_path):
     assert argv[argv.index("--report-pointer") + 1] == str(tmp_path / "pointer.json")
     assert argv[argv.index("--gpu-wait-seconds") + 1] == "1800"
     assert argv[argv.index("--gpu-poll-seconds") + 1] == "60"
+    assert argv[argv.index("--discovery") + 1] == "off"
+    assert argv[argv.index("--candidate-cache") + 1] == "/cache with spaces"
+
+
+@pytest.mark.parametrize("flags",
+                         [["--discovery", "off"], ["--provider", "builtin"], ["--provider", "claude", "--rounds", "0"]])
+def test_refresh_discovery_requires_an_enabled_target_research_phase(tmp_path, flags):
+    result = subprocess.run([
+        sys.executable,
+        str(ROOT / "appctl.py"), "run", "--mode", "weekly", "--targets",
+        str(ROOT / "targets/amd/gfx950/bf16_fa.json"), "--state",
+        str(tmp_path / "state"), "--refresh-discovery", *flags
+    ], capture_output=True, text=True, check=False)
+    assert result.returncode == 2 and "refresh discovery requires" in result.stderr
+    assert not (tmp_path / "state").exists()
 
 
 @pytest.mark.parametrize("busy_checks,timeout", [(0, False), (2, False), (31, True)])

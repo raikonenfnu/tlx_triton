@@ -31,8 +31,8 @@ flowchart TD
     R --> P[Explicit GitHub publication]
 ```
 
-For each target case and eligible backend, Scout measures seed recipes first. Optional discovery
-uses those results for a bounded search. Scout remeasures the fastest correct, stable candidate in
+For each target case and eligible backend, Scout measures seed recipes and saved adapters. Optional discovery
+researches all shapes once per target/backend. Scout remeasures the fastest correct, stable candidate in
 a new process. Reports compare those independent measurements and account for timing uncertainty.
 
 | Component | Responsibility |
@@ -140,6 +140,35 @@ Add `--aiter-search` for alternative kernels and optional agent discovery.
 The report labels GEMM dispatch and Torch fallback.
 In search mode, its agent researches the installed AITER checkout and receives that runtime's source identity.
 
+## Research once, measure each shape
+
+The default `--discovery target` researches each target/backend once, using the complete shape inventory.
+Later shapes reuse those adapters. Later runs reuse the saved research when all cache pins match.
+Each shape still receives fresh inputs, correctness checks, timing, and independent winner confirmation.
+The cache stores adapter source, never a timing result or a correctness verdict.
+
+| Discovery scope | Behavior |
+| --- | --- |
+| `target` (default) | Research the first case with all target shapes in context. Reuse proposals for the remaining cases. |
+| `off` | Measure seeds and matching saved adapters without any agent calls. A cache miss uses seeds only. |
+| `case` | Run the original adaptive search independently for every shape. Bypass the target cache. |
+
+Use `--discovery off` for routine measurement of a known candidate set.
+Use `--refresh-discovery` with target discovery to replace saved research once per target/backend.
+The default cache is `STATE/candidates`. `--candidate-cache /path/to/cache` shares research across fresh campaign state directories.
+Keep this trusted local directory private to the benchmark account. Its adapters execute as Python code.
+
+Cache pins cover the complete target, device, source/runtime identity, backend instructions, harness, and supplied context.
+Changed pins require fresh discovery. Blocked research remains visible and retries on the next run.
+A completed search with no extra variants also saves a cache entry.
+Target discovery can miss shape-specific tuning opportunities. Use case discovery for a focused investigation.
+Both scopes report the best observed variant among the evaluated candidates.
+
+Each backend log includes candidate count, agent calls, and elapsed time.
+`report.json` records discovery time and worker time separately. Worker time includes cold imports, compilation, validation, and measurement.
+Discovery receives compact measurement feedback. Full device snapshots and provenance remain in local artifacts.
+`progress.json` saves completed cases during a run. Only the completed report can become a weekly baseline or trigger publication.
+
 ## Weekly state and operation
 
 | Mode | Fresh measurements | Reused measurements |
@@ -157,10 +186,12 @@ Run a fresh weekly comparison when every backend must have a current measurement
 
 ```text
 STATE/
+  candidates/<key>.json                 # Source-scoped adapter research, without measurements
   baselines/<campaign>/<week>.json       # Immutable weekly report
   runs/<date>_<mode>_<timestamp>/
     gpu_admission.json                  # GPU supervisor state and ownership checks
     report.md / report.json             # Tables and structured results
+    progress.json                       # Completed rows while the campaign runs
     device.json / probe.log             # Hardware and runtime evidence
     <target>/<case>/<backend>/
       search.json                       # All evaluated candidates and feedback

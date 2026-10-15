@@ -19,6 +19,8 @@ Create an absolute-path configuration outside the source checkout:
   "gpu_wait_seconds": 1800,
   "gpu_poll_seconds": 60,
   "provider": "codex",
+  "discovery": "target",
+  "candidate_cache": "/path/to/scout-candidates",
   "aiter_search": false,
   "rounds": 2,
   "max_candidates": 6,
@@ -75,6 +77,13 @@ Weekly measures all registered backends and freezes controls. Nightly measures b
 Torch/driver runtime, device, backend registry, or dependency identity requires a fresh campaign.
 The runner does not silently replace an existing weekly baseline.
 AITER uses public operators by default, without LLM discovery.
+Target discovery is the default. It reuses source-scoped adapters across shapes and later runs.
+Set `discovery` to `off` for routine measurement without agent calls.
+Set `discovery` to `case` for adaptive research on every shape.
+Set `refresh_discovery` to true with target discovery to replace saved research.
+Cache misses with discovery disabled use seed recipes only. No cached measurement replaces a fresh result.
+Keep the configured cache private to the benchmark account. It contains trusted executable adapter source.
+The report records search time and cache reuse. Each run saves completed rows in `progress.json` before report completion.
 Set `aiter_search` to true only for an explicit comparison of alternative AITER implementations.
 
 For fresh source, provide an optional `refresh_command` argument list that invokes YOUR deployment
