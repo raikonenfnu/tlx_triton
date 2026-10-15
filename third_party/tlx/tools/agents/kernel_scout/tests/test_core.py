@@ -1200,6 +1200,20 @@ def test_session_rejects_changed_source_and_harness(monkeypatch):
         session.verify()
 
 
+def test_probe_initializes_backend_defaults_before_fingerprinting(tmp_path, monkeypatch):
+    from benchmarking import worker
+
+    events = []
+    monkeypatch.setattr(sys, "argv", ["worker.py", "--probe", str(tmp_path / "device.json")])
+    monkeypatch.setattr(worker, "inspect_device", dict)
+    monkeypatch.setattr(worker, "assert_idle", lambda *a: None)
+    monkeypatch.setattr(worker, "initialize_packages", lambda: events.append("initialized"))
+    monkeypatch.setattr(worker, "runtime_identity", lambda: events.append("fingerprinted") or {})
+    monkeypatch.setattr(worker, "package_identity", lambda name: {})
+    assert worker.main() == 0
+    assert events == ["initialized", "fingerprinted"]
+
+
 def test_gpu_ownership_excludes_only_registered_peer_workers(monkeypatch):
     from benchmarking import environment
 
