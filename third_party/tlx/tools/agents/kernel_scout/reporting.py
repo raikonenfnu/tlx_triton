@@ -107,7 +107,7 @@ def render(report):
         phases = {
             key: sum(s.get("phase_seconds", {}).get(key, 0)
                      for s in searches)
-            for key in ("setup", "preparation", "correctness", "benchmark_and_checks")
+            for key in ("setup", "preparation", "correctness", "compiler_cleanup", "benchmark_and_checks")
         }
         lines += [f"Worker phase seconds: {phases}. Remaining worker time includes imports and process startup.", ""]
     return "\n".join(lines)

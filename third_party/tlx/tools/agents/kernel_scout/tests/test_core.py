@@ -1214,6 +1214,35 @@ def test_probe_initializes_backend_defaults_before_fingerprinting(tmp_path, monk
     assert events == ["initialized", "fingerprinted"]
 
 
+def test_compile_drain_uses_the_framework_shutdown_api(monkeypatch):
+    from benchmarking import worker
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "torch._inductor.async_compile",
+                        SimpleNamespace(shutdown_compile_workers=lambda: calls.append("drained")))
+    worker.drain_compile_workers()
+    assert calls == ["drained"]
+
+
+@pytest.mark.parametrize("error_type", ["provenance", "ownership"])
+def test_persistent_infrastructure_failure_aborts_without_a_measurement(tmp_path, monkeypatch, error_type):
+    from benchmarking import worker
+
+    error = worker.ProvenanceError("source drift") if error_type == "provenance" else worker.GPUOccupiedError(
+        "occupied")
+
+    def fail(*a):
+        raise error
+
+    calls = []
+    monkeypatch.setattr(worker, "measure", fail)
+    monkeypatch.setattr(worker, "drain_compile_workers", lambda: calls.append("drained"))
+    with pytest.raises(type(error)):
+        worker.measure_to_file({}, tmp_path / "measurement.json", worker.MeasurementSession())
+    assert calls == ["drained"]
+    assert not (tmp_path / "measurement.json").exists()
+
+
 def test_gpu_ownership_excludes_only_registered_peer_workers(monkeypatch):
     from benchmarking import environment
 
@@ -1318,6 +1347,11 @@ def test_publication_rejects_partial_progress_and_screening_results():
     screened = {**report(), "rows": [{"results": {"backend": {"status": "ok", "timing_phase": "screen"}}}]}
     with pytest.raises(ValueError, match="screening timings"):
         publish(api, screened, "screen")
+    infrastructure = {
+        **report(), "rows": [{"results": {"backend": {"status": "failed", "error": "GPUOccupiedError: occupied"}}}]
+    }
+    with pytest.raises(ValueError, match="infrastructure failures"):
+        publish(api, infrastructure, "invalid")
     assert not api.issues
 
 

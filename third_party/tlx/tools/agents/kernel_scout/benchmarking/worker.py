@@ -41,6 +41,18 @@ def initialize_packages():
         configure_cpu_threads()
 
 
+class ProvenanceError(ValueError):
+    """Runtime drift invalidates the campaign rather than one kernel candidate."""
+
+
+def drain_compile_workers():
+    """Release Inductor helper contexts outside timing without excluding GPU owners."""
+    module = sys.modules.get("torch._inductor.async_compile")
+    shutdown = getattr(module, "shutdown_compile_workers", None)
+    if shutdown is not None:
+        shutdown()
+
+
 class MeasurementSession:
     """Retain runtime state and one case's immutable inputs and independent oracles."""
 
@@ -70,12 +82,12 @@ class MeasurementSession:
 
     def verify(self):
         if self.harness is not None and harness_digest() != self.harness:
-            raise ValueError("measurement harness changed during the session")
+            raise ProvenanceError("measurement harness changed during the session")
         if self.runtime is not None and runtime_identity() != self.runtime:
-            raise ValueError("worker source or runtime changed during the session")
+            raise ProvenanceError("worker source or runtime changed during the session")
         for name, pin in self.packages.items():
             if package_identity(name) != pin:
-                raise ValueError(f"{name} source changed during the session")
+                raise ProvenanceError(f"{name} source changed during the session")
 
     def prepare(self, request):
         import torch
@@ -161,11 +173,11 @@ def measure(request, session=None):
     if request.get("probe_identity"):
         expected_probe = request["probe_identity"]
         if identity["runtime"] != expected_probe["runtime"] or identity["device"] != expected_probe["device"]:
-            raise ValueError("worker runtime or device differs from its admission probe")
+            raise ProvenanceError("worker runtime or device differs from its admission probe")
         if request["backend"] == "aiter" and identity["backend_pin"] != expected_probe["aiter"]:
-            raise ValueError("AITER source differs from its admission probe")
+            raise ProvenanceError("AITER source differs from its admission probe")
     if request.get("expected_identity") and identity != request["expected_identity"]:
-        raise ValueError("reproducer source/runtime/device pins differ from the recorded run")
+        raise ProvenanceError("reproducer source/runtime/device pins differ from the recorded run")
     checks = []
     numerical_errors = {}
     input_hashes = {}
@@ -201,6 +213,9 @@ def measure(request, session=None):
             raise ValueError("returned output must not alias an input")
         checks.append(seed)
     correctness_seconds = time.monotonic() - correctness_started
+    cleanup_started = time.monotonic()
+    drain_compile_workers()
+    cleanup_seconds = time.monotonic() - cleanup_started
     benchmark_started = time.monotonic()
     # Restore one canonical seed for every backend's measured inputs.
     inputs = prepared[0]["inputs"]
@@ -237,7 +252,7 @@ def measure(request, session=None):
         {"before": before, "after":
          after}, "pid": os.getpid(), "preparation_reused": reused_preparation, "phase_seconds": {
              "setup": setup_seconds, "preparation": preparation_seconds, "correctness": correctness_seconds,
-             "benchmark_and_checks": time.monotonic() - benchmark_started
+             "compiler_cleanup": cleanup_seconds, "benchmark_and_checks": time.monotonic() - benchmark_started
          }
     }
 
@@ -245,13 +260,19 @@ def measure(request, session=None):
 def measure_to_file(request, output, session=None):
     try:
         result = measure(request, session)
-    except Exception as error:  # noqa: BLE001 - candidate failures become explicit artifacts
+    except Exception as error:
         traceback.print_exc()
+        if session is not None and isinstance(error, (ProvenanceError, GPUOccupiedError)):
+            raise
         if session is not None:
             session.discard_mutated_inputs()
         status = "unavailable" if isinstance(error, ModuleNotFoundError) else ("unsupported" if isinstance(
             error, NotImplementedError) or type(error).__name__ in {"UnsupportedOp", "InvalidInput"} else "failed")
         result = {"status": status, "error": f"{type(error).__name__}: {error}"}
+        if isinstance(error, (ProvenanceError, GPUOccupiedError)):
+            result["failure_kind"] = "infrastructure"
+    finally:
+        drain_compile_workers()
     write_json(output, result)
     return 0 if result["status"] in {"ok", "unstable"} else 1
 
