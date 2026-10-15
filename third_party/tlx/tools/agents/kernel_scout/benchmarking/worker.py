@@ -35,6 +35,8 @@ def initialize_packages():
     import importlib
     import importlib.util
 
+    # Requests are serial. Avoid starting a compiler pool for each compiled adapter.
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
     spec = importlib.util.find_spec("aiter")
     if spec is not None and spec.origin is not None:
         importlib.import_module("aiter")

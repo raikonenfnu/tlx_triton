@@ -25,7 +25,7 @@ flowchart TD
     S --> W[Worker: common inputs, correctness, timing]
     W --> F[Measured feedback]
     F --> S
-    F --> B[Select best variant + remeasure in a new worker]
+    F --> B[Select best variant + independent full remeasurement]
     B --> R[Local reports + pinned reproducers]
     R --> K[Weekly baseline / nightly reuse]
     R --> P[Explicit GitHub publication]
@@ -33,7 +33,7 @@ flowchart TD
 
 For each target case and eligible backend, Scout measures seed recipes and saved adapters. Optional discovery
 researches all shapes once per target/backend. Scout remeasures the fastest correct, stable candidate in
-a new process. Reports compare those independent measurements and account for timing uncertainty.
+a separate measurement. Isolated execution uses a new process. Reports account for timing uncertainty.
 
 | Component | Responsibility |
 | --- | --- |
@@ -183,6 +183,8 @@ CPU preparation uses at most three seed workers and eight Torch threads by defau
 Set `SCOUT_CPU_THREADS` consistently across jobs to change the Torch thread limit. Scout records it for baseline compatibility.
 Every candidate still receives both correctness seeds, mutation checks, output checks, and GPU ownership checks.
 Torch Inductor compiler pools shut down after warmup and before timing. Compiler sidecars cannot retain GPU handles during later measurements.
+Inductor compilation uses one thread by default because GPU requests are serial.
+Set `TORCHINDUCTOR_COMPILE_THREADS` before starting Scout to override this limit. Scout records the value for runtime compatibility.
 The controller removes shared input files after each case. Reproducers regenerate them in temporary storage.
 The GPU check permits only the controller's own live, idle peer workers to retain contexts.
 It still rejects all other GPU owners. The controller never runs two measurement requests simultaneously.
