@@ -80,6 +80,15 @@ implementation. Generated adapters are executable Python, and correctness checks
 
 ## Run locally
 
+For a new problem, follow [target registration](skills/create-target/SKILL.md).
+Registration supplies the target contract, shared input generator, independent oracle, and adapters before routine campaigns.
+Existing operations reuse their harness implementation.
+Run `appctl.py run --mode registration` with the usual target, state, runtime, and GPU options.
+Use `--execution persistent` to reuse preparation across candidates.
+Inspect `registration.json` for checked cases, backend failures, and unsupported implementations.
+Registration creates no weekly baseline and cannot publish a campaign report.
+Weekly and nightly runs still check correctness and collect fresh measurements.
+
 Use a source-built TLX checkout and its virtual environment. Place source Triton before wheel
 Triton on `PYTHONPATH`. The controller rejects a base runtime that imports Triton outside this checkout.
 

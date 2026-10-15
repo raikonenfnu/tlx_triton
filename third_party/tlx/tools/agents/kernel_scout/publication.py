@@ -106,6 +106,8 @@ class GitHub:
 
 
 def publish(api, report, markdown):
+    if report.get("mode") not in {"weekly", "nightly"}:
+        raise ValueError("only weekly and nightly reports can be published")
     if report.get("complete", True) is not True:
         raise ValueError("partial progress cannot be published as a completed report")
     if any(
