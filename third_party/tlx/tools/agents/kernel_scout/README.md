@@ -191,6 +191,12 @@ It still rejects all other GPU owners. The controller never runs two measurement
 Source and harness checks run between cases and before report completion. Failed verification prevents baseline creation and publication.
 Infrastructure failures abort the campaign. A case without a stable correct backend prevents baseline creation.
 
+After an interruption, repeat the same run command with `--resume-from /path/to/run/progress.json`.
+Scout checks exact source, compiler, runtime, device, target, and search compatibility before retaining completed cases.
+Reproducer files must still match their recorded hashes. The interrupted case receives fresh measurements in new workers.
+Elapsed time includes the previous attempt and the interruption. Only a completed campaign can become a baseline or publish.
+Keep the original run directories because retained results reference their reproducer files.
+
 Candidate screening uses three repeats, at most 5 ms warmup, and at most 20 ms measurement per repeat.
 Correct but noisy screening results remain eligible. The fastest two screened candidates receive the full target timing protocol.
 The winner receives another independent full measurement. Screening timings cannot become performance-table results.

@@ -74,6 +74,9 @@ The worker retains ownership checks before and after measurement.
 Startup waiting does not repair samples interrupted by competing jobs during measurement.
 If weekly work exceeds one hour, move the nightly time later.
 Monitor nonzero exits and logs. No report is published after a failed measurement.
+To resume an interrupted job, set `resume_from` to its `progress.json` in the deployment configuration.
+Use the same mode and source. Scout checks all measurement pins and retains only completed cases.
+Remove this setting after the job completes. Keep prior run directories for the retained reproducers.
 
 Weekly measures all registered backends and freezes controls. Nightly measures backends with
 `cadence="nightly"`, then reuses matching weekly controls. A changed target/case selection,
