@@ -30,6 +30,17 @@ from benchmarking.environment import (
 )
 
 
+def initialize_packages():
+    """Capture optional backend initialization defaults before pinning the runtime."""
+    import importlib
+    import importlib.util
+
+    spec = importlib.util.find_spec("aiter")
+    if spec is not None and spec.origin is not None:
+        importlib.import_module("aiter")
+        configure_cpu_threads()
+
+
 class MeasurementSession:
     """Retain runtime state and one case's immutable inputs and independent oracles."""
 
@@ -46,6 +57,8 @@ class MeasurementSession:
         import torch
 
         if self.runtime is None:
+            initialize_packages()
+            self.device = inspect_device()
             self.runtime = runtime_identity()
             self.harness = harness_digest()
         if backend == "aiter" and backend not in self.packages:
@@ -282,6 +295,8 @@ def main():
         try:
             device = inspect_device()
             assert_idle(device)
+            initialize_packages()
+            device = inspect_device()
             identity = {"device": device, "runtime": runtime_identity(), "aiter": package_identity("aiter")}
             assert_idle(device)
         except GPUOccupiedError as error:
