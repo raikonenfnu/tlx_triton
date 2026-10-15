@@ -1710,3 +1710,96 @@ def test_target_templates_are_independent_and_support_memory_metrics(tmp_path):
     second = create_target(tmp_path / "second.json", name="second", **kwargs)
     assert second["cases"][0]["q_lengths"] == [33, 65]
     assert second["metric"] == "memory"
+
+
+@pytest.mark.parametrize("status", ["ok", "failed", "unstable", "unavailable", "unsupported"])
+def test_registration_records_real_coverage(target, status):
+    from registration import registration_result
+
+    measured = {
+        "status": "ok", "input_sha256": "identical", "timing_phase": "full", "correctness_seeds": [17, 29],
+        "reproducer": "/request.json", "request_sha256": "request"
+    }
+    results = {name: dict(measured) for name in ("tlx_ops", "pytorch", "aiter")}
+    results["aiter"].update(status=status, error="diagnostic")
+    value = {
+        "rows": [{"target": target, "case": target["cases"][0], "results": results}], "baseline_key": "pins", "device":
+        {"arch": "gfx950"}
+    }
+    readiness = registration_result(value)
+    assert readiness["ready"] == (status in {"ok", "unsupported"})
+    assert readiness["cases"][0]["target_sha256"] == digest(target)
+    assert readiness["cases"][0]["unsupported"] == ({"aiter": "diagnostic"} if status == "unsupported" else {})
+    results["pytorch"]["input_sha256"] = "different"
+    rejected = registration_result(value)
+    assert not rejected["ready"]
+    assert any("fingerprints" in error for error in rejected["cases"][0]["errors"])
+
+
+@pytest.mark.parametrize("change", ["seed", "screen", "reproducer", "tlx", "reference"])
+def test_registration_rejects_incomplete_evidence(target, change):
+    from registration import registration_result
+
+    measured = {
+        "status": "ok", "input_sha256": "identical", "timing_phase": "full", "correctness_seeds": [17, 29],
+        "reproducer": "/request.json", "request_sha256": "request"
+    }
+    results = {name: dict(measured) for name in ("tlx_ops", "pytorch")}
+    if change == "seed":
+        results["tlx_ops"]["correctness_seeds"] = [17]
+    elif change == "screen":
+        results["tlx_ops"]["timing_phase"] = "screen"
+    elif change == "reproducer":
+        results["tlx_ops"].pop("reproducer")
+    else:
+        results["tlx_ops" if change == "tlx" else "pytorch"] = {"status": "unsupported"}
+    value = {
+        "rows": [{"target": target, "case": target["cases"][0], "results": results}], "baseline_key": "pins", "device":
+        {"arch": "gfx950"}
+    }
+    assert not registration_result(value)["ready"]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_registration_controller_never_creates_a_baseline(tmp_path, monkeypatch, target, failed):
+    import appctl
+
+    path = tmp_path / "target.json"
+    write_json(path, {**target, "cases": target["cases"][:1]})
+    identity = {
+        "device": {"vendor": "amd", "arch": "gfx950", "physical_gpu": 0, "name": "GPU"}, "runtime":
+        {"compiler_sha256": "compiler", "triton_module":
+         str(appctl.REPOSITORY / "python/triton/__init__.py")}, "aiter": {"status": "unavailable"}
+    }
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(appctl, "wait_for_gpu", lambda *a, **kw: kw["ready"]())
+    monkeypatch.setattr(appctl, "probe", lambda *a: identity)
+    monkeypatch.setattr(appctl, "backends", lambda: {name: backends()[name] for name in ("tlx_ops", "pytorch")})
+
+    def scout(backend, *a, **kw):
+        if failed:
+            return {"status": "failed", "error": "bad adapter"}
+        return {
+            **measurement(1), "input_sha256": "same", "timing_phase": "full", "correctness_seeds": [17, 29],
+            "candidate": {"id": "seed"}, "backend_pin": {"git_sha": "source"}, "runtime": identity["runtime"], "tflops":
+            1, "logical_tbps": 1, "reproducer": "/request.json", "request_sha256": "request"
+        }
+
+    monkeypatch.setattr(appctl, "scout", scout)
+    args = SimpleNamespace(targets=[path], case=None, state=tmp_path / "state", python=sys.executable,
+                           pythonpath="/source", runtimes=None, date="2026-10-15", execute=True, mode="registration",
+                           gpu=0, provider="builtin", max_candidates=3, rounds=0, agent_timeout=10, worker_timeout=10,
+                           report_pointer=tmp_path / "pointer.json")
+    if failed:
+        with pytest.raises(RuntimeError, match="registration needs attention"):
+            appctl.run(args)
+    else:
+        appctl.run(args)
+    recorded = read_json(read_json(args.report_pointer)["report"])
+    assert recorded["complete"] and recorded["registration_ready"] is not failed
+    assert "tlx_ops_baseline" not in recorded["columns"]
+    assert not list(args.state.glob("baselines/**/*.json"))
+    receipt = read_json(next(args.state.glob("runs/*/registration.json")))
+    assert receipt["ready"] is not failed
+    with pytest.raises(ValueError, match="only weekly and nightly"):
+        publish(None, recorded, "registration")

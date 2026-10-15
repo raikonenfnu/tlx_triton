@@ -31,6 +31,7 @@ from contracts import (
 from discovery import DiscoveryCache, discover, validate_proposals
 from gpu_scheduler import wait_for_gpu
 from publication import GitHub, publish
+from registration import registration_result
 from reporting import describe, render, reproduce_command
 from target_templates import create_target
 from worker_pool import WorkerPool
@@ -373,7 +374,7 @@ def run(args):
             baseline = read_json(baseline_path)
             validate_baseline(baseline, campaign=campaign, week=week, key=key)
             controls = {(row["target"]["id"], row["case"]["id"]): row for row in baseline["rows"]}
-        elif baseline_path.exists():
+        elif args.mode == "weekly" and baseline_path.exists():
             raise ValueError("this week's immutable baseline already exists; use a new state directory to rerun")
         report = {
             "schema_version": 1, "complete": False, "started_utc": started_utc, "mode": args.mode, "date":
@@ -396,6 +397,8 @@ def run(args):
         context_hash = digest(context.read_text()) if context else None
         preferred = [name for name in ("tlx_ops", "tlx_tutorials", "aiter", "pytorch") if name in registry]
         report["columns"] = preferred + [name for name in registry if name not in preferred] + ["tlx_ops_baseline"]
+        if args.mode == "registration":
+            report["columns"].remove("tlx_ops_baseline")
         report["resume_key"] = digest({
             "identity": identity, "override_pins": override_pins, "runtime": runtime, "baseline":
             digest(baseline) if args.mode == "nightly" else None, "controller": digest(Path(__file__).read_text()),
@@ -453,10 +456,11 @@ def run(args):
                 if args.mode == "nightly":
                     row["results"]["tlx_ops_baseline"] = dict(controls[(target["id"],
                                                                         case["id"])]["results"]["tlx_ops"])
-                else:
+                elif args.mode == "weekly":
                     row["results"]["tlx_ops_baseline"] = dict(row["results"]["tlx_ops"])
-                row["results"]["tlx_ops_baseline"]["frozen_date"] = date.isoformat(
-                ) if args.mode == "weekly" else baseline["date"]
+                if args.mode != "registration":
+                    row["results"]["tlx_ops_baseline"]["frozen_date"] = date.isoformat(
+                    ) if args.mode == "weekly" else baseline["date"]
                 report["rows"].append(row)
                 print(f"measured {target['id']} / {case['id']}", flush=True)
                 # Preserve completed rows before the final report and immutable baseline exist.
@@ -468,12 +472,16 @@ def run(args):
             raise ValueError("case filter selected no cases")
         if pool is not None:
             pool.verify()
+        if args.mode == "registration":
+            readiness = registration_result(report)
+            write_json(directory / "registration.json", readiness)
+            report["registration_ready"] = readiness["ready"]
         missing = [
             row["case"]["id"]
             for row in report["rows"]
             if not any(r["status"] == "ok" for backend, r in row["results"].items() if backend != "tlx_ops_baseline")
         ]
-        if missing:
+        if missing and args.mode != "registration":
             raise RuntimeError(f"cases have no stable correct backend measurement: {missing}")
         report["elapsed_seconds"] = time.monotonic() - run_started
         report["worker_processes"] = len(pool.workers) if pool is not None else None
@@ -486,6 +494,8 @@ def run(args):
         if args.report_pointer:
             write_json(args.report_pointer, {"report": str(directory / "report.json")})
         print(directory / "report.md")
+        if args.mode == "registration" and not report["registration_ready"]:
+            raise RuntimeError(f"target registration needs attention: {directory / 'registration.json'}")
 
 
 def reproduce(args):
@@ -517,7 +527,8 @@ def main():
     initialize.add_argument("--metric", choices=["compute", "memory"], default="compute")
     initialize.add_argument("--output", type=Path, required=True)
     measure = sub.add_parser("run")
-    measure.add_argument("--mode", choices=["weekly", "nightly"], required=True)
+    measure.add_argument("--mode", choices=["registration", "weekly", "nightly"], required=True,
+                         help="check target readiness, freeze weekly controls, or compare nightly TLX")
     measure.add_argument("--targets", nargs="+", type=Path, required=True)
     measure.add_argument("--state", type=Path, required=True)
     measure.add_argument("--python", default=sys.executable)

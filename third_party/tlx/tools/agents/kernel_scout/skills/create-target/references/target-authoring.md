@@ -60,30 +60,40 @@ Examples include partial tiles, unequal Q/KV lengths, grouped heads, and empty s
 Check one small case first:
 
 ```bash
-python appctl.py run --mode weekly \
+python appctl.py run --mode registration \
   --targets targets/amd/gfx950/my_varlen_f16_fa.json \
   --state /path/to/new-target-state --case ragged_small --gpu 2 \
-  --provider builtin --rounds 0 --execute
+  --provider builtin --rounds 0 --execution persistent --execute
 ```
 
 Put source Triton before any wheel Triton on PYTHONPATH.
 Select an idle physical GPU index.
 The controller checks physical PCI selection, ownership, actual input fingerprints, correctness, and timing stability.
-Inspect `report.json`, candidate logs, and search manifests.
+Inspect `registration.json`, `report.json`, candidate logs, and search manifests.
+Registration saves checked coverage and returns a nonzero exit code when an applicable backend fails or is unavailable or unstable.
+Each ready case needs a stable TLX measurement and a stable AITER or PyTorch measurement.
+Unsupported backends remain visible, with their reasons.
+The receipt covers only the selected cases and recorded source/runtime pins.
+Remove `--case` to check the complete target after the initial smoke check.
+Registration does not create an immutable weekly baseline or publish a GitHub report.
 Run the report's pinned reproducer command.
 An unsupported backend or missing dependency cannot supply a performance number.
 
 Enable discovery after the seed path works:
 
 ```bash
-python appctl.py run --mode weekly \
+python appctl.py run --mode registration \
   --targets targets/amd/gfx950/my_varlen_f16_fa.json \
   --state /path/to/discovery-state --gpu 2 --provider claude \
-  --context /path/to/megabrain/context.md --max-candidates 6 --rounds 2 --execute
+  --context /path/to/megabrain/context.md --max-candidates 6 --rounds 2 \
+  --execution persistent --candidate-cache /path/to/candidates --execute
 ```
 
-Use a fresh state directory for this second weekly run.
-The controller preserves an existing weekly baseline.
+Resolve registration failures before the first weekly run.
+Use `--mode weekly --execution persistent --screen-candidates --discovery off` for routine measurement.
+Pass the same candidate-cache and context paths to reuse inspected adapters when all pins match.
+Cache misses use seeds only. Check reported candidate counts before claiming search coverage.
+Use a fresh state directory when replacing an existing weekly baseline.
 Pass the same targets and case filter to nightly runs.
 A new target contract selects a new campaign and needs a matching weekly baseline.
 
@@ -103,6 +113,18 @@ Use this extension map:
 | `backends/seeds.py` | Add seed candidates and a callable over harness-owned inputs. Include required conversions inside the call. |
 | `target_templates.py` / `appctl.py` | Add a starter case and expose the operation in `target-init` after the contract exists. |
 | `tests/test_core.py` | Test schema failures, arithmetic, backend eligibility, and controller integration. Add meaningful GPU checks when supported. |
+
+Implement seeded generation once in `make_inputs` and the FP32 oracle once in `reference`.
+Test repeat generation with the same seed and changed values with a different seed.
+Test declared layouts, including zero batch strides and packed offsets when applicable.
+Check the oracle against a small independently calculated example.
+Use `MeasurementSession.prepare` for per-case reuse across candidates.
+Use `cached_host_inputs` for identical CPU values across separate backend runtimes.
+Do not save oracle outputs, GPU tensors, or timing results in the adapter research cache.
+
+After registration, inspect `search.phase_seconds` in the report.
+Separate input preparation from first-call compilation and autotuning in correctness checks.
+A slow first call does not imply a slow kernel.
 
 Do not derive the oracle from the candidate kernel.
 Do not place benchmark timing inside backend adapters.

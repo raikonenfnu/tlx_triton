@@ -1,6 +1,6 @@
 ---
 name: create-target
-description: Create a TLX Kernel Scout target problem or extend its shared benchmark harness for a new operation.
+description: Register a TLX Kernel Scout problem with shared inputs, an independent reference, benchmark adapters, and measured readiness checks.
 ---
 
 Use this skill when adding target cases or a new operation to Kernel Scout.
@@ -25,11 +25,28 @@ Use existing backend entry points before adding kernel code.
 Declare unsupported hardware and cases explicitly.
 Follow the sibling [backend registration skill](../register-backend/SKILL.md) for new implementations.
 
-Check config validation and core unit tests before GPU work.
-Run a small case through the shared harness on supported hardware.
-Check actual input fingerprints, output correctness, source pins, and timing stability.
-Check a pinned reproducer after choosing a valid candidate.
-Record whether live discovery ran and which dependencies were available.
+Registration owns the reusable benchmark implementation, not just its JSON shapes.
+Keep input generation, the oracle, and timing in the shared harness.
+Do not generate a separate benchmark program for each backend or campaign.
+Test deterministic values, declared strides, output semantics, and work counts before GPU work.
+For a new operation, include an independent small numerical example in the unit tests.
+
+Run `appctl.py run --mode registration` with persistent workers on supported hardware.
+Check a small case and a representative boundary case first.
+Check every added case before declaring the complete target ready.
+Inspect `registration.json`, the report, and failed candidate logs.
+A ready case needs a checked TLX implementation and a checked AITER or PyTorch reference.
+Unavailable dependencies, unstable timings, and failed backend comparisons need investigation.
+Unsupported implementations remain explicit coverage gaps.
+Do not label a missing adapter as proof that the backend cannot support the problem.
+Run a pinned reproducer from the report.
+
+Prepare and inspect reusable backend adapters during registration when discovery is needed.
+Use target-scoped discovery and retain its source-pinned candidate cache for routine campaigns.
+Keep fresh correctness checks and measurements in weekly and nightly runs.
+Reuse immutable inputs and FP32 references only within a worker's current case.
+Keep input-dependent packing and conversions inside the timed call.
+Registration artifacts record scope and source pins. They do not replace later correctness checks.
 
 A changed target contract needs a new weekly baseline before nightly reuse.
 Keep the prior target and report revisions with their evidence.
