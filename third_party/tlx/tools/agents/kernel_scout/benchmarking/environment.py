@@ -62,12 +62,24 @@ def source_identity(repository):
     }
 
 
+def configure_cpu_threads():
+    """Bound CPU preparation threads consistently across probes, workers, and reproducers."""
+    import torch
+
+    count = int(os.environ.get("SCOUT_CPU_THREADS", "8"))
+    if count < 1:
+        raise ValueError("SCOUT_CPU_THREADS must be positive")
+    if torch.get_num_threads() != count:
+        torch.set_num_threads(count)
+
+
 def inspect_device():
     import torch
     from triton.runtime import driver
 
     if not torch.cuda.is_available():
         raise RuntimeError("a GPU runtime is required")
+    configure_cpu_threads()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -132,7 +144,7 @@ def kfd_owners(process_root, gpu_id):
     return owners
 
 
-def assert_idle(device):
+def assert_idle(device, *, allowed_pids=()):
     """Refuse an occupied device; do not change another job's clocks or processes."""
     physical = device["physical_gpu"]
     if device["vendor"] == "amd":
@@ -157,7 +169,7 @@ def assert_idle(device):
         uuid = command(["nvidia-smi", "-i", str(physical), "--query-gpu=uuid", "--format=csv,noheader"])
         rows = command(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"]).splitlines()
         pids = [int(row.split(",")[1]) for row in rows if row.split(",")[0].strip() == uuid]
-    foreign = [pid for pid in pids if pid != os.getpid()]
+    foreign = [pid for pid in pids if pid != os.getpid() and pid not in allowed_pids]
     if foreign:
         raise GPUOccupiedError(f"selected GPU has external processes: {foreign}")
 
@@ -178,10 +190,12 @@ def runtime_identity():
     import triton.testing
 
     native_path = Path(native.__file__)
+    with native_path.open("rb") as source:
+        compiler_hash = hashlib.file_digest(source, "sha256").hexdigest()
     identity = {
-        "python": platform.python_version(), "torch": torch.__version__, "torch_git": torch.version.git_version, "hip":
-        torch.version.hip, "cuda": torch.version.cuda, "triton": triton.__version__, "compiler_sha256":
-        hashlib.sha256(native_path.read_bytes()).hexdigest(), "timing_sha256":
+        "python": platform.python_version(), "torch": torch.__version__, "torch_git": torch.version.git_version,
+        "torch_num_threads": torch.get_num_threads(), "hip": torch.version.hip, "cuda": torch.version.cuda, "triton":
+        triton.__version__, "compiler_sha256": compiler_hash, "timing_sha256":
         hashlib.sha256(Path(triton.testing.__file__).read_bytes()).hexdigest(), "performance_environment": {
             key: value
             for key, value in os.environ.items()

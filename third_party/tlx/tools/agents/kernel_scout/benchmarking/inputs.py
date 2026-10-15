@@ -6,7 +6,7 @@ import itertools
 import json
 
 import torch
-from contracts import DENSE_ATTENTION, GEMM_OPERATIONS, attention_scale
+from contracts import DENSE_ATTENTION, GEMM_OPERATIONS, attention_scale, digest, read_json, write_json
 
 
 def input_digest(inputs):
@@ -21,7 +21,8 @@ def input_digest(inputs):
             if stride == 0 and value.shape[dim] > 1:
                 unique = unique.narrow(dim, 0, 1)
         dense = unique.contiguous().cpu()
-        hasher.update(ctypes.string_at(dense.data_ptr(), dense.numel() * dense.element_size()))
+        buffer = (ctypes.c_ubyte * (dense.numel() * dense.element_size())).from_address(dense.data_ptr())
+        hasher.update(buffer)
     return hasher.hexdigest()
 
 
@@ -66,6 +67,45 @@ def make_inputs(case, operation, seed, *, device="cuda"):
         "cu_q": torch.tensor([0, *itertools.accumulate(ql)], dtype=torch.int32, device=device), "cu_k":
         torch.tensor([0, *itertools.accumulate(kl)], dtype=torch.int32, device=device)
     }
+
+
+def cached_host_inputs(case, operation, seed, directory):
+    """Load or create one deterministic CPU seed without initializing a GPU."""
+    from pathlib import Path
+
+    path = Path(directory) / f"{digest([case, operation, seed])}.pt"
+    metadata = path.with_suffix(".json")
+    if path.exists():
+        host = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        expected_hash = read_json(metadata)["input_sha256"]
+        if input_digest(host) != expected_hash:
+            raise ValueError("shared input cache content differs")
+    else:
+        host = make_inputs(case, operation, seed, device="cpu")
+        expected_hash = input_digest(host)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        torch.save(host, temporary)
+        temporary.replace(path)
+        write_json(metadata, {"input_sha256": expected_hash})
+    return host, expected_hash
+
+
+def cached_inputs(case, operation, seed, directory, *, device="cuda", host_data=None):
+    """Share canonical CPU data across runtimes while retaining actual GPU fingerprints."""
+    host, expected_hash = host_data if host_data is not None else cached_host_inputs(case, operation, seed, directory)
+    inputs = {}
+    for name, value in host.items():
+        unique = value
+        for dim, stride in enumerate(value.stride()):
+            if stride == 0 and value.shape[dim] > 1:
+                unique = unique.narrow(dim, 0, 1)
+        transferred = unique.to(device)
+        inputs[name] = transferred.as_strided(value.shape, value.stride())
+    actual_hash = input_digest(inputs)
+    if actual_hash != expected_hash:
+        raise ValueError("device input bits or strides differ from the canonical CPU cache")
+    return inputs, actual_hash
 
 
 def reference(case, operation, inputs):

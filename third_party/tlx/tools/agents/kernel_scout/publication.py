@@ -106,6 +106,13 @@ class GitHub:
 
 
 def publish(api, report, markdown):
+    if report.get("complete", True) is not True:
+        raise ValueError("partial progress cannot be published as a completed report")
+    if any(
+            result.get("timing_phase") == "screen" and result.get("status") == "ok"
+            for row in report.get("rows", [])
+            for result in row["results"].values()):
+        raise ValueError("screening timings cannot be published as final performance")
     chunks = split_report(markdown, BODY_BYTES)
     first = chunks[0]
     if len(chunks) > 1:

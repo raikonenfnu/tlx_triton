@@ -6,6 +6,7 @@ import datetime as dt
 import fcntl
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from gpu_scheduler import wait_for_gpu
 from publication import GitHub, publish
 from reporting import describe, render, reproduce_command
 from target_templates import create_target
+from worker_pool import WorkerPool
 
 
 def execute(command, *, env, log, timeout):
@@ -96,13 +98,15 @@ def admitted_probe(runtime, gpu, directory, args, deadline):
                         status_path=directory / "gpu_admission.json", ready=lambda: probe(runtime, gpu, directory))
 
 
-def baseline_key(targets, device, runtime):
+def baseline_key(targets, device, runtime, *, execution="isolated", screening=False, finalists=2):
     # TLX source/compiler revisions intentionally evolve during the week.
     # The physical device, target, PyTorch, driver, and timing contract must match.
     return digest({
-        "targets": targets, "device": device, "harness_sha256": harness_digest(), "runtime": {
+        "targets": targets, "device": device, "harness_sha256": harness_digest(), "execution": execution, "screening":
+        screening, "finalists": finalists, "runtime": {
             k: runtime.get(k)
-            for k in ("torch", "torch_git", "hip", "cuda", "python", "timing_sha256", "performance_environment")
+            for k in ("torch", "torch_git", "torch_num_threads", "hip", "cuda", "python", "timing_sha256",
+                      "performance_environment")
         }
     })
 
@@ -118,23 +122,31 @@ def validate_baseline(baseline, *, campaign, week, key):
                     raise ValueError("weekly baseline reproducer is missing or changed")
 
 
-def evaluate(backend, target, case, candidate, directory, runtime, args):
+def evaluate(backend, target, case, candidate, directory, runtime, args, *, pool=None, timing_phase="full"):
     started = time.monotonic()
     runtime = {**runtime, "vendor": target["hardware"]["vendor"]}
     directory.mkdir(parents=True, exist_ok=True)
     request_path, output = directory / "request.json", directory / "measurement.json"
     request = {
         "backend": backend, "target": target, "case": case, "candidate": candidate, "repository": str(REPOSITORY),
-        "worker_runtime": runtime, "physical_gpu": args.gpu
+        "worker_runtime": runtime, "physical_gpu": args.gpu, "timing_phase": timing_phase
     }
+    if pool is not None:
+        request["input_cache"] = str(directory.parents[3] / "inputs" / target["id"] / case["id"])
     write_json(request_path, request)
     try:
-        execute(
-            [runtime["python"], str(ROOT / "benchmarking/worker.py"),
-             str(request_path), str(output)], env=worker_environment(args.gpu, runtime), log=directory / "worker.log",
-            timeout=args.worker_timeout)
+        if pool is None:
+            execute([runtime["python"],
+                     str(ROOT / "benchmarking/worker.py"),
+                     str(request_path),
+                     str(output)], env=worker_environment(args.gpu, runtime), log=directory / "worker.log",
+                    timeout=args.worker_timeout)
+        else:
+            pool.evaluate(runtime, args.gpu, request_path, output, directory / "worker.log")
         result = read_json(output)
     except RuntimeError as error:
+        if pool is not None:
+            raise
         result = {"status": "failed", "error": str(error)}
     if result["status"] == "ok":
         request["expected_identity"] = {
@@ -150,17 +162,23 @@ def evaluate(backend, target, case, candidate, directory, runtime, args):
     return result
 
 
-def scout(backend, target, case, directory, runtime, args, *, research=None, cache=None):
+def scout(backend, target, case, directory, runtime, args, *, research=None, cache=None, pool=None):
     started = time.monotonic()
     directory.mkdir(parents=True, exist_ok=True)
     search = backend != "aiter" or getattr(args, "aiter_search", False)
     scope = getattr(args, "discovery", "target")
     stats = {"scope": scope, "agent_calls": 0, "discovery_seconds": 0, "cache_hit": False}
+    extra_measurements = []
 
     def finish(result):
+        measured = [f["result"] for f in feedback] + extra_measurements + [result]
         result["search"] = {
             **stats, "elapsed_seconds": time.monotonic() - started, "worker_seconds":
-            sum(f["result"].get("worker_seconds", 0) for f in feedback) + result.get("worker_seconds", 0)
+            sum(m.get("worker_seconds", 0) for m in measured), "phase_seconds": {
+                key: sum(m.get("phase_seconds", {}).get(key, 0)
+                         for m in measured)
+                for key in ("setup", "preparation", "correctness", "benchmark_and_checks")
+            }
         }
         return result
 
@@ -181,10 +199,14 @@ def scout(backend, target, case, directory, runtime, args, *, research=None, cac
         proposals += validate_proposals(response, cached_dir, remaining)
         remaining = 0
     generated = []
+    evaluation_options = {"pool": pool} if pool is not None else {}
+    screening = getattr(args, "screen_candidates", False) and len(proposals) > 1
+    if screening:
+        evaluation_options["timing_phase"] = "screen"
     for round_number in range(args.rounds + 1):
         for candidate in proposals:
             result = evaluate(backend, target, case, candidate, directory / f"r{round_number}_{candidate['id']}",
-                              runtime, args)
+                              runtime, args, **evaluation_options)
             feedback.append({"candidate": candidate, "result": result})
         if not search or scope == "off" or args.provider == "builtin" or not remaining or round_number == args.rounds:
             break
@@ -206,22 +228,36 @@ def scout(backend, target, case, directory, runtime, args, *, research=None, cac
     if cache_key and stats["agent_calls"]:
         cache.save(cache_key, discovery_status, discovery_summary, generated)
     write_json(directory / "search.json", feedback)
-    valid = [f for f in feedback if f["result"]["status"] == "ok"]
+    selection = feedback
+    if screening:
+        eligible = [f for f in feedback if f["result"]["status"] in {"ok", "unstable"}]
+        finalists = sorted(eligible, key=lambda f: f["result"]["latency_ms"])[:getattr(args, "finalists", 2)]
+        selection = []
+        for finalist in finalists:
+            candidate = finalist["candidate"]
+            result = evaluate(backend, target, case, candidate, directory / f"final_{candidate['id']}", runtime, args,
+                              **({"pool": pool} if pool is not None else {}))
+            extra_measurements.append(result)
+            selection.append({"candidate": candidate, "result": result})
+        write_json(directory / "finalists.json", selection)
+        stats.update(screened_candidates=len(feedback), full_candidates=len(selection))
+    valid = [f for f in selection if f["result"]["status"] == "ok"]
     if not valid:
         if discovery_status == "blocked":
             return finish({"status": "blocked", "error": discovery_summary, "evaluated_candidates": len(feedback)})
         if not feedback:
             return finish(
                 {"status": "unsupported", "error": "no seed adapter; enable an agent to research this backend"})
-        statuses = {f["result"]["status"] for f in feedback}
+        statuses = {f["result"]["status"] for f in (selection or feedback)}
         status = next(s for s in ("failed", "unstable", "unavailable", "unsupported") if s in statuses)
         return finish({
-            "status": status, "error": feedback[0]["result"].get("error", "no stable correct candidate"),
+            "status": status, "error": (selection or feedback)[0]["result"].get("error", "no stable correct candidate"),
             "evaluated_candidates": len(feedback)
         })
     best = min(valid, key=lambda f: f["result"]["latency_ms"])
     # Independent remeasurement after selection reduces tuning-selection bias.
-    winner = evaluate(backend, target, case, best["candidate"], directory / "confirmation", runtime, args)
+    winner = evaluate(backend, target, case, best["candidate"], directory / "confirmation", runtime, args,
+                      **({"pool": pool} if pool is not None else {}))
     winner["evaluated_candidates"] = len(feedback)
     winner["search_manifest"] = str(directory / "search.json")
     winner["discovery_status"] = discovery_status
@@ -230,6 +266,7 @@ def scout(backend, target, case, directory, runtime, args, *, research=None, cac
 
 
 def run(args):
+    job_started = time.monotonic()
     aiter_search = getattr(args, "aiter_search", False)
     targets = [load_target(path) for path in args.targets]
     if args.case:
@@ -261,7 +298,10 @@ def run(args):
         return
     # One lock per physical GPU across state directories used by this user.
     gpu_lock = Path.home() / ".cache/tlx-kernel-scout" / f"gpu-{args.gpu}.lock"
-    with locked(gpu_lock), locked(args.state / "controller.lock"):
+    with locked(gpu_lock), locked(args.state / "controller.lock"), contextlib.ExitStack() as stack:
+        execution_mode = getattr(args, "execution", "isolated")
+        pool = stack.enter_context(WorkerPool(directory / "workers", worker_environment, args.worker_timeout)) \
+            if execution_mode == "persistent" else None
         admission_deadline = time.monotonic() + getattr(args, "gpu_wait_seconds", 1800)
         identity = admitted_probe(runtime, args.gpu, directory, args, admission_deadline)
         if not Path(identity["runtime"]["triton_module"]).is_relative_to(REPOSITORY / "python"):
@@ -280,9 +320,20 @@ def run(args):
             if pin["device"] != device:
                 raise ValueError(f"{backend} runtime selected a different device")
             override_pins[backend] = pin
+        if pool is not None:
+            pool.register(runtime, args.gpu, identity)
+            for backend, override in runtimes.items():
+                pool.register({**runtime, **override}, args.gpu, override_pins[backend])
         key = digest({
-            "contract": baseline_key(targets, device, identity["runtime"]), "runtimes": runtimes, "registry": registry,
-            "aiter": identity["aiter"], "override_pins": override_pins, "aiter_search": aiter_search
+            "contract":
+            baseline_key(targets, device, identity["runtime"], execution=execution_mode,
+                         screening=getattr(args, "screen_candidates", False), finalists=getattr(args, "finalists", 2)),
+            "runtimes":
+            runtimes, "registry":
+            registry, "aiter":
+            identity["aiter"], "override_pins":
+            override_pins, "aiter_search":
+            aiter_search
         })
         baseline_path = args.state / "baselines" / campaign / f"{week}.json"
         controls = {}
@@ -293,8 +344,8 @@ def run(args):
         elif baseline_path.exists():
             raise ValueError("this week's immutable baseline already exists; use a new state directory to rerun")
         report = {
-            "schema_version": 1, "mode": args.mode, "date": date.isoformat(), "week": week, "campaign": campaign,
-            "baseline_key": key, "device": device, "provider": args.provider, "aiter_mode":
+            "schema_version": 1, "complete": False, "mode": args.mode, "date": date.isoformat(), "week": week,
+            "campaign": campaign, "baseline_key": key, "device": device, "provider": args.provider, "aiter_mode":
             "search" if aiter_search else "public", "budget": {
                 "max_candidates": args.max_candidates, "rounds": args.rounds, "agent_timeout_s": args.agent_timeout,
                 "worker_timeout_s": args.worker_timeout
@@ -305,7 +356,10 @@ def run(args):
             getattr(args, "candidate_cache", None) or args.state / "candidates", refresh=getattr(
                 args, "refresh_discovery", False))
         report["discovery_scope"] = discovery_scope
-        run_started = time.monotonic()
+        report["execution_mode"] = execution_mode
+        report["screen_candidates"] = getattr(args, "screen_candidates", False)
+        report["finalists"] = getattr(args, "finalists", 2)
+        run_started = job_started
         context = getattr(args, "context", None)
         context_hash = digest(context.read_text()) if context else None
         preferred = [name for name in ("tlx_ops", "tlx_tutorials", "aiter", "pytorch") if name in registry]
@@ -338,8 +392,10 @@ def run(args):
                         if backend == "aiter":
                             research["package"] = backend_identity["aiter"]
                         result = scout(backend, target, case, directory / target["id"] / case["id"] / backend,
-                                       backend_runtime, args, research=research, cache=cache)
+                                       backend_runtime, args, research=research, cache=cache, pool=pool)
                     row["results"][backend] = result
+                    if result["status"] == "ok" and result.get("timing_phase") == "screen":
+                        raise ValueError("screening timings cannot become report results")
                     search_stats = result.get("search", {})
                     print(
                         f"{target['id']}/{case['id']}: {backend} {result['status']} "
@@ -359,8 +415,16 @@ def run(args):
                 # Preserve completed rows before the final report and immutable baseline exist.
                 report["elapsed_seconds"] = time.monotonic() - run_started
                 write_json(directory / "progress.json", report)
+                if pool is not None:
+                    shutil.rmtree(directory / "inputs" / target["id"] / case["id"], ignore_errors=True)
         if not report["rows"]:
             raise ValueError("case filter selected no cases")
+        if pool is not None:
+            pool.verify()
+        report["elapsed_seconds"] = time.monotonic() - run_started
+        report["worker_processes"] = len(pool.workers) if pool is not None else None
+        report["complete"] = True
+        write_json(directory / "progress.json", report)
         write_json(directory / "report.json", report)
         (directory / "report.md").write_text(render(report))
         if args.mode == "weekly":
@@ -407,6 +471,12 @@ def main():
     measure.add_argument("--runtimes", type=Path, help="JSON backend -> {python, pythonpath} overrides")
     measure.add_argument("--report-pointer", type=Path, help="write the completed report path for deployment")
     measure.add_argument("--provider", choices=["builtin", "codex", "claude"], default="builtin")
+    measure.add_argument("--execution", choices=["isolated", "persistent"], default="isolated",
+                         help="use fresh processes or serialized runtime workers with shared case preparation")
+    measure.add_argument("--screen-candidates", action="store_true",
+                         help="select finalists with short timing before full measurement")
+    measure.add_argument("--finalists", type=int, default=2,
+                         help="number of screened variants to measure with the full timing contract")
     measure.add_argument("--discovery", choices=["target", "case", "off"], default="target",
                          help="research once per target/backend, per case, or use only seeds and saved adapters")
     measure.add_argument("--candidate-cache", type=Path, help="adapter cache directory, defaults to STATE/candidates")
@@ -442,6 +512,8 @@ def main():
             print(load_target(path)["id"])
         print("backends:", ", ".join(backends()))
     elif args.command == "run":
+        if args.finalists < 1:
+            parser.error("finalists must be positive")
         if args.refresh_discovery and args.discovery != "target":
             parser.error("refresh discovery requires target discovery")
         if args.refresh_discovery and (args.provider == "builtin" or args.rounds == 0):

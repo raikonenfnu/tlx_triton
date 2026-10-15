@@ -125,7 +125,7 @@ def discover(provider, backend, target, case, feedback, directory, remaining, *,
             for k, v in f["result"].items()
             if k in {
                 "status", "error", "latency_ms", "p20_ms", "p80_ms", "relative_spread", "numerical_errors",
-                "adapter_metadata"
+                "adapter_metadata", "timing_phase"
             }
         }
     }

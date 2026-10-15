@@ -20,6 +20,9 @@ Create an absolute-path configuration outside the source checkout:
   "gpu_poll_seconds": 60,
   "provider": "codex",
   "discovery": "target",
+  "execution": "persistent",
+  "screen_candidates": true,
+  "finalists": 2,
   "candidate_cache": "/path/to/scout-candidates",
   "aiter_search": false,
   "rounds": 2,
@@ -78,6 +81,11 @@ Torch/driver runtime, device, backend registry, or dependency identity requires 
 The runner does not silently replace an existing weekly baseline.
 AITER uses public operators by default, without LLM discovery.
 Target discovery is the default. It reuses source-scoped adapters across shapes and later runs.
+For routine runs with an existing adapter cache, set `discovery` to `off`.
+Persistent execution shares case preparation while serializing measurements across runtime workers.
+Screening ranks all candidates with short timings, then fully measures finalists and independently remeasures the winner.
+Reported timings retain the target's full protocol. Execution and screening changes require a fresh weekly baseline.
+Use isolated execution and disable screening for exhaustive investigations.
 Set `discovery` to `off` for routine measurement without agent calls.
 Set `discovery` to `case` for adaptive research on every shape.
 Set `refresh_discovery` to true with target discovery to replace saved research.
