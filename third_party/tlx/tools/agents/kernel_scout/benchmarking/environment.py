@@ -200,9 +200,10 @@ def runtime_identity():
             key: value
             for key, value in os.environ.items()
             if key.startswith(("AITER_", "FLYDSL_")) or key in {
-                "TORCH_BLAS_PREFER_HIPBLASLT", "PYTORCH_TUNABLEOP_ENABLED", "PYTORCH_TUNABLEOP_TUNING",
-                "NVIDIA_TF32_OVERRIDE", "HSA_OVERRIDE_GFX_VERSION", "TRITON_ALWAYS_COMPILE", "TRITON_DEFAULT_FP_FUSION",
-                "TRITON_ENABLE_C_CACHE", "ENABLE_CK", "CK_DIR", "GPU_ARCHS", "ROCM_PATH", "HIPCC_FLAGS_APPEND"
+                "TORCH_BLAS_PREFER_HIPBLASLT", "TORCHINDUCTOR_COMPILE_THREADS", "PYTORCH_TUNABLEOP_ENABLED",
+                "PYTORCH_TUNABLEOP_TUNING", "NVIDIA_TF32_OVERRIDE", "HSA_OVERRIDE_GFX_VERSION", "TRITON_ALWAYS_COMPILE",
+                "TRITON_DEFAULT_FP_FUSION", "TRITON_ENABLE_C_CACHE", "ENABLE_CK", "CK_DIR", "GPU_ARCHS", "ROCM_PATH",
+                "HIPCC_FLAGS_APPEND"
             }
         }, "configuration_sha256": {
             key: hashlib.sha256(Path(value).read_bytes()).hexdigest()

@@ -1214,6 +1214,24 @@ def test_probe_initializes_backend_defaults_before_fingerprinting(tmp_path, monk
     assert events == ["initialized", "fingerprinted"]
 
 
+@pytest.mark.parametrize("configured, expected", [(None, "1"), ("2", "2")])
+def test_compiler_thread_limit_precedes_backend_initialization(monkeypatch, configured, expected):
+    import importlib.util
+    import os
+
+    from benchmarking import worker
+
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", configured)
+
+    def find_backend(name):
+        assert os.environ["TORCHINDUCTOR_COMPILE_THREADS"] == expected
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_backend)
+    worker.initialize_packages()
+
+
 def test_compile_drain_uses_the_framework_shutdown_api(monkeypatch):
     from benchmarking import worker
 
