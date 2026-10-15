@@ -19,7 +19,10 @@ def digest(value):
 
 
 def harness_digest():
-    paths = [ROOT / "contracts.py", ROOT / "backends/seeds.py", *sorted((ROOT / "benchmarking").glob("*.py"))]
+    paths = [
+        ROOT / "contracts.py", ROOT / "worker_pool.py", ROOT / "backends/seeds.py", *sorted(
+            (ROOT / "benchmarking").glob("*.py"))
+    ]
     return digest({str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
 
 

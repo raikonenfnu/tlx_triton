@@ -45,6 +45,7 @@ Prepare and inspect reusable backend adapters during registration when discovery
 Use target-scoped discovery and retain its source-pinned candidate cache for routine campaigns.
 Keep fresh correctness checks and measurements in weekly and nightly runs.
 Reuse immutable inputs and FP32 references only within a worker's current case.
+Keep each backend in its own persistent worker to separate compiler and library state.
 Keep input-dependent packing and conversions inside the timed call.
 Registration artifacts record scope and source pins. They do not replace later correctness checks.
 
