@@ -109,6 +109,11 @@ def publish(api, report, markdown):
     if report.get("complete", True) is not True:
         raise ValueError("partial progress cannot be published as a completed report")
     if any(
+            result.get("failure_kind") == "infrastructure" or result.get("error", "").startswith("GPUOccupiedError:")
+            for row in report.get("rows", [])
+            for result in row["results"].values()):
+        raise ValueError("infrastructure failures cannot become a published benchmark report")
+    if any(
             result.get("timing_phase") == "screen" and result.get("status") == "ok"
             for row in report.get("rows", [])
             for result in row["results"].values()):

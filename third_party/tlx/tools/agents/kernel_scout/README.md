@@ -182,10 +182,12 @@ Workers share canonical CPU input files across runtimes. Each worker prepares GP
 CPU preparation uses at most three seed workers and eight Torch threads by default.
 Set `SCOUT_CPU_THREADS` consistently across jobs to change the Torch thread limit. Scout records it for baseline compatibility.
 Every candidate still receives both correctness seeds, mutation checks, output checks, and GPU ownership checks.
+Torch Inductor compiler pools shut down after warmup and before timing. Compiler sidecars cannot retain GPU handles during later measurements.
 The controller removes shared input files after each case. Reproducers regenerate them in temporary storage.
 The GPU check permits only the controller's own live, idle peer workers to retain contexts.
 It still rejects all other GPU owners. The controller never runs two measurement requests simultaneously.
 Source and harness checks run between cases and before report completion. Failed verification prevents baseline creation and publication.
+Infrastructure failures abort the campaign. A case without a stable correct backend prevents baseline creation.
 
 Candidate screening uses three repeats, at most 5 ms warmup, and at most 20 ms measurement per repeat.
 Correct but noisy screening results remain eligible. The fastest two screened candidates receive the full target timing protocol.

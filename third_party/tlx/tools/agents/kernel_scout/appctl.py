@@ -148,6 +148,8 @@ def evaluate(backend, target, case, candidate, directory, runtime, args, *, pool
         if pool is not None:
             raise
         result = {"status": "failed", "error": str(error)}
+    if result.get("failure_kind") == "infrastructure":
+        raise RuntimeError(result["error"])
     if result["status"] == "ok":
         request["expected_identity"] = {
             key: result[key]
@@ -177,7 +179,7 @@ def scout(backend, target, case, directory, runtime, args, *, research=None, cac
             sum(m.get("worker_seconds", 0) for m in measured), "phase_seconds": {
                 key: sum(m.get("phase_seconds", {}).get(key, 0)
                          for m in measured)
-                for key in ("setup", "preparation", "correctness", "benchmark_and_checks")
+                for key in ("setup", "preparation", "correctness", "compiler_cleanup", "benchmark_and_checks")
             }
         }
         return result
@@ -421,6 +423,13 @@ def run(args):
             raise ValueError("case filter selected no cases")
         if pool is not None:
             pool.verify()
+        missing = [
+            row["case"]["id"]
+            for row in report["rows"]
+            if not any(r["status"] == "ok" for backend, r in row["results"].items() if backend != "tlx_ops_baseline")
+        ]
+        if missing:
+            raise RuntimeError(f"cases have no stable correct backend measurement: {missing}")
         report["elapsed_seconds"] = time.monotonic() - run_started
         report["worker_processes"] = len(pool.workers) if pool is not None else None
         report["complete"] = True
