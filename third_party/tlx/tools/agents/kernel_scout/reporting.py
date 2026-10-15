@@ -30,6 +30,7 @@ def render(report):
         f"Device: {report['device']['name']}, {report['device']['arch']}, physical GPU {report['device']['physical_gpu']}.",
         f"Week: {report['week']}. Campaign: `{report['campaign']}`. Provider: {report['provider']}.",
         f"AITER mode: {report.get('aiter_mode', 'search (legacy report)')}.",
+        f"Discovery scope: {report.get('discovery_scope', 'case (legacy report)')}.",
         "Best observed among evaluated candidates; unavailable and unstable results cannot win.",
         "All calls use returned tensors, eager triton.testing.do_bench, and the same seeded logical inputs.",
         "Weekly controls are frozen observations, not simultaneous nightly measurements.", "",
@@ -92,6 +93,17 @@ def render(report):
         f"Candidate budget: {report['budget']}. Discovery and failed candidate details are in report.json and candidate logs.",
         ""
     ]
+    searches = [
+        row["results"][backend]["search"]
+        for row in report["rows"]
+        for backend in columns
+        if backend != "tlx_ops_baseline" and "frozen_date" not in row["results"].get(backend, {})
+        and "search" in row["results"].get(backend, {})
+    ]
+    if searches:
+        lines += [(f"Search overhead: {sum(s['agent_calls'] for s in searches)} agent calls, "
+                   f"{sum(s['discovery_seconds'] for s in searches):.1f}s in discovery, "
+                   f"{sum(s['worker_seconds'] for s in searches):.1f}s in isolated workers."), ""]
     return "\n".join(lines)
 
 

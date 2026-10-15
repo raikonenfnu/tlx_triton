@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from coding_agents import query_json
-from contracts import NAME, REPOSITORY, ROOT
+from contracts import NAME, REPOSITORY, ROOT, digest, harness_digest, read_json, write_json
 
 SCHEMA = {
     "type": "object",
@@ -58,8 +58,57 @@ def validate_proposals(response, directory, remaining):
     return result
 
 
+class DiscoveryCache:
+    """Reuse source-scoped adapters, never measurements or correctness verdicts."""
+
+    def __init__(self, root, *, refresh=False):
+        self.root, self.refresh, self.responses = Path(root), refresh, {}
+
+    def key(self, backend, target, research):
+        paths = [
+            ROOT / "discovery.py", ROOT / "backends" / backend / "instructions.md",
+            ROOT / "backends" / backend / "backend.json", *sorted((ROOT / "skills").rglob("*.md"))
+        ]
+        return digest({
+            "target": target, "backend": backend, "research": research, "harness": harness_digest(), "instructions":
+            {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in paths}
+        })
+
+    def load(self, key):
+        if key not in self.responses and not self.refresh:
+            path = self.root / f"{key}.json"
+            if path.exists():
+                saved = read_json(path)
+                if saved["key"] != key or saved["response_sha256"] != digest(saved["response"]):
+                    raise ValueError("discovery cache identity or content differs")
+                self.responses[key] = saved["response"]
+        return self.responses.get(key)
+
+    def save(self, key, status, summary, candidates):
+        proposals, seen = [], set()
+        if status == "complete":
+            for candidate in candidates:
+                if "adapter" not in candidate or candidate["adapter_sha256"] in seen:
+                    continue
+                source = Path(candidate["adapter"]).read_text()
+                if hashlib.sha256(source.encode()).hexdigest() != candidate["adapter_sha256"]:
+                    raise ValueError("discovered adapter changed before caching")
+                seen.add(candidate["adapter_sha256"])
+                proposals.append({
+                    "id": f"cached_{len(proposals)}", "params": {}, "adapter_source": source.removesuffix("\n"),
+                    "rationale": candidate["rationale"]
+                })
+        response = {"status": status, "summary": summary, "candidates": proposals}
+        self.responses[key] = response
+        # Retry blocked research on the next run, rather than saving it as an empty search.
+        if status == "complete":
+            write_json(self.root / f"{key}.json",
+                       {"key": key, "response": response, "response_sha256": digest(response)})
+
+
 def discover(provider, backend, target, case, feedback, directory, remaining, *, model=None, context=None, timeout=300,
-             research=None):
+             research=None, scope="case"):
     instructions = (ROOT / "backends" / backend / "instructions.md").read_text()
     fairness = (ROOT / "skills/benchmark-fairness/SKILL.md").read_text()
     registration = (ROOT / "skills/register-backend/SKILL.md").read_text()
@@ -69,7 +118,25 @@ def discover(provider, backend, target, case, feedback, directory, remaining, *,
         workspace = Path(package.get("repository") or package["module"])
     if backend == "pytorch" and research and research.get("runtime", {}).get("torch_module"):
         workspace = Path(research["runtime"]["torch_module"]).parent
-    prompt = f"""Find the best observed existing kernel variants for this backend and exact target.
+    # Feedback already has full provenance on disk. Avoid sending repeated runtime and device dumps.
+    compact = [{
+        "candidate": f["candidate"], "result": {
+            k: v
+            for k, v in f["result"].items()
+            if k in {
+                "status", "error", "latency_ms", "p20_ms", "p80_ms", "relative_spread", "numerical_errors",
+                "adapter_metadata"
+            }
+        }
+    }
+               for f in feedback]
+    scope_instruction = (
+        "Research all cases in target.cases. Return adapters that derive dimensions, dtype, and causal mode from case.\n"
+        "Guard unsupported cases with NotImplementedError. The controller will check every adapter on each case.\n"
+        "This is the target's only research phase. Do not assume the current case represents every shape."
+        if scope == "target" else "Research the current case.")
+    prompt = f"""Find existing kernel variants for this backend and target.
+{scope_instruction}
 Read source before selecting entry points. Do not install dependencies, edit source, run benchmarks,
 or publish memory. Return at most {remaining} adapter proposals. Return an empty list if no justified
 candidate exists. Return status=blocked for tool, permission, authentication, or source-read failures.
@@ -79,6 +146,7 @@ build runs before input generation. run returns the canonical tensor and include
 Adapters can import existing kernels; do not rewrite a kernel or substitute another backend.
 The controller checks outputs and measures candidates. It owns memory checkpoints.
 Use unique ids. Hardcode tunable parameters in source and return params={{}}.
+Do not propose aliases of evaluated entry points with the same configuration. An empty candidate list is successful research.
 The adapters execute as trusted local Python; do not use files, network, shell commands, or instrumentation.
 
 Backend instructions:
@@ -93,7 +161,7 @@ Research workspace: {workspace}
 Target and case:
 {json.dumps({'target': target, 'case': case}, indent=2)}
 Measured feedback (not a request to infer unmeasured performance):
-{json.dumps(feedback, indent=2)}
+{json.dumps(compact, indent=2)}
 """
     response = query_json(provider, prompt, workspace=workspace, schema=SCHEMA, model=model, context_path=context,
                           timeout_seconds=timeout)
