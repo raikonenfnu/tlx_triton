@@ -1,4 +1,4 @@
-"""Keep one worker per runtime and serialize all GPU requests on the controller."""
+"""Keep one worker per backend/runtime and serialize all GPU requests."""
 
 import contextlib
 import json
@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 
-from contracts import REPOSITORY, ROOT, digest
+from contracts import REPOSITORY, ROOT, digest, read_json
 
 
 class WorkerPool:
@@ -29,8 +29,9 @@ class WorkerPool:
         finally:
             self.close(abort=kind is not None)
 
-    def worker(self, runtime, gpu):
-        key = digest([runtime, gpu])
+    def worker(self, runtime, gpu, backend):
+        # Compiler and library state can outlive a candidate. Keep backends apart.
+        key = digest([runtime, gpu, backend])
         if key not in self.workers:
             self.directory.mkdir(parents=True, exist_ok=True)
             log = (self.directory / f"{key}.log").open("w")
@@ -73,7 +74,7 @@ class WorkerPool:
 
     def evaluate(self, runtime, gpu, request, output, log):
         self.verified = False
-        worker = self.worker(runtime, gpu)
+        worker = self.worker(runtime, gpu, read_json(request)["backend"])
         log.write_text(f"Persistent worker log: {worker['log'].name}\nRequest: {request}\n")
         return self.send(
             worker,

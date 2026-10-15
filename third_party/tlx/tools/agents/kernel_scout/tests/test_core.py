@@ -1376,7 +1376,7 @@ for line in sys.stdin:
 def test_worker_pool_reuses_processes_and_keeps_logs_out_of_protocol(tmp_path, fake_worker_server):
     pool = fake_worker_server
     request, output, log = (tmp_path / name for name in ("request.json", "measurement.json", "worker.log"))
-    write_json(request, {})
+    write_json(request, {"backend": "pytorch"})
     runtime = {"python": sys.executable}
     with pool:
         pool.evaluate(runtime, 0, request, output, log)
@@ -1387,6 +1387,16 @@ def test_worker_pool_reuses_processes_and_keeps_logs_out_of_protocol(tmp_path, f
         second = json.loads(output.read_text())
         assert second["pid"] != first["pid"]
         assert set(second["peers"]) == {first["pid"], second["pid"]}
+        write_json(request, {"backend": "tlx_ops"})
+        pool.evaluate(runtime, 0, request, output, log)
+        third = json.loads(output.read_text())
+        assert third["pid"] not in {first["pid"], second["pid"]}
+        assert set(third["peers"]) == {first["pid"], second["pid"], third["pid"]}
+        pool.evaluate(runtime, 0, request, output, log)
+        assert json.loads(output.read_text())["pid"] == third["pid"]
+        write_json(request, {"backend": "pytorch"})
+        pool.evaluate(runtime, 0, request, output, log)
+        assert json.loads(output.read_text())["pid"] == first["pid"]
     assert pool.verified
     assert all(w["process"].poll() == 0 for w in pool.workers.values())
     assert "backend output" in next((tmp_path / "workers").glob("*.log")).read_text()
@@ -1396,7 +1406,7 @@ def test_worker_pool_timeout_terminates_its_process(tmp_path, fake_worker_server
     pool = fake_worker_server
     pool.timeout = 0.05
     request, output, log = (tmp_path / name for name in ("request.json", "measurement.json", "worker.log"))
-    write_json(request, {"sleep": 30})
+    write_json(request, {"backend": "pytorch", "sleep": 30})
     with pytest.raises(RuntimeError, match="exceeded"), pool:
         pool.evaluate({"python": sys.executable}, 0, request, output, log)
     assert all(w["process"].poll() is not None for w in pool.workers.values())

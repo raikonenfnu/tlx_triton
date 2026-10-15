@@ -186,7 +186,8 @@ Use `--execution persistent --screen-candidates --discovery off` for routine mea
 This path preserves the target's full timing protocol for finalists and the reported winner.
 Source builds and new variant research remain separate operations. A missing research cache uses seeds only.
 
-Persistent execution keeps one worker per Python runtime and serializes every GPU request.
+Persistent execution keeps one worker per backend and Python runtime, then serializes every GPU request.
+This separates backend compiler and library state while retaining preparation across candidates within each backend.
 Workers share canonical CPU input files across runtimes. Each worker prepares GPU inputs and FP32 references once per case.
 CPU preparation uses at most three seed workers and eight Torch threads by default.
 Set `SCOUT_CPU_THREADS` consistently across jobs to change the Torch thread limit. Scout records it for baseline compatibility.
