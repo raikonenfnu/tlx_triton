@@ -83,7 +83,7 @@ Extract the output explicitly if the selected API returns auxiliary tensors.
 
 FP16 must remain FP16 throughout the measured operation.
 Do not convert to BF16 or FP8 to access an assembly or FlyDSL path.
-PR #3921's BF16 assembly results are not FP16 controls.
+BF16 assembly measurements cannot serve as FP16 controls.
 Do not measure backward, dropout generation, extra masks, or another causal convention.
 An implementation's required auxiliary work remains part of its measured call.
 
@@ -142,5 +142,5 @@ Its CK instances use BF16 inputs. Keep FP16 unsupported rather than converting i
 For `flash_attn_mxfp8`, this backend supplies a labeled BF16 public attention reference.
 Use the case's BF16 inputs, explicit softmax scale, and causal flag.
 Do not claim this path implements TLX's block-scaled Q/K/V/P recipe.
-PR #3824's pre-quantized AITER code-object comparison uses another recipe and graph timing.
+Pre-quantized AITER code-object measurements use another input recipe and graph timing.
 Do not import those numbers into the eager public-op target.

@@ -37,7 +37,6 @@
       "k": 931,
       "a_layout": "row_major",
       "b_layout": "row_major",
-      "source_issue": "https://github.com/raikonenfnu/tlx_triton/issues/21",
       "source_weight": 1,
       "batch": 3072,
       "shared_a": true,
@@ -51,7 +50,6 @@
       "k": 931,
       "a_layout": "row_major",
       "b_layout": "row_major",
-      "source_issue": "https://github.com/raikonenfnu/tlx_triton/issues/21",
       "source_weight": 1,
       "batch": 3072,
       "shared_a": true,
@@ -60,15 +58,9 @@
     }
   ],
   "source": {
-    "issues": [
-      "https://github.com/raikonenfnu/tlx_triton/issues/20",
-      "https://github.com/raikonenfnu/tlx_triton/issues/21",
-      "https://github.com/raikonenfnu/tlx_triton/issues/22"
-    ],
-    "suite_repository": "https://github.com/raikonenfnu/tlx_triton",
     "suite_revision": "555e565bbe9e15d3270c86832581e6f156dee362",
     "notes": [
-      "Issue data uses BF16. FP16 counterparts preserve dimensions, layout, and input scaling.",
+      "BF16 and FP16 cases share dimensions, layouts, and input scaling.",
       "MM, ADDMM, and shared-A BMM keep separate operation contracts.",
       "Source weights are metadata. Scout does not aggregate weighted performance.",
       "Historical timings and tuned fork variants are not imported as baseline measurements.",

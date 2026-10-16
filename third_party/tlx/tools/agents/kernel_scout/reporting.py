@@ -1,6 +1,8 @@
 """Render measured evidence, frozen control dates, and pinned reproducer commands."""
 
 import shlex
+import sys
+from collections import Counter
 
 from contracts import GEMM_OPERATIONS, ROOT, attention_scale, select_winner
 
@@ -23,7 +25,7 @@ def describe(target, case):
     )
 
 
-def render(report):
+def render(report, report_path=None):
     columns = report["columns"]
     lines = [
         f"# TLX Kernel Scout — {report['date']} ({report['mode']})", "",
@@ -34,10 +36,11 @@ def render(report):
         f"Execution: {report.get('execution_mode', 'isolated')}. Candidate screening: {report.get('screen_candidates', False)}.",
         "Best observed among evaluated candidates; unavailable and unstable results cannot win.",
         "All calls use returned tensors, eager triton.testing.do_bench, and the same seeded logical inputs.",
-        "Weekly controls are frozen observations, not simultaneous nightly measurements.", "", "| Problem | " +
-        " | ".join(columns) + " | Winner |", "| --- | " + " | ".join("---" for _ in columns) + " | --- |"
+        "Weekly controls are frozen observations, not simultaneous nightly measurements.", "", "<details>",
+        "<summary>Performance</summary>", "", "| # | Problem | " + " | ".join(columns) + " | Winner |",
+        "| --- | --- | " + " | ".join("---" for _ in columns) + " | --- |"
     ]
-    for row in report["rows"]:
+    for number, row in enumerate(report["rows"], 1):
         values = []
         for backend in columns:
             result = row["results"].get(backend, {"status": "unavailable"})
@@ -55,39 +58,52 @@ def render(report):
                 values.append(result["status"] + (": " + result.get("error", "")[:110] if result.get("error") else ""))
         results = {k: v for k, v in row["results"].items() if report["mode"] != "weekly" or k != "tlx_ops_baseline"}
         winner = select_winner(results, row["target"]["timing"]["tie_fraction"])
-        lines.append("| " + " | ".join(cell(v) for v in [row["description"], *values, winner]) + " |")
+        lines.append("| " + " | ".join(cell(v) for v in [number, row["description"], *values, winner]) + " |")
     lines += [
         "",
         "Useful FLOPs exclude padded/masked work. Logical bytes count inputs and output once; they are not measured HBM traffic.",
         "Overlap between p20–p80 timing intervals or the configured minimum separation produces a tie.", "",
-        "## Reproducers", "", "Commands verify the saved source, compiler, runtime, and device pins before measuring.",
+        "</details>", "", "<details>", "<summary>Reproducers</summary>", "",
+        "Commands verify the saved source, compiler, runtime, and device pins before measuring.",
         "Keep the run directory and source revisions. A moved source checkout is rejected.", "",
-        "| Problem | " + " | ".join(columns) + " |", "| --- | " + " | ".join("---" for _ in columns) + " |"
+        "| # | " + " | ".join(columns) + " |", "| --- | " + " | ".join("---" for _ in columns) + " |"
     ]
-    for row in report["rows"]:
+    if report_path is not None:
+        command = shlex.join([sys.executable, str(ROOT / "appctl.py"), "reproduce", "--report", str(report_path)])
+        # Factor shared paths out of each cell. The report selects the exact saved request.
+        lines[-2:-2] = [
+            "Define this shell function once. Row numbers refer to the performance table.", "", "```bash",
+            'repro() { ' + command + ' --row "$1" --backend "$2"; }', "```", ""
+        ]
+    for number, row in enumerate(report["rows"], 1):
         values = []
         for backend in columns:
             result = row["results"].get(backend, {})
             command = result.get("reproducer_command", "unavailable")
+            if report_path is not None and result.get("reproducer"):
+                command = shlex.join(["repro", str(number), backend])
             values.append(f"`{command}`" if command != "unavailable" else command)
-        lines.append("| " + " | ".join(cell(v) for v in [row["description"], *values]) + " |")
+        lines.append("| " + " | ".join(cell(v) for v in [number, *values]) + " |")
     lines += [
-        "", "## Provenance and search coverage", "",
-        "| Backend / case | Source commit | Compiler hash | Variant | Dispatch | Evaluated |",
-        "| --- | --- | --- | --- | --- | --- |"
+        "", "</details>", "", "<details>", "<summary>Provenance and search coverage</summary>", "",
+        "Identical source and variant records are grouped. report.json retains the mapping for each case.", "",
+        "| Backend | Source commit | Compiler hash | Variant | Dispatch | Evaluated | Cases |",
+        "| --- | --- | --- | --- | --- | --- | --- |"
     ]
+    provenance = Counter()
     for row in report["rows"]:
         for backend, result in row["results"].items():
             if result.get("status") != "ok":
                 continue
-            lines.append("| " + " | ".join(
-                cell(v) for v in [
-                    f"{backend} / {row['case']['id']}", result["backend_pin"].get("git_sha")
-                    or "unknown (package hash in JSON)", result["runtime"]["compiler_sha256"][:16], result["candidate"]
-                    ["id"],
+            provenance[tuple(
+                str(v) for v in [
+                    backend, result["backend_pin"].get("git_sha") or "unknown (package hash in JSON)", result["runtime"]
+                    ["compiler_sha256"][:16], result["candidate"]["id"],
                     result.get("adapter_metadata", {}).get("implementation", "implementation defaults"),
                     f"{result.get('evaluated_candidates', 'weekly control')}; discovery {result.get('discovery_status', 'not_requested')}"
-                ]) + " |")
+                ])] += 1
+    for entry, count in provenance.items():
+        lines.append("| " + " | ".join(cell(v) for v in (*entry, count)) + " |")
     lines += [
         "",
         f"Candidate budget: {report['budget']}. Discovery and failed candidate details are in report.json and candidate logs.",
@@ -114,6 +130,7 @@ def render(report):
         lines += [f"Elapsed wall time: {report['elapsed_seconds']:.1f}s, including interruptions after resume.", ""]
     if report.get("resumed_cases"):
         lines += [f"Retained {report['resumed_cases']} completed cases from the same pinned campaign.", ""]
+    lines += ["</details>", ""]
     return "\n".join(lines)
 
 

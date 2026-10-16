@@ -32,8 +32,8 @@ exists, return no proposals. Unsupported is useful coverage information.
 Use feedback to stop investigating invalid or slower variants. Do not edit tutorial source,
 create new algorithms, or time calls in the discovery agent. The artifact adapter may select
 existing variants and launch parameters. A tuning proposal must cite the existing source caller
-that establishes its validity. The harness checks independent inputs and checks the selected
-winner in a fresh measurement process.
+that establishes its validity. The harness checks independent inputs and remeasures the selected winner.
+Persistent execution reuses the backend worker. Isolated execution starts a fresh process.
 
 ## ADDMM, shared-A BMM, and MXFP8 availability
 

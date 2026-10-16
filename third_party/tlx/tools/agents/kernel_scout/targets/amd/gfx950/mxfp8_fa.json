@@ -208,7 +208,6 @@
     }
   ],
   "source": {
-    "url": "https://github.com/facebookexperimental/triton/pull/3824",
     "merge_commit": "a05314cb02afddf4bd617eb072e7a2641b6de172",
     "suite": "gfx950_1",
     "suite_file": "third_party/tlx/ops/kernels/flash_attn_mxfp8/_shapes.py",
@@ -218,8 +217,8 @@
       "TLX quantizes Q/K/V inside every timed call. No pre-quantized kernel-only measurements.",
       "AITER and PyTorch are labeled BF16 attention references, not matching MXFP8 recipes.",
       "Scale 0.5, input standard deviation 0.5, and atol 0.2/rtol 0 follow the source benchmark.",
-      "CPU-seeded input bits are shared across backends. They do not reproduce the PR random seeds.",
-      "Useful causal FLOPs use exact triangular work. PR graph and clock-pinned timings are not imported.",
+      "CPU-seeded input bits are shared across backends.",
+      "Useful causal FLOPs count exact triangular work. Measurements use eager calls without clock changes.",
       "Scout also requires relative RMS output error at most 0.1 to reject trivial outputs under the absolute tolerance."
     ]
   }

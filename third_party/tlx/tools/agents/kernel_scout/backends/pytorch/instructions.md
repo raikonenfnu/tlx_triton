@@ -26,8 +26,8 @@ A useful competing variant pads to the actual batch maximum, builds a padding/ca
 executes batched SDPA, and extracts the packed result. Include padding, mask construction,
 and extraction in every timed call. Compare these strategies. Small batches and length variance
 can change the winner. Do not measure pre-padded inputs against a TLX packed-input call.
-PR #3921's padded reference prepared tensors outside timing and used graph timing for its
-performance table. Those numbers cannot be imported into this campaign.
+Pre-padding outside timing changes the input contract. Graph replay changes the timing contract.
+Neither measurement can serve as an eager packed-input control.
 
 Consider public torch.compile only as an explicitly labeled variant with its compiler/runtime
 pins and full semantics preserved. Compile and check it before timing, include graph breaks and

@@ -488,7 +488,7 @@ def run(args):
         report["complete"] = True
         write_json(directory / "progress.json", report)
         write_json(directory / "report.json", report)
-        (directory / "report.md").write_text(render(report))
+        (directory / "report.md").write_text(render(report, directory / "report.json"))
         if args.mode == "weekly":
             write_json(baseline_path, report)
         if args.report_pointer:
@@ -499,6 +499,16 @@ def run(args):
 
 
 def reproduce(args):
+    if getattr(args, "report", None):
+        report = read_json(args.report)
+        if args.row is None or not 1 <= args.row <= len(report["rows"]) or not args.backend:
+            raise ValueError("select a valid report row and backend")
+        result = report["rows"][args.row - 1]["results"].get(args.backend, {})
+        if not result.get("reproducer") or not result.get("request_sha256"):
+            raise ValueError("selected result has no verified reproducer")
+        args.request = Path(result["reproducer"])
+        if digest(read_json(args.request)) != result["request_sha256"]:
+            raise ValueError("saved reproducer differs from the report")
     request = read_json(args.request)
     if not request.get("expected_identity"):
         raise ValueError("request is not a verified reproducer")
@@ -563,7 +573,11 @@ def main():
     measure.add_argument("--worker-timeout", type=int, default=600)
     measure.add_argument("--execute", action="store_true")
     rep = sub.add_parser("reproduce")
-    rep.add_argument("--request", type=Path, required=True)
+    source = rep.add_mutually_exclusive_group(required=True)
+    source.add_argument("--request", type=Path)
+    source.add_argument("--report", type=Path, help="select a saved request from a report")
+    rep.add_argument("--row", type=int, help="one-based report row, used with --report")
+    rep.add_argument("--backend", help="report backend column, used with --report")
     rep.add_argument("--timeout", type=int, default=600)
     publication = sub.add_parser("publish")
     publication.add_argument("--report", type=Path, required=True)
@@ -594,10 +608,12 @@ def main():
             parser.error("budgets must be positive; rounds and GPU must be nonnegative")
         run(args)
     elif args.command == "reproduce":
+        if args.request and (args.row is not None or args.backend is not None):
+            parser.error("row and backend require --report")
         reproduce(args)
     else:
         report = read_json(args.report)
-        markdown = render(report)
+        markdown = render(report, args.report.resolve())
         if args.execute:
             print(publish(GitHub(args.repo), report, markdown)["html_url"])
         else:

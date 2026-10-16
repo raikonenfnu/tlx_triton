@@ -4,10 +4,9 @@ Kernel Scout compares existing kernel variants for the same workload across TLX 
 AITER, and PyTorch. It reports the best observed variant per backend, performance, source identity,
 and reproduction commands. Weekly reference measurements make nightly TLX progress cheaper to track.
 
-The first target is [FP16 variable-length attention](targets/amd/gfx950/varlen_f16_fa.json), from
-[PR #3921](https://github.com/facebookexperimental/triton/pull/3921). Its cases freeze the five
-`gfx950_1` focus shapes and realized lengths, plus a causal control. Other targets cover GEMM and
-BF16 dense attention. See [example output and measurement scope](https://github.com/raikonenfnu/tlx_triton/issues/27).
+The [gfx950 target index](targets/amd/gfx950/README.md) defines 60 attention and GEMM cases.
+Each JSON file contains the complete dimensions, layouts, input distribution, and numerical limits.
+The report contains collapsible performance, reproducer, and provenance sections in one message.
 
 ## Architecture
 
@@ -263,15 +262,16 @@ adapter, or device pins. Preserve original checkouts, environments, and artifact
 Publication is a separate command and previews by default:
 
 ```bash
-/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton
-/path/to/python appctl.py publish --report /path/to/run/report.json --repo raikonenfnu/tlx_triton --execute
+/path/to/python appctl.py publish --report /path/to/run/report.json --repo OWNER/REPOSITORY
+/path/to/python appctl.py publish --report /path/to/run/report.json --repo OWNER/REPOSITORY --execute
 ```
 
 Weekly publication checks the new owned issue before linking and closing previous campaign weeks.
 Nightly publication updates one dated comment on that week's open issue.
-Long reports use labeled continuation comments with repeated table headers and complete rows.
-Publication checks every part before closing a previous weekly issue.
-Retries update owned parts and mark obsolete continuations as superseded.
+Each report keeps its performance and reproducer tables in one message, inside collapsible sections.
+Publication verifies the complete message before closing a previous weekly issue.
+Oversized reports fail before publication. They remain available as complete local artifacts.
+Retries update the same message and mark older continuation comments as superseded.
 Local artifacts remain
 the detailed evidence. See [deployment instructions](deploy/README.md) for configuration, cron,
 optional source refresh, and failure handling. The runner measures before publishing and does not install cron or update Megabrain automatically.

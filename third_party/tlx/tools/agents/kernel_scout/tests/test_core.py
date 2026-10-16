@@ -72,16 +72,15 @@ def test_mxfp8_contract_rejects_incompatible_shapes(change, tmp_path):
         load_target(path)
 
 
-def test_issue_gemm_targets_preserve_operations_layouts_and_dtypes():
+def test_gemm_targets_preserve_operations_layouts_and_dtypes():
     counts = {}
     for filename, operation in [("a16w16_gemm.json", "mm"), ("a16w16_addmm.json", "addmm"), ("a16w16_bmm.json", "bmm")]:
         target = load_target(ROOT / "targets/amd/gfx950" / filename)
         assert target["operation"] == operation
         for case in target["cases"]:
-            if "source_issue" not in case:
+            if case["id"].startswith("square_"):
                 continue
-            issue = int(case["source_issue"].rsplit("/", 1)[1])
-            counts[(issue, operation, case["dtype"])] = counts.get((issue, operation, case["dtype"]), 0) + 1
+            counts[(operation, case["dtype"])] = counts.get((operation, case["dtype"]), 0) + 1
             if operation == "addmm":
                 assert (case["a_layout"], case["b_layout"], case["bias_layout"]) == ("row_major", "column_major",
                                                                                      "vector")
@@ -89,12 +88,9 @@ def test_issue_gemm_targets_preserve_operations_layouts_and_dtypes():
                 assert (case["batch"], case["m"], case["n"], case["k"], case["shared_a"]) == (3072, 448, 160, 931, True)
             if operation != "bmm":
                 assert case["a_std"] == case["k"]**-0.5 and case["b_std"] == case["n"]**-0.5
-    assert counts == {
-        (issue, operation, dtype): count
-        for (issue, operation
-             ), count in {(20, "mm"): 8, (20, "addmm"): 3, (21, "addmm"): 7, (21, "bmm"): 1, (22, "mm"): 2}.items()
-        for dtype in ("bfloat16", "float16")
-    }
+    assert counts == {(operation, dtype): count
+                      for operation, count in {"mm": 10, "addmm": 10, "bmm": 1}.items()
+                      for dtype in ("bfloat16", "float16")}
 
 
 def test_gemm_work_counts_shared_storage_and_bias():
@@ -633,59 +629,29 @@ def report(mode="weekly", week="2026-10-12", date="2026-10-14"):
     return {"campaign": "abc", "week": week, "date": date, "mode": mode, "device": {"arch": "gfx950"}}
 
 
-def test_long_report_split_preserves_unicode_rows_and_table_headers():
-    from publication import split_report
-
-    header = "| Problem | Command |\n| --- | --- |"
-    rows = [f"| case_{i} | `reproduce {'µ' * 20} {i}` |" for i in range(10)]
-    chunks = split_report("# Report\n\n" + header + "\n" + "\n".join(rows), max_bytes=240)
-    assert len(chunks) > 1
-    assert all(len(chunk.encode()) <= 240 for chunk in chunks)
-    joined = "\n".join(chunks)
-    assert all(joined.count(row) == 1 for row in rows)
-    assert all(header in chunk for chunk in chunks if "| case_" in chunk)
-
-
-def test_chunked_publication_is_idempotent_and_retires_stale_parts(monkeypatch):
-    import publication
-
-    monkeypatch.setattr(publication, "BODY_BYTES", 240)
-    header = "| Problem | Command |\n| --- | --- |"
-    markdown = "# Report\n\n" + header + "\n" + "\n".join(f"| case_{i} | {'x' * 70} |" for i in range(10))
-    api = FakeGitHub()
-    issue = publish(api, report(), markdown)
-    comments = len(api.comments)
-    assert comments > 1 and "continues" in issue["body"]
-    publish(api, report(), markdown)
-    assert len(api.issues) == 1 and len(api.comments) == comments
-    publish(api, report(mode="nightly"), markdown)
-    nightly_count = len(api.comments)
-    publish(api, report(mode="nightly"), markdown)
-    assert len(api.comments) == nightly_count
-    publish(api, report(mode="nightly"), "short report")
-    nightly_parts = [c for c in api.comments.values() if "mode=nightly;" in c["body"]]
-    assert all("superseded" in c["body"] for c in nightly_parts)
-    assert all("case_" in c["body"] for c in api.comments.values() if "mode=weekly;" in c["body"])
-
-
-def test_failed_continuation_check_does_not_close_previous_week(monkeypatch):
+def test_oversized_report_fails_before_publication(monkeypatch):
     import publication
 
     monkeypatch.setattr(publication, "BODY_BYTES", 50)
     api = FakeGitHub()
     old = publish(api, report(week="2026-10-05"), "old")
-    original = api.request
-
-    def request(method, resource, payload=None):
-        result = original(method, resource, payload)
-        if method == "GET" and resource.startswith("issues/comments/"):
-            result["body"] = "corrupted"
-        return result
-
-    monkeypatch.setattr(api, "request", request)
-    with pytest.raises(RuntimeError, match="read-after-write"):
-        publish(api, report(), "a" * 40 + "\n\n" + "b" * 40)
+    events = list(api.events)
+    with pytest.raises(ValueError, match="single-message"):
+        publish(api, report(), "µ" * 26)
+    assert api.events == events
     assert api.issues[old["number"]]["state"] == "open"
+
+
+def test_single_message_retires_old_continuations():
+    api = FakeGitHub()
+    issue = publish(api, report(), "weekly")
+    marker = "<!-- tlx-kernel-scout:campaign=abc;week=2026-10-12;mode=nightly;date=2026-10-14;part=2 -->"
+    api.request("POST", f"issues/{issue['number']}/comments", {"body": marker + "old part"})
+    publish(api, report(mode="nightly"), "<details><summary>Performance and reproducers</summary>tables</details>")
+    publish(api, report(mode="nightly"), "updated tables")
+    assert len(api.comments) == 2
+    assert "superseded" in api.comments[1]["body"]
+    assert "updated tables" in api.comments[2]["body"]
 
 
 def test_publication_rotation_and_daily_upsert():
@@ -1813,3 +1779,71 @@ def test_registration_controller_never_creates_a_baseline(tmp_path, monkeypatch,
     assert receipt["ready"] is not failed
     with pytest.raises(ValueError, match="only weekly and nightly"):
         publish(None, recorded, "registration")
+
+
+def test_compact_report_keeps_sixty_cases_in_one_message(tmp_path):
+    from publication import BODY_BYTES
+    from reporting import render
+
+    r = report()
+    columns = ["tlx_ops", "tlx_tutorials", "aiter", "pytorch", "tlx_ops_baseline"]
+    r.update(device={"name": "AMD GPU", "arch": "gfx950", "physical_gpu": 6}, provider="builtin", columns=columns,
+             budget={}, rows=[])
+    for i in range(60):
+        results = {
+            backend: {
+                **measurement(1), "tflops": 100, "candidate": {"id": "public_api"}, "backend_pin":
+                {"git_sha": "a" * 40}, "runtime": {"compiler_sha256": "b" * 64}, "reproducer":
+                str(tmp_path / f"case_{i}" / backend / "request.json")
+            }
+            for backend in columns
+        }
+        r["rows"].append({
+            "description": f"case_{i}: " + "shape " * 25, "case": {"id": f"case_{i}"}, "target":
+            {"metric": "compute", "timing": {"tie_fraction": 0.03}}, "results": results
+        })
+    text = render(r, tmp_path / "report with spaces.json")
+    assert len(text.encode()) < BODY_BYTES
+    assert text.count("<details>") == text.count("</details>") == 3
+    assert "<summary>Performance</summary>" in text and "<summary>Reproducers</summary>" in text
+    assert "'" + str(tmp_path / "report with spaces.json") + "'" in text
+    for i in range(60):
+        assert f"case_{i}:" in text
+        for backend in columns:
+            assert f"`repro {i + 1} {backend}`" in text
+    api = FakeGitHub()
+    publish(api, r, text)
+    publish(api, {**r, "mode": "nightly"}, text)
+    assert len(api.comments) == 1 and text in api.comments[1]["body"]
+
+
+@pytest.mark.parametrize("change", [None, "request", "row", "backend", "missing"])
+def test_report_reproducer_selects_exact_saved_request(tmp_path, monkeypatch, change):
+    import appctl
+
+    request = {
+        "expected_identity": {"source": "pinned"}, "worker_runtime": {"python": "/backend/python"}, "physical_gpu": 6
+    }
+    path = tmp_path / "request with spaces.json"
+    write_json(path, request)
+    r = {"rows": [{"results": {"aiter": {"reproducer": str(path), "request_sha256": digest(request)}}}]}
+    report_path = tmp_path / "report.json"
+    if change == "missing":
+        r["rows"][0]["results"]["aiter"].pop("reproducer")
+    write_json(report_path, r)
+    if change == "request":
+        write_json(path, {**request, "physical_gpu": 5})
+    args = SimpleNamespace(report=report_path, row=0 if change == "row" else 1,
+                           backend="unknown" if change == "backend" else "aiter", request=None, timeout=20)
+    calls = []
+    monkeypatch.setattr(appctl, "worker_environment", lambda gpu, runtime: {})
+    monkeypatch.setattr(appctl, "execute", lambda argv, **kw: calls.append(argv) or 0)
+    import contextlib
+    monkeypatch.setattr(appctl, "locked", lambda path: contextlib.nullcontext())
+    if change:
+        with pytest.raises(ValueError):
+            appctl.reproduce(args)
+        assert not calls
+    else:
+        appctl.reproduce(args)
+        assert calls[0][0] == "/backend/python" and calls[0][2] == str(path)

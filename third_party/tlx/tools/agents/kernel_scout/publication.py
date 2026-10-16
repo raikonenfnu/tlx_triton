@@ -8,41 +8,6 @@ REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 BODY_BYTES = 60_000  # Leave room for ownership markers below GitHub's comment limit.
 
 
-def split_report(markdown, max_bytes=BODY_BYTES):
-    """Split paragraphs and long tables without truncating rows or commands."""
-    if len(markdown.encode()) <= max_bytes:
-        return [markdown]
-    blocks = []
-    for paragraph in markdown.split("\n\n"):
-        if len(paragraph.encode()) <= max_bytes:
-            blocks.append(paragraph)
-            continue
-        lines = paragraph.splitlines()
-        if len(lines) < 3 or not lines[0].startswith("|") or not lines[1].startswith("| ---"):
-            raise ValueError("a report paragraph exceeds the publication limit")
-        header = "\n".join(lines[:2])
-        fragment = header
-        for row in lines[2:]:
-            if len((header + "\n" + row).encode()) > max_bytes:
-                raise ValueError("a report table row exceeds the publication limit")
-            if len((fragment + "\n" + row).encode()) > max_bytes:
-                blocks.append(fragment)
-                fragment = header
-            fragment += "\n" + row
-        blocks.append(fragment)
-    chunks, current = [], ""
-    for block in blocks:
-        combined = current + "\n\n" + block if current else block
-        if len(combined.encode()) > max_bytes:
-            chunks.append(current)
-            current = block
-        else:
-            current = combined
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 def upsert_comment(api, issue, comments, marker, body):
     matches = [c for c in comments if marker in (c.get("body") or "")]
     if len(matches) > 1:
@@ -57,26 +22,19 @@ def upsert_comment(api, issue, comments, marker, body):
     return verified
 
 
-def publish_continuations(api, issue, report, chunks, comments):
+def retire_continuations(api, issue, report, comments):
     prefix = (f"<!-- tlx-kernel-scout:campaign={report['campaign']};week={report['week']};"
               f"mode={report['mode']};")
     if report["mode"] == "nightly":
         prefix += f"date={report['date']};"
     prefix += "part="
-    active = set()
-    for number, chunk in enumerate(chunks[1:], 2):
-        marker = f"{prefix}{number} -->"
-        active.add(marker)
-        body = marker + f"\n{report['mode'].capitalize()} report continuation {number} of {len(chunks)}.\n\n" + chunk
-        upsert_comment(api, issue, comments, marker, body)
     for previous in comments:
         body = previous.get("body") or ""
         if not body.startswith(prefix):
             continue
         marker = body.split(" -->", 1)[0] + " -->"
-        if marker not in active:
-            upsert_comment(api, issue, comments, marker,
-                           marker + "\nThis continuation is superseded by the current report.")
+        upsert_comment(api, issue, comments, marker,
+                       marker + "\nThis continuation is superseded by the current report.")
 
 
 class GitHub:
@@ -120,10 +78,9 @@ def publish(api, report, markdown):
             for row in report.get("rows", [])
             for result in row["results"].values()):
         raise ValueError("screening timings cannot be published as final performance")
-    chunks = split_report(markdown, BODY_BYTES)
-    first = chunks[0]
-    if len(chunks) > 1:
-        first += f"\n\nThis report continues in {len(chunks) - 1} labeled comments below."
+    if len(markdown.encode()) > BODY_BYTES:
+        raise ValueError("report exceeds the single-message publication limit; keep the full local report")
+    first = markdown
     campaign, week = report["campaign"], report["week"]
     prefix = f"<!-- tlx-kernel-scout:campaign={campaign};week="
     marker = f"{prefix}{week} -->"
@@ -142,7 +99,7 @@ def publish(api, report, markdown):
         if verified.get("body") != body or verified.get("state") != "open":
             raise RuntimeError("new weekly issue was not verified; previous issues remain open")
         comments = api.all(f"issues/{issue['number']}/comments")
-        publish_continuations(api, issue["number"], report, chunks, comments)
+        retire_continuations(api, issue["number"], report, comments)
         for previous in issues:
             if previous["number"] == issue["number"] or previous["state"] != "open":
                 continue
@@ -166,5 +123,5 @@ def publish(api, report, markdown):
     body = daily + "\n" + first
     comments = api.all(f"issues/{issue['number']}/comments")
     verified = upsert_comment(api, issue["number"], comments, daily, body)
-    publish_continuations(api, issue["number"], report, chunks, comments)
+    retire_continuations(api, issue["number"], report, comments)
     return verified

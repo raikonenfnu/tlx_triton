@@ -14,7 +14,7 @@ Create an absolute-path configuration outside the source checkout:
   "pythonpath": "/path/to/triton/python:/path/to/torch/site-packages",
   "targets": ["/path/to/triton/third_party/tlx/tools/agents/kernel_scout/targets/amd/gfx950/varlen_f16_fa.json"],
   "state": "/path/to/scout-state",
-  "repository": "raikonenfnu/tlx_triton",
+  "repository": "OWNER/REPOSITORY",
   "gpu": 0,
   "gpu_wait_seconds": 1800,
   "gpu_poll_seconds": 60,
@@ -108,5 +108,5 @@ publication. Publication checks a new weekly issue before linking and closing ea
 issues. Nightly updates one dated comment. Re-running publish is idempotent. Unrelated issues
 are excluded by campaign ownership markers. Raw logs, adapters, and reproducer requests remain
 local. Archive run directories separately if reports need to be reproduced on another machine.
-Long reports continue in labeled, verified comments without truncating table rows or reproducer commands.
-Publication retries update the owned parts. Obsolete continuation comments receive a superseded notice.
+Each report uses one message with collapsible tables. Oversized reports fail before publication and remain complete local artifacts.
+Publication retries update the same message. Older continuation comments receive a superseded notice.

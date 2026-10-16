@@ -38,7 +38,7 @@ Use eager `triton.testing.do_bench` for all backends. `warmup` and `rep` are mil
 Compile and autotune before recorded samples. Use identical warmup, repetition, quantiles,
 and independent repeats. This function clears cache before measured calls. Label the protocol
 accordingly. Do not compare these results with graph replay, hot-cache batches, profiler timing,
-or numbers copied from a PR. Graph timing needs a separate campaign and a separate harness contract.
+or historical measurements. Graph timing needs a separate campaign and a separate harness contract.
 Check device ownership before and after measurement. The harness does not change clocks.
 An idle device check cannot rule out power, temperature, or another job arriving between checks. Record unstable samples and investigate them before claiming a win.
 

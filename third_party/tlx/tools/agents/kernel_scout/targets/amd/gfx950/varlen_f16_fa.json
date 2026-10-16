@@ -217,10 +217,9 @@
     }
   ],
   "source": {
-    "pull_request": "https://github.com/facebookexperimental/triton/pull/3921",
-    "pr_head": "b156bb028b28d117646323ba8357afea74b20b7d",
     "shape_suite": "gfx950_1",
     "shape_source_commit": "302d051fee248e3ccff6d768d915ac43e449b5ee",
-    "notes": "Five original noncausal focus shapes plus a causal control. Exact realized lengths are frozen. PR graph/BF16 numbers are not comparison data."
+    "notes": "Five noncausal focus shapes plus a causal control. Exact realized lengths are frozen. All backends measure eager FP16 calls.",
+    "suite_file": "third_party/tlx/ops/kernels/flash_attn_varlen/_shapes.py"
   }
 }
