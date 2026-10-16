@@ -953,6 +953,98 @@ def test_kfd_ownership_finds_queues_and_vram(tmp_path):
     assert kfd_owners(tmp_path, 111) == set()
 
 
+@pytest.fixture
+def amd_ownership(tmp_path, monkeypatch):
+    from benchmarking import environment
+
+    info = {
+        "pid": 101, "memory_usage": {"vram_mem": {"value": 84000, "unit": "B"}}, "usage":
+        {"gfx": {"value": 0, "unit": "ns"}, "enc": {"value": 0, "unit":
+                                                    "ns"}}, "sdma_usage": {"value": 0, "unit": "us"}, "cu_occupancy": 0
+    }
+    entries = [{"gpu": 6, "process_list": [{"process_info": info}]}]
+    monkeypatch.setattr(environment, "command", lambda args: json.dumps(entries))
+    monkeypatch.setattr(environment, "Path", lambda path: tmp_path)
+    return info, entries, {"vendor": "amd", "physical_gpu": 6, "kfd_id": 999}
+
+
+def test_amd_idle_context_on_unowned_device(amd_ownership, tmp_path):
+    from benchmarking.environment import assert_idle
+
+    _, _, device = amd_ownership
+    # The same process can own another GPU while retaining an idle context here.
+    queue = tmp_path / "101/queues/0"
+    queue.mkdir(parents=True)
+    (queue / "gpuid").write_text("111")
+    (tmp_path / "101/vram_111").write_text("4096")
+    (tmp_path / "101/vram_999").write_text("0")
+    assert_idle(device)
+
+
+@pytest.mark.parametrize("smi_empty", [False, True])
+@pytest.mark.parametrize("owner", ["queue", "vram"])
+def test_amd_kfd_owner_blocks_even_with_idle_smi(amd_ownership, tmp_path, owner, smi_empty):
+    from benchmarking.environment import GPUOccupiedError, assert_idle
+
+    _, entries, device = amd_ownership
+    if smi_empty:
+        entries[0]["process_list"] = [{"process_info": "No running processes detected"}]
+    if owner == "queue":
+        queue = tmp_path / "101/queues/0"
+        queue.mkdir(parents=True)
+        (queue / "gpuid").write_text("999")
+    else:
+        (tmp_path / "101").mkdir()
+        (tmp_path / "101/vram_999").write_text("1")
+    with pytest.raises(GPUOccupiedError, match="101"):
+        assert_idle(device)
+    assert_idle(device, allowed_pids=[101])
+
+
+@pytest.mark.parametrize("change", [
+    lambda i: i["memory_usage"]["vram_mem"].update(value=1024 * 1024 + 1),
+    lambda i: i["memory_usage"]["vram_mem"].update(value=-1),
+    lambda i: i["memory_usage"]["vram_mem"].update(value="N/A"),
+    lambda i: i["memory_usage"]["vram_mem"].update(value=False),
+    lambda i: i["memory_usage"]["vram_mem"].update(unit="MB"),
+    lambda i: i.pop("memory_usage"),
+    lambda i: i["usage"]["gfx"].update(value=1),
+    lambda i: i["usage"]["enc"].update(value=1),
+    lambda i: i["usage"]["gfx"].update(unit="unknown"),
+    lambda i: i["usage"].pop("gfx"),
+    lambda i: i["sdma_usage"].update(value=1),
+    lambda i: i.pop("sdma_usage"),
+    lambda i: i.update(cu_occupancy=1),
+    lambda i: i.update(cu_occupancy="N/A"),
+    lambda i: i.update(cu_occupancy=False),
+])
+def test_amd_smi_activity_or_unknown_telemetry_blocks(amd_ownership, change):
+    from benchmarking.environment import GPUOccupiedError, assert_idle
+
+    info, _, device = amd_ownership
+    change(info)
+    with pytest.raises(GPUOccupiedError, match="101"):
+        assert_idle(device)
+
+
+def test_amd_idle_context_requires_kfd_inspection(amd_ownership, tmp_path, monkeypatch):
+    from benchmarking import environment
+
+    _, _, device = amd_ownership
+    monkeypatch.setattr(environment, "Path", lambda path: tmp_path / "missing")
+    with pytest.raises(RuntimeError, match="KFD process ownership is unavailable"):
+        environment.assert_idle(device)
+
+    monkeypatch.setattr(environment, "Path", lambda path: tmp_path)
+
+    def denied(*args):
+        raise PermissionError("cannot read KFD ownership")
+
+    monkeypatch.setattr(environment, "kfd_owners", denied)
+    with pytest.raises(PermissionError, match="cannot read KFD"):
+        environment.assert_idle(device)
+
+
 def test_scout_confirms_selected_candidate_and_records_blocked_search(tmp_path, monkeypatch, target):
     from types import SimpleNamespace
 

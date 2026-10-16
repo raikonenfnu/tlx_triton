@@ -64,6 +64,11 @@ The GPU supervisor checks ownership immediately, then once per minute for up to 
 Runtime probes share this deadline and retry if another process occupies the GPU during startup.
 The probe checks ownership before and after runtime fingerprinting.
 AMD checks use both AMD SMI and KFD ownership. NVIDIA checks use NVIDIA SMI ownership.
+AMD SMI can list small runtime contexts on GPUs that a process does not use.
+Scout permits these contexts only when reported VRAM is at most 1 MiB and all reported activity counters are zero.
+The required counters are graphics, encoding, SDMA, and CU occupancy. Missing fields or unknown units block admission.
+Any KFD queue or nonzero KFD VRAM allocation on the selected GPU still blocks admission, regardless of SMI readings.
+These checks run before and after measurement. They do not reserve the GPU against future jobs.
 An idle GPU starts measurement automatically. A busy GPU at the deadline fails the job without publication.
 Inspection errors fail immediately. The supervisor does not stop other jobs or change clocks.
 Each run stores supervisor state and check counts in `gpu_admission.json`.

@@ -9,6 +9,10 @@ import subprocess
 from functools import cache
 from pathlib import Path
 
+# ROCm enumeration can leave small DRM allocations on devices with no KFD owner.
+# Observed idle contexts used 48–84 KB on gfx950. Larger allocations stay blocked.
+AMD_IDLE_CONTEXT_VRAM_BYTES = 1024 * 1024
+
 
 class GPUOccupiedError(RuntimeError):
     """A selected GPU has another process that prevents exclusive measurement."""
@@ -144,6 +148,21 @@ def kfd_owners(process_root, gpu_id):
     return owners
 
 
+def amd_idle_context(info):
+    """Recognize small, inactive SMI contexts. KFD ownership must be checked separately."""
+    try:
+        memory = info["memory_usage"]["vram_mem"]
+        if (memory["unit"] != "B" or type(memory["value"]) not in (int, float)
+                or not 0 <= memory["value"] <= AMD_IDLE_CONTEXT_VRAM_BYTES):
+            return False
+        counters = [(info["usage"]["gfx"], "ns"), (info["usage"]["enc"], "ns"), (info["sdma_usage"], "us")]
+        values = [info["cu_occupancy"], *(c["value"] for c, _ in counters)]
+        return (all(type(value) in (int, float) and value == 0 for value in values)
+                and all(c["unit"] == unit for c, unit in counters))
+    except (KeyError, TypeError):
+        return False  # Missing or unknown telemetry cannot establish an idle context.
+
+
 def assert_idle(device, *, allowed_pids=()):
     """Refuse an occupied device; do not change another job's clocks or processes."""
     physical = device["physical_gpu"]
@@ -159,7 +178,10 @@ def assert_idle(device, *, allowed_pids=()):
             info = row.get("process_info", row)
             if not isinstance(info, dict) or "pid" not in info:
                 raise RuntimeError(f"unrecognized AMD process record: {row}")
-            pids.append(int(info["pid"]))
+            pid = int(info["pid"])
+            if not amd_idle_context(info):
+                pids.append(pid)
+        # KFD queues and allocations always count, even for small SMI contexts.
         # KFD also exposes owners when the management API reports no processes.
         kfd = Path("/sys/class/kfd/kfd/proc")
         if not kfd.is_dir():
@@ -169,7 +191,7 @@ def assert_idle(device, *, allowed_pids=()):
         uuid = command(["nvidia-smi", "-i", str(physical), "--query-gpu=uuid", "--format=csv,noheader"])
         rows = command(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"]).splitlines()
         pids = [int(row.split(",")[1]) for row in rows if row.split(",")[0].strip() == uuid]
-    foreign = [pid for pid in pids if pid != os.getpid() and pid not in allowed_pids]
+    foreign = sorted({pid for pid in pids if pid != os.getpid() and pid not in allowed_pids})
     if foreign:
         raise GPUOccupiedError(f"selected GPU has external processes: {foreign}")
 

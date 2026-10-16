@@ -195,7 +195,9 @@ Torch Inductor compiler pools shut down after warmup and before timing. Compiler
 Inductor compilation uses one thread by default because GPU requests are serial.
 Set `TORCHINDUCTOR_COMPILE_THREADS` before starting Scout to override this limit. Scout records the value for runtime compatibility.
 The controller removes shared input files after each case. Reproducers regenerate them in temporary storage.
-The GPU check permits only the controller's own live, idle peer workers to retain contexts.
+The GPU check permits the controller's own live, idle peer workers to retain contexts.
+AMD also permits small, inactive runtime contexts when KFD shows no ownership on the selected GPU.
+See the [admission criteria](deploy/README.md) for the required telemetry and allocation limit.
 It still rejects all other GPU owners. The controller never runs two measurement requests simultaneously.
 Source and harness checks run between cases and before report completion. Failed verification prevents baseline creation and publication.
 Infrastructure failures abort the campaign. A case without a stable correct backend prevents baseline creation.
