@@ -1,0 +1,165 @@
+Short-KV MXFP8 attention: roofline and optimization analysis
+2026-11-13 UTC
+
+Outcome
+No large fixed-shape kernel gain was validated. The current winning worktree was kept unchanged.
+A metadata-carry prototype improves the ten short shapes by 1.065% on GPU 1 and 0.850% on GPU 0.
+Its output and LSE are bitwise identical on these tested seed-7 shapes. One GPU-0 case regresses 0.27%.
+This prototype remains experimental: other seeds, BF16-Q, other tile sizes and long KV were not validated.
+The previous estimate of almost 2x short-KV headroom used the 4-GiB streaming read ceiling.
+Size-matched paired references give a much smaller gap under the measured protocol.
+
+Matched reference
+Known inputs: same PR batch-432 H4/D128 short shapes, prepared E4M3 Q/K/V and E8M0 scales.
+Attention uses the existing balanced persistent schedule, BM128 and 512 CTAs, exact-exp policy.
+Read reference loads as many bytes as the earlier calibrated FetchSize estimate for each shape.
+It reads uint32 words and stores only a per-block checksum. All checksums are verified.
+Both runners use the same 256-MiB cache flush and alternating 50 samples x 3 rounds.
+A preceding independent 0.610-ms GPU compute kernel keeps the queue occupied while the host submits
+flush/start/kernel/end. It is outside the measured interval and does not access attention inputs.
+Adding this guard changes the representative paired timings by less than 0.4%.
+This argues against host submission gaps as the main cause of the lower short-call rate.
+
+Per-shape paired results
+case | attention_us | matched_read_us | read_rate_fraction | 8x_batch_throughput_gain | batch8_us_per_original
+control_short_0 | 133.64 | 114.64 | 85.78% | 1.3281x | 103.72
+control_short_1 | 142.94 | 123.90 | 86.68% | 1.2590x | 117.39
+control_short_2 | 130.18 | 111.22 | 85.44% | 1.3261x | 100.69
+control_short_3 | 145.50 | 129.00 | 88.66% | 1.2729x | 119.98
+control_short_4 | 132.68 | 112.40 | 84.71% | 1.2941x | 105.36
+candidate_short_0 | 134.10 | 114.94 | 85.71% | 1.3386x | 103.02
+candidate_short_1 | 130.90 | 111.32 | 85.04% | 1.3423x | 99.32
+candidate_short_2 | 131.66 | 111.84 | 84.95% | 1.3515x | 101.75
+candidate_short_3 | 131.60 | 111.76 | 84.92% | 1.3455x | 102.43
+candidate_short_4 | 132.20 | 112.40 | 85.02% | 1.3222x | 105.27
+
+Geometric-mean matched-read fraction: 85.68%.
+This is an empirical reference ratio, not a proven physical hardware utilization percentage.
+Attention also writes BF16 output and FP32 LSE; the reference stores a small checksum only.
+Captured bytes use the previous locally calibrated 2x FetchSize correction; it is not a universal metric fix.
+
+Why the read reference matters
+Cold uint8 streaming read calibration: 256 MiB 2.87 TB/s, 320 MiB 3.11 TB/s, 384 MiB 3.32 TB/s.
+Cold uint32 read calibration on the second GPU: 256 MiB 2.89 TB/s, 320 MiB 3.12 TB/s,
+384 MiB 3.35 TB/s, 1 GiB 4.34 TB/s and 4 GiB 5.04 TB/s.
+Byte unpack/reduction overhead therefore does not explain the size dependence.
+A linear fit to the best uint32 times has a 43.95-us intercept and 5.31-TB/s asymptotic slope.
+That fit is descriptive. It does not identify a hardware pipeline stage or prove an unavoidable cost.
+A further paired sweep uses 4-, 32-, 128- and 256-KiB read blocks and 4/8 warps.
+Best control_short_1 read reference is 121.86 us vs attention 143.58 us (84.9%).
+Best candidate_short_4 read reference is 108.60 us vs attention 128.00 us (84.8%).
+The small-call reference remains substantially below the 4-GiB throughput after this sweep.
+Applying the 5.1-TB/s large-stream figure to a roughly 350-MB short call overstates demonstrated headroom.
+
+ATT findings
+Both baseline captures pass automatic viewer-bundle validation. The metadata-carry capture also passes.
+rocprofv3 /opt/rocm-7.2.1/bin/rocprofv3; external official decoder 0.1.6.
+Decoder directory /home/stwinata/nod/tlx_work/tmp/pr4683/att_tools/decoder/opt/rocm/lib
+All collection, validation and packaging use .agents/skills/amd-att-trace/scripts/att_trace.py.
+Kernel regex _mxfp8_varlen_kernel; matching dispatch 4 after 3 warmups; CU0, SE mask0x1, SIMD mask0xF.
+Baseline traces use GPU0 UUID GPU-49b26f9df75a3f63. Carry trace uses GPU1 UUID GPU-0274a6afb9b94834.
+Baseline resident-wave occupancy: control_short_1 94.71%, candidate_short_4 93.45% of observed peak
+in the traced shader engine eight CUs. These are neither full-GPU nor MFMA utilization numbers.
+The baseline has substantial sampled stalls at vmcnt waits associated with:
+  - ItemTile -> sequence -> prefix offsets and K/V pointers, including next-item prefetch.
+  - Q payload and scale loads near the first QK stage.
+  - K/V tile completion before the following MFMA stage.
+The short workload has few tile iterations, so startup and epilogue costs amortize poorly.
+Slow exact-exp softmax is retained; enabling the existing approximate fast-exp globally had earlier
+added short-shape accuracy failures. Accuracy was not relaxed to get a performance result.
+On the selected control trace, sampled scalar global-load hits fall from 416 to 368 with carry metadata,
+while sampled exp hits stay at 14144. This supports the removed metadata reload mechanism.
+Captures are on different GPUs; do not compare their cycle totals as a paired performance result.
+Per-wave stalls overlap and must not be summed as whole-GPU runtime fractions.
+
+Hypotheses tested and geometric-mean speedups (1.0 is neutral)
+Unchanged numerical recipe, prepared operands and schedules except the explicit one-item grid test:
+short_hypotheses_gpu1: 4 shapes; all tested outputs/LSE bitwise equal = True
+  short_skip_final: 0.99055x
+  short_descriptors: 0.98513x
+  short_descriptors_skip: 0.99128x
+  short_single: 0.95426x
+  short_scale_log: 0.96209x
+short_backend_screen_gpu1: 4 shapes; all tested outputs/LSE bitwise equal = True
+  short_agpr: 0.91947x
+  short_tree: 0.95023x
+  short_sink: 0.93184x
+  short_free_sched: 0.97862x
+  short_free_agpr: 0.91596x
+short_q_overlap_gpu1: 10 shapes; all tested outputs/LSE bitwise equal = True
+  short_q_overlap: 1.00134x
+short_graph_hypotheses_gpu0: 10 shapes; all tested outputs/LSE bitwise equal = True
+  short_skip_final: 1.00215x
+  short_descriptors: 0.99124x
+  short_descriptors_skip: 0.99252x
+  short_single: 0.99125x
+  short_scale_log: 0.96861x
+short_q_packing_gpu0: 4 shapes; all tested outputs/LSE bitwise equal = True
+  short_packed_qscale: 1.00640x
+  short_full_q: 0.78502x
+  short_full_q_packed: 0.72482x
+short_packed_confirm_gpu1: 10 shapes; all tested outputs/LSE bitwise equal = True
+  short_packed_qscale: 1.00106x
+  short_packed_overlap: 1.00066x
+short_carry_metadata_gpu1: 10 shapes; all tested outputs/LSE bitwise equal = True
+  short_carry_metadata: 1.01065x
+short_carry_confirm_gpu0: 10 shapes; all tested outputs/LSE bitwise equal = True
+  short_carry_metadata: 1.00850x
+The apparent initial 0.6% packed-Q-scale gain shrinks to 0.1% in the full ten-shape confirmation.
+Predecoded descriptors, redundant-final-prefetch removal, a single item per workgroup, exponent-scale
+log arithmetic, AGPR enablement, reduction-tree changes, spill sinking, relaxing compiler scheduling
+barriers, wider Q loads, and Q-prefetch reordering did not provide a consistent worthwhile gain.
+No synchronization waits were removed from the correctness contract.
+Graph replay was slower by about 5-8 us in the paired read/attention test on this stack.
+ROCm rejected external captured event timing. Internal captured events also could not provide valid
+elapsed-time handles. Those failed attempts are logged; the queue-prefix test avoids that limitation.
+
+A practical way to raise throughput when independent work is available
+Packing eight independent copies into a single packed-varlen call raises batch432 to3456.
+Throughput gain is 1.3177x geometric mean across all ten short shapes,
+range 1.2590..1.3515x.
+All eight outputs and LSE equal the original output/LSE repeated, bit for bit.
+It is a changed workload, not a fixed-shape kernel speedup. Call latency increases to about 0.8-1.0 ms.
+Use it only when independent requests can be batched and the latency tradeoff is acceptable.
+The 1/2/4/8 scaling experiment fits approximately 45-49 us of intercept plus a per-batch term.
+That is evidence for amortization; it does not identify the intercept with one hardware mechanism.
+Batching dependent attention layers is not an equivalent transformation.
+
+Next kernel methods
+Carry metadata is a small, reviewable candidate. It needs full edge-case and accuracy validation before adoption.
+For more substantial gains, investigate producer/consumer overlap that increases outstanding memory work
+without increasing LDS/VGPR footprint enough to reduce residency, and faster softmax that meets accuracy gates.
+Reducing tile size alone previously lost latency hiding: the K/V LDS footprint stayed large while each CTA had fewer warps.
+Any redesigned small-query path must change operand buffering/occupancy along with tile geometry.
+Benchmark a size-matched memory reference and report latency/useful work alongside bandwidth, so redundant
+reads are not mistaken for progress toward a meaningful roofline.
+
+Artifacts and reproduction
+No changes from these experiments were promoted to /home/stwinata/nod/tlx_work/tmp/pr4683_source.
+Experimental metadata-carry patch: /home/stwinata/nod/tlx_work/tmp/pr4683/short_carry_metadata.experimental.patch
+Data short_attention_analysis.json/.csv; plot short_attention_analysis.png.
+source /home/stwinata/nod/tlx_work/tmp/pr4683/env.sh
+python /home/stwinata/nod/tlx_work/tmp/pr4683/compare_short_matched_all.py
+python /home/stwinata/nod/tlx_work/tmp/pr4683/bench_short.py --kfd-id 39903 --all-short --variant short_carry_metadata --samples 100 --rounds 3 --warmups 15 --json /tmp/short_carry_new.json
+python /home/stwinata/nod/tlx_work/tmp/pr4683/short_batch_scaling.py --all-short --multiplier 1 --multiplier 8 --json /tmp/short_batch_new.json
+
+
+Validated full ATT bundles
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_control1
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_control1/ui_output_agent_64167_dispatch_36
+Selected fourth matching dispatch: global 36
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_control1.tar.gz
+SHA256 ed66d1cee3c581dd0e22c99852c2538ed09cb716f8444874afadcf1c35f0297f
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_candidate4
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_candidate4/ui_output_agent_33453_dispatch_36
+Selected fourth matching dispatch: global 36
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_base_candidate4.tar.gz
+SHA256 bbdd6525fac65ee1f1434553a1599d388f1922b4186475c97af47c2ca68db947
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_carry_control1_gpu1
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_carry_control1_gpu1/ui_output_agent_48732_dispatch_30
+Selected fourth matching dispatch: global 30
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/short_carry_control1_gpu1.tar.gz
+SHA256 936ca603c355d0b1e1c82b314097628a0729e48980f0101b39e0e29d18b101dc

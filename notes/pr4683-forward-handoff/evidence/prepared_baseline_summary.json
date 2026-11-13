@@ -1,0 +1,16 @@
+{
+  "short": {
+    "baseline_TBps": 2.6307718061914858,
+    "after_TBps": 2.819964513772681,
+    "optimization_speedup": 1.0719152862806012,
+    "prepared_q_only_speedup": 1.0230098392411264,
+    "other_gpu_confirmation_speedup": 1.0768200476392362
+  },
+  "long": {
+    "baseline_TBps": 3.107286227353959,
+    "after_TBps": 5.138452138664784,
+    "optimization_speedup": 1.6536784070389565,
+    "prepared_q_only_speedup": 1.0101405989215757,
+    "other_gpu_confirmation_speedup": 1.6455575826796802
+  }
+}

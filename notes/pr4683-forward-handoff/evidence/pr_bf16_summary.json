@@ -1,0 +1,12 @@
+{
+  "short": {
+    "bf16_speedup_over_original": 1.0315277132373926,
+    "aiter_over_pr_bf16": 1.2989691084602493,
+    "prepared_speedup_over_pr_bf16": 2.517852155126142
+  },
+  "long": {
+    "bf16_speedup_over_original": 1.2614750100575807,
+    "aiter_over_pr_bf16": 0.7670642278470112,
+    "prepared_speedup_over_pr_bf16": 3.3499841922167697
+  }
+}

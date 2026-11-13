@@ -1,0 +1,165 @@
+Persistent MXFP8 attention scheduling experiment
+2026-11-13 UTC
+
+Outcome
+Cost-balanced static assignment improves the prepared MXFP8 core. No atomic work queue is used.
+It is opt-in, with a reusable schedule built from known CPU sequence lengths.
+All arithmetic, precision, async waits and output ownership stay the same.
+The previous static assignment leaves long-KV workgroups with very different amounts of work.
+
+Performance (GPU 0, shared operands, cold 256 MiB flush, alternating runners, 50 samples x 3 rounds, 10 warmups)
+MI350X gfx950, PCI 0000:05:00.0, UUID GPU-49b26f9df75a3f63, 256 CUs.
+BM128, 512 persistent CTAs, 4 warps/CTA; long fast_exp policy inherited from prior validation.
+The baseline already has prequantized Q/K/V and the previous async-wait overlap improvement.
+AITER comparison is the raw native BF16 fmha_v3_varlen_fwd at 2988812e1.
+MXFP8 versus BF16 is a precision/algorithm comparison; preparation is excluded.
+Clocks were not locked. Separate-run ratios must not replace the paired results below.
+  short: integrated speedup 1.03888x; per-case range 0.99940..1.07935x.
+  short: native BF16 AITER / integrated TLX latency 3.22088x; useful TFLOPS geometric mean 281.84.
+  short: prototype speedup 1.03700x in same run.
+  long: integrated speedup 1.34215x; per-case range 1.28545..1.50188x.
+  long: native BF16 AITER / integrated TLX latency 2.64220x; useful TFLOPS geometric mean 552.58.
+  long: prototype speedup 1.38849x in same run.
+  all: integrated speedup 1.18082x; per-case range 0.99940..1.50188x.
+  all: native BF16 AITER / integrated TLX latency 2.91722x; useful TFLOPS geometric mean 394.64.
+  all: prototype speedup 1.19994x in same run.
+
+Independent evidence
+GPU 0 prototype-only full confirmation: long1.40588x, short1.03309x.
+GPU 1 independent full screening: long1.42744x, short1.04171x.
+The integrated paired full run is the conservative headline (long1.34215x, short1.03888x).
+Prototype and integrated runtime instruction streams are identical (3167 counted ISA instructions).
+A fresh single-case rerun had essentially equal prototype/integrated timings (.892/.887ms).
+The initial few-percent gap between prototype and integration is not explained by an ISA regression.
+
+Why persistence was insufficient
+The old kernel gives each CTA a fixed grid-stride list of (query tile, head) work items.
+Item count is similar across CTAs, but KV lengths differ. Some CUs retire their last CTA early.
+For control_long_0, the cost model gives mean109.22 outer iterations/CTA and max260.
+Global capacitated longest-job-first assignment lowers the modeled max to132.
+Each outer iteration represents two128-key tiles. These are work estimates, not timing predictions.
+An XCD-local balanced assignment helps, but global balancing consistently wins on long KV.
+Inserting an identity indirection alone slows the long cases: the order change supplies the gain.
+
+ATT validation
+Profiler /opt/rocm-7.2.1/bin/rocprofv3, official external trace decoder0.1.6.
+Decoder /home/stwinata/nod/tlx_work/tmp/pr4683/att_tools/decoder/opt/rocm/lib/librocprof-trace-decoder.so
+Collected, validated and packaged with .agents/skills/amd-att-trace/scripts/att_trace.py.
+Kernel regex _mxfp8_varlen_kernel; matching dispatch4 after3warmups; GPU0 UUID above.
+Target CU0, shader engine mask0x1, SIMDmask0xF; occupancy events cover the traced SE eight CUs.
+All occupancy and wave JSON files parse, raw traces/code objects are present, database integrity passes.
+JSON occupancy fields were checked against the ROCm viewer loader: time,CU,SIMD,slot,start,kernel.
+Viewer source: https://github.com/ROCm/rocprof-compute-viewer/blob/amd-mainline/src/data/json_emitter.cpp
+Each of these traces has64 resident-wave lifetimes from8CUs, i.e. two4-warp CTAs/CU.
+  scheduling_base_control_long0: mean/peak resident waves 60.80%; traced span 1981772 cycles; UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_base_control_long0/ui_output_agent_33787_dispatch_33.
+  scheduling_global_control_long0: mean/peak resident waves 97.23%; traced span 1551036 cycles; UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_global_control_long0/ui_output_agent_2947_dispatch_33.
+  scheduling_integrated_control_long0: mean/peak resident waves 97.74%; traced span 1526564 cycles; UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_integrated_control_long0/ui_output_agent_45088_dispatch_38.
+These occupancy percentages are not whole-GPU measurements or MFMA utilization percentages.
+Wave occupancy can stay high while a wave is stalled. The trace confirms reduced completion imbalance
+in the selected SE; the 20-shape paired benchmark establishes the overall latency gain.
+Raw and normalized loop reports: scheduling_att_loops.json and scheduling_att_occupancy.json.
+Balanced prototype normal outer loop:480vector,100scalar,72LDS,24global,35wait,4barrier,36MFMA instructions.
+Of36MFMA operations,32are scaled32x32x64 and4are16x16x128 row-sum operations.
+Counts are not elapsed-time fractions. Instructions overlap and have different costs.
+Assembly uses256VGPR and32bytes scratch, with4VGPR spills for the scheduled path.
+Compiler shared-memory requirement remains68544bytes/CTA; 160KiB/CU limits this footprint to two CTAs.
+VGPR resources also limit residency. More grid CTAs do not automatically add resident waves.
+
+Current inefficiencies after balancing
+1. Padding: control_long_0 query padding multiplies main matrix work by2.46294x;
+   key padding adds1.01812x, for2.50757x overall. About60% of issued main matrix arithmetic
+   therefore acts on padding. It is a work count, not a60% runtime saving opportunity.
+   Small-query tiles tested so far lose because they increase K/V visits and reduce intensity.
+   BM64 also uses only two warps per CTA with a similar K/V LDS allocation, limiting latency hiding.
+2. Memory: at BM128, main matrix arithmetic / requested K/V byte is248.24FLOP/byte.
+   This is below the board machine balance (~677.5FLOP/byte at dense4.614PF/s and6.810TB/s).
+   A pure matrix-compute ceiling therefore cannot describe this streaming workload.
+3. Softmax, MXFP8 conversion and scale bookkeeping impose substantial vector issue work.
+   Row-sum MFMA adds6.25% arithmetic beyond QK/PV. These costs remain after work balancing.
+4. Two CTAs/CU, dependent shared-memory reads, synchronization and remaining scratch spills
+   constrain latency hiding. ATT still contains waits; their sum is not a runtime breakdown.
+5. Full BF16 input still needs K/V quantization and transpose. This report measures prepared operands.
+   No new full-BF16 end-to-end win over AITER is claimed.
+
+Memory measurement and realistic roofline
+ROCm FetchSize under-reports a known4GiB read by almost exactly2x on this setup.
+We keep raw values and apply only the earlier local calibration for estimates.
+Scheduled raw FetchSize bytes: 1784556736.
+Estimated scheduled read traffic: 3.5691GB; profiled kernel 0.819904ms; estimated read rate 4.3531TB/s.
+Prior wait-overlap kernel estimated read rate3.2336TB/s; scheduled estimate4.3531TB/s.
+New same-GPU read-only calibration reads4GiB and writes only one32-bit reduction result per block.
+Correctness checks all loaded bytes through the reduction. It reaches5.1152TB/s (30cold samples).
+The scheduled estimate is85.1% of that empirical streaming read rate. This is not proof of full
+HBM hardware saturation: access patterns and the counter correction differ from the calibration.
+For control_long_0, main padded QK/PV938.182GFLOP plus row-sum58.636GFLOP gives
+0.216ms at the dense theoretical matrix ceiling. The estimated3.569GB of reads gives0.698ms
+at5.115TB/s. The counter-profiled kernel is0.820ms. The read-rate projection therefore sets a
+much tighter simple bound than matrix throughput. It excludes vector issue and synchronization.
+The remaining kernel is consistent with a primarily bandwidth-constrained regime for this shape.
+Do not multiply all TFLOPS by the padding factor and compare to the wrong sparse/FP4 peak.
+
+Preparation and API
+prepare_work_schedule(query_lengths,key_lengths,device,num_ctas=512,block_m=128)
+uses known CPU lists and builds a capacitated longest-job-first static permutation.
+All work items are independent and remain block-uniform. There is no per-lane scalar backdoor.
+The schedule is applied to initial item lookup, the persistent loop and next-item prefetch.
+Every workgroup retains its original item count and async synchronization semantics.
+The CPU scheduling pass measured0.62..0.85ms before GPU upload in the prototype confirmation.
+Plan construction, upload and first-use metadata are excluded from core timing. Reuse is necessary
+for an end-to-end benefit. Dynamic GPU-only offsets are not automatically sorted by this API.
+The optional schedule is checked against total tokens, batch, device, tile size and grid.
+The supplied CPU lengths must match the device offsets exactly; values are not read back to verify.
+forward_prequantized(...,work_schedule=schedule) and forward(...,work_schedule=schedule) accept it.
+For BF16 forward, an unspecified block_m follows the supplied schedule. Default unscheduled behavior remains.
+
+Correctness
+35regression tests pass, including scheduled/unscheduled, BF16-Q/prepared-Q, BM64/128/256,
+both exponent paths, empty queries, empty KV, irregular lengths and schedule mismatch rejection.
+All60production shape/seed comparisons remain bitwise identical to the prior winning core.
+All30long checks pass the original AITER accuracy gates. Three inherited short LSE failures remain:
+  scheduling_integrated_gpu0_seed7: ['control_short_0', 'candidate_short_3']
+  scheduling_integrated_gpu1_seed11: []
+  scheduling_integrated_gpu1_seed23: ['candidate_short_2']
+
+Next methods
+Preserve cost balancing and measure new candidates against this winner with paired timings.
+Improve effective K/V reuse or compression to raise arithmetic intensity; matrix-only tuning has limited headroom.
+Test smaller-query designs only alongside LDS footprint/occupancy changes, not just smaller BM.
+Reduce softmax vector work and scale handling while retaining the numerical recipe and accuracy gates.
+If implementing a GPU planner or dynamic queue, count its launch/atomic/metadata cost and validate
+all initial, loop, next-prefetch and final-item ownership paths; CPU planning is not free.
+
+Files and reproduction
+Worktree /home/stwinata/nod/tlx_work/tmp/pr4683_source; branch opt/pr4683-prequantized-forward.
+Combined patch against PR head d3774785447d0385c0027dcef799be5188d462ed:
+/home/stwinata/nod/tlx_work/tmp/pr4683/persistent_work_schedule.patch
+SHA256 dd3804156ed5d410e306018191da86a20ecfb059c494dc7bc2260568995633c5
+It includes prior prequantization and wait-overlap work as well as this scheduling change.
+No native compiler changes. The source-built venv uses compiler main46d1f37fa31c.
+source /home/stwinata/nod/tlx_work/tmp/pr4683/env.sh
+python /home/stwinata/nod/tlx_work/tmp/pr4683/bench_scheduling.py --all --aiter --samples 50 --rounds 3 --warmups 10 --json /tmp/scheduling_new.json
+GPU tests: preimport installed triton then pytest.main with --import-mode=importlib -s --tb=short
+/home/stwinata/nod/tlx_work/tmp/pr4683_source/python/test/unit/language/test_tlx_amd_gfx950.py -k mxfp8_prequantized
+Detailed data scheduling_analysis.json; plot persistent_scheduling.png; runtime ASM asm/runtime_scheduling/.
+GPU0andGPU1are free after this work; unrelated GPU7job was not touched.
+
+
+Viewer-ready ATT bundles
+
+Root /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_base_control_long0
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_base_control_long0/ui_output_agent_33787_dispatch_33
+Matching attention dispatches [26, 28, 30, 33, 36]; selected fourth matching dispatch = global 33.
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_base_control_long0.tar.gz
+SHA256 5391a077c1085bd92a3203c4fbee94ae2811e5e785721ba4cd77e6b0019fec97
+
+Root /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_global_control_long0
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_global_control_long0/ui_output_agent_2947_dispatch_33
+Matching attention dispatches [26, 28, 30, 33, 36]; selected fourth matching dispatch = global 33.
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_global_control_long0.tar.gz
+SHA256 c18f289476fff4e9cea7bd2b870cfc039c929d03e58c3fe0303c7707ba461267
+
+Root /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_integrated_control_long0
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_integrated_control_long0/ui_output_agent_45088_dispatch_38
+Matching attention dispatches [31, 33, 35, 38, 41]; selected fourth matching dispatch = global 38.
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/scheduling_integrated_control_long0.tar.gz
+SHA256 f8b67367a7919e353fe7443138f801470cfde2fe3f1661de6fca0e60d6899e76

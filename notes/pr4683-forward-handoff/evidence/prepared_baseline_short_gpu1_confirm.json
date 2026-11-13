@@ -1,0 +1,597 @@
+{
+  "completed": true,
+  "pci": "0000:15:00.0",
+  "baseline_hashes": {
+    "mxfp8_attention_core_gfx950": "bff4a76cb97ca346fdba5793b79ecf0eb289eba050c3f48e161197f8e1b4ee46",
+    "mxfp8_varlen_pingpong_gfx950": "8deb59532255a5ac80ccb9c3868cf56e0693b3a55c01cce7284bfcb7e85c78ec"
+  },
+  "candidate_hashes": {
+    "mxfp8_attention_core_gfx950": "bff4a76cb97ca346fdba5793b79ecf0eb289eba050c3f48e161197f8e1b4ee46",
+    "mxfp8_varlen_pingpong_gfx950": "d01ab3e0c14f452ea5b366342b702bbd106df20a2690bbae39c20b535ed7aceb"
+  },
+  "baseline": "PR4683 plus prepared-Q API and LSE fix; no wait overlap, cost schedule or metadata/fill optimization",
+  "protocol": {
+    "warmups": 15,
+    "samples": 100,
+    "rounds": 3,
+    "seed": 7,
+    "flush_MiB": 256,
+    "BM": 128,
+    "num_ctas": 512,
+    "fast_exp": "false for short, true for long on every runner",
+    "pairwise": true,
+    "operand_preparation_and_schedule_excluded": true
+  },
+  "results": [
+    {
+      "case": "control_short_0",
+      "family": "short",
+      "shape": {
+        "name": "control_short_0",
+        "family": "short",
+        "total_q": 24688,
+        "total_kv": 264119,
+        "max_q": 192,
+        "max_kv": 1004,
+        "trace_calls": 3
+      },
+      "kv_bytes": 364683264,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.14460399746894836,
+              "mad_ms": 0.0020200014114379883,
+              "p10_ms": 0.14100399613380432,
+              "p90_ms": 0.14980809688568114,
+              "mean_ms": 0.14637184669574102,
+              "stdev_ms": 0.017577258999588927,
+              "cv_percent": 12.008633761467992,
+              "minimum_ms": 0.13536399602890015,
+              "maximum_ms": 0.43741199374198914,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.14604400098323822,
+              0.1443839967250824,
+              0.14362400025129318
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.12994349747896194,
+              "mad_ms": 0.0027199983596801758,
+              "p10_ms": 0.12563599795103073,
+              "p90_ms": 0.1356520026922226,
+              "mean_ms": 0.13024018632868925,
+              "stdev_ms": 0.0038398976682009144,
+              "cv_percent": 2.9483201586567938,
+              "minimum_ms": 0.12176399677991867,
+              "maximum_ms": 0.14260399341583252,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13088400661945343,
+              0.1292639970779419,
+              0.1299239993095398
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_short_1",
+      "family": "short",
+      "shape": {
+        "name": "control_short_1",
+        "family": "short",
+        "total_q": 27248,
+        "total_kv": 264237,
+        "max_q": 160,
+        "max_kv": 828,
+        "trace_calls": 3
+      },
+      "kv_bytes": 431456256,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.14998450130224228,
+              "mad_ms": 0.0014994964003562927,
+              "p10_ms": 0.14760400354862213,
+              "p90_ms": 0.15420899540185928,
+              "mean_ms": 0.15119570647676786,
+              "stdev_ms": 0.006348597535010156,
+              "cv_percent": 4.198927127593836,
+              "minimum_ms": 0.1458439975976944,
+              "maximum_ms": 0.2277670055627823,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.15038450062274933,
+              0.1500840038061142,
+              0.1498044952750206
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.13876399397850037,
+              "mad_ms": 0.002280004322528839,
+              "p10_ms": 0.13499999940395355,
+              "p90_ms": 0.14400410205125808,
+              "mean_ms": 0.13932177990674974,
+              "stdev_ms": 0.004046419960116202,
+              "cv_percent": 2.9043699863901637,
+              "minimum_ms": 0.13292400538921356,
+              "maximum_ms": 0.16300399601459503,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13942399621009827,
+              0.13858400285243988,
+              0.13828399777412415
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_short_2",
+      "family": "short",
+      "shape": {
+        "name": "control_short_2",
+        "family": "short",
+        "total_q": 29232,
+        "total_kv": 264686,
+        "max_q": 240,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 351436800,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.13582400232553482,
+              "mad_ms": 0.0015800073742866516,
+              "p10_ms": 0.13351510167121888,
+              "p90_ms": 0.14022399783134462,
+              "mean_ms": 0.1365106764435768,
+              "stdev_ms": 0.0031986662493458363,
+              "cv_percent": 2.343161965553605,
+              "minimum_ms": 0.13092300295829773,
+              "maximum_ms": 0.15488499402999878,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.1370840072631836,
+              0.13556399941444397,
+              0.13574399799108505
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.12552300095558167,
+              "mad_ms": 0.002179998904466629,
+              "p10_ms": 0.12214800342917442,
+              "p90_ms": 0.13053199499845505,
+              "mean_ms": 0.1262166034926971,
+              "stdev_ms": 0.004480818776095266,
+              "cv_percent": 3.5501024842223132,
+              "minimum_ms": 0.11988300085067749,
+              "maximum_ms": 0.1657249927520752,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.12626399844884872,
+              0.12492349743843079,
+              0.12528350204229355
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_short_3",
+      "family": "short",
+      "shape": {
+        "name": "control_short_3",
+        "family": "short",
+        "total_q": 31856,
+        "total_kv": 263664,
+        "max_q": 224,
+        "max_kv": 788,
+        "trace_calls": 3
+      },
+      "kv_bytes": 442269696,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.15788500010967255,
+              "mad_ms": 0.0015799999237060547,
+              "p10_ms": 0.15560490339994432,
+              "p90_ms": 0.16272500157356262,
+              "mean_ms": 0.15879600370923677,
+              "stdev_ms": 0.0037058039112885786,
+              "cv_percent": 2.333688395631219,
+              "minimum_ms": 0.1540050059556961,
+              "maximum_ms": 0.18732599914073944,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.15886399894952774,
+              0.15752500295639038,
+              0.15766500681638718
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.14456500113010406,
+              "mad_ms": 0.002241000533103943,
+              "p10_ms": 0.1409200057387352,
+              "p90_ms": 0.14951599389314651,
+              "mean_ms": 0.14512745315829914,
+              "stdev_ms": 0.004455141465161242,
+              "cv_percent": 3.069813028622334,
+              "minimum_ms": 0.13752399384975433,
+              "maximum_ms": 0.18864600360393524,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.14442399889230728,
+              0.1444844976067543,
+              0.14484400302171707
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_short_4",
+      "family": "short",
+      "shape": {
+        "name": "control_short_4",
+        "family": "short",
+        "total_q": 32736,
+        "total_kv": 263726,
+        "max_q": 240,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 362790912,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.13282400369644165,
+              "mad_ms": 0.0012599974870681763,
+              "p10_ms": 0.13088400661945343,
+              "p90_ms": 0.13700890094041826,
+              "mean_ms": 0.13366153006752332,
+              "stdev_ms": 0.003559163542139786,
+              "cv_percent": 2.662818194840178,
+              "minimum_ms": 0.12932400405406952,
+              "maximum_ms": 0.16008499264717102,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13324349373579025,
+              0.13252399861812592,
+              0.13244399428367615
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.12586399912834167,
+              "mad_ms": 0.0017405003309249878,
+              "p10_ms": 0.12296000197529793,
+              "p90_ms": 0.13036800026893616,
+              "mean_ms": 0.12686174352963767,
+              "stdev_ms": 0.007366348364560051,
+              "cv_percent": 5.806595557973797,
+              "minimum_ms": 0.12032400071620941,
+              "maximum_ms": 0.2354069948196411,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.12642399966716766,
+              0.12576399743556976,
+              0.12566349655389786
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_short_0",
+      "family": "short",
+      "shape": {
+        "name": "candidate_short_0",
+        "family": "short",
+        "total_q": 26672,
+        "total_kv": 259407,
+        "max_q": 224,
+        "max_kv": 964,
+        "trace_calls": 3
+      },
+      "kv_bytes": 369008640,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.14436399936676025,
+              "mad_ms": 0.0013799965381622314,
+              "p10_ms": 0.14220000207424163,
+              "p90_ms": 0.1481279954314232,
+              "mean_ms": 0.14520478318134944,
+              "stdev_ms": 0.0037377954154165843,
+              "cv_percent": 2.574154468967024,
+              "minimum_ms": 0.13968400657176971,
+              "maximum_ms": 0.17144499719142914,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.14494400471448898,
+              0.1439640000462532,
+              0.14454399794340134
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.13116399943828583,
+              "mad_ms": 0.0023400038480758667,
+              "p10_ms": 0.1269199937582016,
+              "p90_ms": 0.1357640027999878,
+              "mean_ms": 0.1313247932990392,
+              "stdev_ms": 0.0037075594181681243,
+              "cv_percent": 2.823198365692954,
+              "minimum_ms": 0.12464399635791779,
+              "maximum_ms": 0.14832399785518646,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13276399672031403,
+              0.1310039982199669,
+              0.1303034946322441
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_short_1",
+      "family": "short",
+      "shape": {
+        "name": "candidate_short_1",
+        "family": "short",
+        "total_q": 27200,
+        "total_kv": 264751,
+        "max_q": 224,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 347922432,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.1346839964389801,
+              "mad_ms": 0.001440003514289856,
+              "p10_ms": 0.13227600008249282,
+              "p90_ms": 0.13909199684858323,
+              "mean_ms": 0.1352879898250103,
+              "stdev_ms": 0.0035783670455648347,
+              "cv_percent": 2.644999789111592,
+              "minimum_ms": 0.12952400743961334,
+              "maximum_ms": 0.15940499305725098,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13546400517225266,
+              0.13420400023460388,
+              0.13396400213241577
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.12612399458885193,
+              "mad_ms": 0.0025004930794239044,
+              "p10_ms": 0.1222038984298706,
+              "p90_ms": 0.13061199933290482,
+              "mean_ms": 0.12638717311124006,
+              "stdev_ms": 0.0037710692187221677,
+              "cv_percent": 2.9837436235740866,
+              "minimum_ms": 0.11972399801015854,
+              "maximum_ms": 0.14392399787902832,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.1262435019016266,
+              0.1262034997344017,
+              0.12590400129556656
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_short_2",
+      "family": "short",
+      "shape": {
+        "name": "candidate_short_2",
+        "family": "short",
+        "total_q": 30576,
+        "total_kv": 264690,
+        "max_q": 240,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 354951168,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.1358640044927597,
+              "mad_ms": 0.0015000104904174805,
+              "p10_ms": 0.13320399820804596,
+              "p90_ms": 0.13977199643850327,
+              "mean_ms": 0.13643443033099176,
+              "stdev_ms": 0.0034209357958846836,
+              "cv_percent": 2.507384527194087,
+              "minimum_ms": 0.13140399754047394,
+              "maximum_ms": 0.1577250063419342,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.13650400191545486,
+              0.13568399846553802,
+              0.13568399846553802
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.1275634989142418,
+              "mad_ms": 0.0019605010747909546,
+              "p10_ms": 0.12455999925732614,
+              "p90_ms": 0.1331439942121506,
+              "mean_ms": 0.12836431001623472,
+              "stdev_ms": 0.00397980178072877,
+              "cv_percent": 3.100395881242558,
+              "minimum_ms": 0.12212300300598145,
+              "maximum_ms": 0.14928500354290009,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.1279440000653267,
+              0.12774349749088287,
+              0.12682349979877472
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_short_3",
+      "family": "short",
+      "shape": {
+        "name": "candidate_short_3",
+        "family": "short",
+        "total_q": 30928,
+        "total_kv": 264436,
+        "max_q": 224,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 357113856,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.13508400321006775,
+              "mad_ms": 0.0013799965381622314,
+              "p10_ms": 0.13323989361524582,
+              "p90_ms": 0.14013599455356598,
+              "mean_ms": 0.13659137353301049,
+              "stdev_ms": 0.005673689839045353,
+              "cv_percent": 4.153768786631444,
+              "minimum_ms": 0.130963996052742,
+              "maximum_ms": 0.19788600504398346,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.1359040066599846,
+              0.13488399982452393,
+              0.13486400246620178
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.12678299844264984,
+              "mad_ms": 0.0019790008664131165,
+              "p10_ms": 0.12392300367355347,
+              "p90_ms": 0.13160790055990218,
+              "mean_ms": 0.12755498977998891,
+              "stdev_ms": 0.00425523780244803,
+              "cv_percent": 3.336002621134309,
+              "minimum_ms": 0.1211640015244484,
+              "maximum_ms": 0.15848499536514282,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.12788400053977966,
+              0.1265840008854866,
+              0.1263434961438179
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_short_4",
+      "family": "short",
+      "shape": {
+        "name": "candidate_short_4",
+        "family": "short",
+        "total_q": 32784,
+        "total_kv": 264520,
+        "max_q": 240,
+        "max_kv": 748,
+        "trace_calls": 3
+      },
+      "kv_bytes": 363601920,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 0.13306400179862976,
+              "mad_ms": 0.0016999989748001099,
+              "p10_ms": 0.1306399941444397,
+              "p90_ms": 0.1383720025420189,
+              "mean_ms": 0.1340571701526642,
+              "stdev_ms": 0.005138326726024637,
+              "cv_percent": 3.832936888174735,
+              "minimum_ms": 0.1290840059518814,
+              "maximum_ms": 0.19740599393844604,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.1336435005068779,
+              0.1328039988875389,
+              0.13252399861812592
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.1270029991865158,
+              "mad_ms": 0.002079501748085022,
+              "p10_ms": 0.12352390214800835,
+              "p90_ms": 0.1322920009493828,
+              "mean_ms": 0.12765509667495886,
+              "stdev_ms": 0.004307203189118678,
+              "cv_percent": 3.374094181359536,
+              "minimum_ms": 0.12052399665117264,
+              "maximum_ms": 0.15848499536514282,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.12802349776029587,
+              0.12636400014162064,
+              0.12676399946212769
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

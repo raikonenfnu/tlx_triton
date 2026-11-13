@@ -1,0 +1,111 @@
+{
+  "model": "t_us = intercept_us + bytes / (sustained_TBps * 1e6)",
+  "training_sizes_MiB": [
+    1024,
+    4096
+  ],
+  "intercept_us": 45.72783907254538,
+  "sustained_TBps": 5.326122487704613,
+  "held_out_same_gpu": [
+    {
+      "size_MiB": 256,
+      "predicted_us": 96.12762928009033,
+      "measured_us": 92.84299984574318,
+      "error_percent": 3.5378320819065445
+    },
+    {
+      "size_MiB": 320,
+      "predicted_us": 108.72757683197658,
+      "measured_us": 107.42300003767014,
+      "error_percent": 1.214429678792217
+    },
+    {
+      "size_MiB": 384,
+      "predicted_us": 121.32752438386282,
+      "measured_us": 120.06350234150887,
+      "error_percent": 1.0527945776215741
+    }
+  ],
+  "held_out_gpu0_matched": [
+    {
+      "case": "control_short_0",
+      "bytes": 354785952,
+      "predicted_us": 112.34026731072908,
+      "measured_us": 114.90349844098091,
+      "error_percent": -2.2307685710443503,
+      "ideal_6_81TBps_us": 52.097790308370044
+    },
+    {
+      "case": "control_short_1",
+      "bytes": 396023048,
+      "predicted_us": 120.08269082712324,
+      "measured_us": 124.36399981379509,
+      "error_percent": -3.442562954779571,
+      "ideal_6_81TBps_us": 58.15316417033774
+    },
+    {
+      "case": "control_short_2",
+      "bytes": 346160804,
+      "predicted_us": 110.72086257118146,
+      "measured_us": 111.72349750995636,
+      "error_percent": -0.8974253054381487,
+      "ideal_6_81TBps_us": 50.83124875183554
+    },
+    {
+      "case": "control_short_3",
+      "bytes": 415974136,
+      "predicted_us": 123.82858440092993,
+      "measured_us": 128.5640001296997,
+      "error_percent": -3.683313932354726,
+      "ideal_6_81TBps_us": 61.08283935389134
+    },
+    {
+      "case": "control_short_4",
+      "bytes": 349823780,
+      "predicted_us": 111.40860041582472,
+      "measured_us": 112.76350170373917,
+      "error_percent": -1.2015424028549049,
+      "ideal_6_81TBps_us": 51.369130690161526
+    },
+    {
+      "case": "candidate_short_0",
+      "bytes": 355558304,
+      "predicted_us": 112.48527937190171,
+      "measured_us": 115.48300087451935,
+      "error_percent": -2.595811920297153,
+      "ideal_6_81TBps_us": 52.2112046989721
+    },
+    {
+      "case": "candidate_short_1",
+      "bytes": 346472228,
+      "predicted_us": 110.7793336260096,
+      "measured_us": 111.6430014371872,
+      "error_percent": -0.7735978073498018,
+      "ideal_6_81TBps_us": 50.87697914831131
+    },
+    {
+      "case": "candidate_short_2",
+      "bytes": 348684324,
+      "predicted_us": 111.19466316548352,
+      "measured_us": 112.52349987626076,
+      "error_percent": -1.180941503098043,
+      "ideal_6_81TBps_us": 51.201809691629954
+    },
+    {
+      "case": "candidate_short_3",
+      "bytes": 348115492,
+      "predicted_us": 111.08786276776206,
+      "measured_us": 111.98350042104721,
+      "error_percent": -0.7997942999795837,
+      "ideal_6_81TBps_us": 51.118280763582966
+    },
+    {
+      "case": "candidate_short_4",
+      "bytes": 349318564,
+      "predicted_us": 111.31374416699336,
+      "measured_us": 112.18300089240074,
+      "error_percent": -0.7748560107080027,
+      "ideal_6_81TBps_us": 51.29494331864905
+    }
+  ]
+}

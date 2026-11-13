@@ -1,0 +1,160 @@
+PR4683 MXFP8 forward: prepared operands and wait overlap
+2026-11-13 UTC
+
+Implemented in isolated worktree /home/stwinata/nod/tlx_work/tmp/pr4683_source
+Branch opt/pr4683-prequantized-forward, base d3774785447d0385c0027dcef799be5188d462ed.
+Installed compiler remains source-built main checkout 46d1f37fa31c3765bbf773ff5cc0eefe66fcdafd.
+Only tutorial Python and an existing GPU test module changed; no native rebuild needed.
+Patch: /home/stwinata/nod/tlx_work/tmp/pr4683/prequantized_wait_overlap.patch
+Patch SHA256: 34c7365ce0fcd885f127e4c0ce1adec4cb0f16d2dbbd83d868f2fe53f023bbdc
+
+Changes
+1. prepare_q produces E4M3 [tokens,4,128] and uint8 E8M0 [tokens,4,4].
+   It exactly matches fused 32-query-row x 32-feature quantization; groups restart per sequence.
+2. forward_prequantized accepts Q8/Q scales and the existing prepared K/V ABI.
+   It needs no original BF16 operands; preparation and metadata initialization are outside core timing.
+   External row-wise Q scales are supported, including scales that differ for adjacent rows.
+3. Move both main-loop async wait_group(0) operations after register-only softmax.
+   Every subsequent LDS consumer still follows the full wait. Shared buffer alternation,
+   async commit groups, stage barriers, epilogue waits, and iteration boundaries remain.
+   This is a valid block-uniform program; no hardware-ID scalars or divergent lane control.
+4. Include the previously validated natural-log LSE correction (subtract log2 shift 4).
+
+Performance protocol
+MI350X gfx950, physical GPU 0 PCI 0000:05:00.0, UUID GPU-49b26f9df75a3f63.
+GPU 1 PCI 0000:15:00.0 used for independent hypothesis screening and correctness.
+No competing GPU allocation during workloads. Clocks not locked; use paired comparisons.
+20 PR ragged noncausal shapes, batch432 H4 D128, same generated offsets and shared operands.
+256 MiB L2/Infinity-cache flush, alternating runner order, 10 warmups, 50 samples x 3 rounds.
+BM128, 512 persistent CTAs; fast_exp only for long KV, inherited from earlier validated policy.
+AITER native fmha_v3_varlen_fwd at 2988812e134a7dbb08948092a9d89df48a2585d3; no Python wrapper timing.
+Comparison is MXFP8 approximate attention against BF16 AITER; quantization is excluded for prepared core.
+
+Direct paired before/after prepared-core comparison (same quantized inputs):
+  short: geometric-mean speedup 1.01657x; individual 1.00647..1.02617x
+  long: geometric-mean speedup 1.08903x; individual 1.02847..1.14843x
+  all: geometric-mean speedup 1.05218x; individual 1.00647..1.14843x
+
+Same-run comparison to native BF16 AITER:
+  short: AITER / prepared TLX latency = 2.99713x
+  long: AITER / prepared TLX latency = 1.94879x
+  all: AITER / prepared TLX latency = 2.41677x
+  short: useful TFLOPS geometric mean 262.98; range 224.57..306.31
+  long: useful TFLOPS geometric mean 427.75; range 326.89..508.34
+Useful FLOPs = 4*H*D*sum(query_length_i*key_length_i), with multiply-add counted as 2.
+The old BF16-Q core vs new prepared core improves 1.156x on long KV in the same run.
+This includes both Q preparation and wait overlap. Q preparation alone was only ~3% long gain.
+The full BF16-input path still pays K/V preparation; no new end-to-end AITER win is claimed.
+
+Correctness
+20 added regression tests passed before and after the wait change (-s --tb=short).
+All 60 production shape/seed checks (seeds7,11,23) are bitwise identical to the prior core
+for both output and LSE; no numerical relaxation is responsible for this gain.
+All 30 long-KV checks pass original output-relative-L2<0.08 and LSE-max-abs<0.10 gates.
+27/30 short checks pass. Inherited short LSE failures remain: seed7 control_short_0,
+seed7 candidate_short_3, seed23 candidate_short_2; outputs/LSE unchanged from the prior core.
+Edge tests cover zero query lengths, zero KV, irregular lengths, BM64/128/256, both exp paths,
+independent per-row E8M0 scales, and invalid ABI input rejection.
+PR pytest collection initially selected incompatible PR Python runtime; fixed by preimporting
+installed triton and using pytest importlib mode while loading tutorial modules explicitly.
+
+First-principles roofline
+Official dense MXFP8 peak ~4.614 PF/s (not the sparse or MXFP4 peak); retail HBM8TB/s.
+This board reports 6.810 TB/s and max GPU2.2GHz, 256CUs, 160KiB LDS/CU.
+Local calibration: streaming copy read+write4.484TB/s; resident scaled-MFMA32 ~3.046PF/s,
+16x16 scaled MFMA ~3.220PF/s. These are calibration targets, not universal hard bounds.
+For BM128: padded main math/requested KV byte = 4*D*128/(2*D+8) = 248.24 FLOP/byte.
+Query/key padding matters; rowsum MFMA adds another6.25% to main padded arithmetic.
+R = sum(ceil(q_i/128)*ceil(k_i/256)*256).
+Main padded FLOPs = 4*H*D*128*R; K/V CTA-request bytes = H*(2*D+8)*R.
+Actual HBM bytes can be lower through cache reuse. Softmax/vector issue, LDS and synchronization
+are excluded from the simple compute/memory lower bounds and need separate modeling.
+Best optimistic latency >= max(matrix-only time, compulsory HBM time); such a bound is not a prediction.
+  control_short_1: padding 2.946x; measured 0.1578ms; matrix-only theoretical 0.0247ms; unique-HBM lower 0.0588ms; all-CTA-read HBM projection 0.0696ms.
+  control_long_0: padding 2.508x; measured 1.1445ms; matrix-only theoretical 0.2160ms; unique-HBM lower 0.5006ms; all-CTA-read HBM projection 0.5606ms.
+
+ATT and ASM evidence
+Profiler /opt/rocm-7.2.1/bin/rocprofv3, external official trace decoder0.1.6.
+Decoder /home/stwinata/nod/tlx_work/tmp/pr4683/att_tools/decoder/opt/rocm/lib/librocprof-trace-decoder.so
+All traces collected/validated/packaged with .agents/skills/amd-att-trace/scripts/att_trace.py.
+Kernel regex _mxfp8_varlen_kernel, CU0, shader engine mask0x1, SIMDmask0xF, GPU0 UUID.
+BF16-Q reference dispatch5 -> globaldispatch65 after correctness+3warmups.
+Prepared before/after dispatch4 -> globaldispatch28 after3warmups (verified in rocpd DB).
+Each decoded UI has8wave JSONs; database integrity and every JSON validate.
+One outer iteration represents two128-key tiles:32 scaled32x32x64 and4 rowsum16x16x128 MFMA per wave.
+Non-rescaling before loop:474 vector,98scalar-other,72LDS,24global,35wait,4barrier,36MFMA instructions.
+Instruction-only ASM diff is two vmcnt(0) relocations; total3145 counted instructions unchanged.
+Offline ASM: 256VGPR,32bytes private scratch,5VGPR spills and68544bytes compiler-reported shared
+for both variants. SMI/counter VGPR field128 differs in convention; do not mistake it for halved registers.
+Before selected sl0 wave normal-loop median11770cycles and VM-wait stall4248cycles;
+after selected sl0 normal-loop median7042cycles and VM-wait stall272cycles.
+Other resident sl1 wave median9232->10976cycles, VM-wait2520->1516cycles.
+Wave/item assignments differ. These are diagnostic samples, not a matched GPU runtime ratio.
+Raw iterations10..14 windows are also saved; they are not identical workload windows and
+must not be used to infer overall speedup. Wave stall/latency sums overlap and are not GPU time shares.
+The paired 20-shape benchmark is the performance evidence; ATT/ASM support the overlap mechanism.
+
+HBM counter calibration
+Collecting FetchSize+WriteSize in one pass exceeded hardware counter capability and aborted;
+the failed profiler process was stopped. FetchSize-only collection succeeded.
+FetchSize reported2,147,484,992bytes for a known4,294,967,296byte streaming read.
+Its documented gfx950 derived formula under-reports this calibration by almost exactly2x.
+Attention raw FetchSize1,805,775,040bytes over1.116873ms; empirically corrected estimate
+'3.612GB and 3.234TB/s'.
+The correction is local empirical calibration, not a validated universal ROCm metric fix.
+Conclusion: core is constrained by memory/issue overlap and vector softmax as well as matrix work.
+Pure matrix-compute saturation and full-board HBM bandwidth saturation are not established.
+The improved schedule demonstrates an avoidable exposed-memory-wait component.
+
+Other hypotheses
+Q prequantization alone: ~3.3% long gain, neutral/slightly worse short; fused Q work overlaps prefetch.
+Scheduler-group options2/4/8 slower; softmax priority1 small mixed benefit, not accepted.
+Earlier copy and skipping last persistent prefetch small mixed gains, not accepted.
+BM64 slower despite reduced padded math: loses arithmetic intensity and adds K/V requests.
+Grid256 slower; grid1024 mixed and regresses candidate_long_3, not accepted.
+BM256 changes floating-point rounding across tile shapes, failed strict bitwise screening;
+not retained or classified as a numerical bug. BM256 prequant regression against its fused path passes.
+
+Next high-value directions
+1. Reduce softmax packed-vector instructions and live values without changing the quantization recipe.
+2. Improve prefetch distance/buffering only after checking physical buffer aliasing, async completion
+   and LDS/register occupancy. Two blocks/CU already use substantial LDS and VGPR resources.
+3. Reduce query padding through row-aware tiling while retaining K/V reuse; BM64 alone loses.
+4. Keep producer-native MXFP8 K/V as an integration target; attention-only gains do not erase
+   full-BF16 K/V conversion/transpose cost.
+
+Reproduce
+source /home/stwinata/nod/tlx_work/tmp/pr4683/env.sh
+python /home/stwinata/nod/tlx_work/tmp/pr4683/confirm_prequant_wait.py --json /tmp/prequant_wait_new_results.json
+python /home/stwinata/nod/tlx_work/tmp/pr4683/prequant_bench.py --samples 50 --rounds 3 --warmups 10 --json /tmp/prequant_new_results.json
+Test command: preimport installed triton, then pytest.main([--import-mode=importlib,-s,--tb=short,
+/home/stwinata/nod/tlx_work/tmp/pr4683_source/python/test/unit/language/test_tlx_amd_gfx950.py,-k,mxfp8_prequantized]).
+Forward entry defaults fast_exp=False; benchmark explicitly uses true for long cases only.
+
+Trace bundles (whole directories, with code objects/database/decoded UI):
+/home/stwinata/nod/tlx_work/tmp/pr4683/att/hybrid_fast_control_long0_uuid.tar.gz
+SHA256 f9a9a41561202c8b466bf3b69bf36073d2b9ae33ddceb7a8b1aca15118168eba
+/home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_fast_control_long0.tar.gz
+SHA256 b5b7bf6db1cf54b6f7a36fe521a2f0329a3c68061e71fe0335cf849cf760e053
+/home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_wait_overlap_control_long0.tar.gz
+SHA256 2dc570de35ccb314bfe502623d8e9924dccc91958839b4362b2f7ea5341c60c0
+
+References
+https://github.com/facebookexperimental/triton/pull/4683
+https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf
+https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi350x-gpu-brochure.pdf
+https://www.amd.com/en/blogs/2025/amd-instinct-mi350-series-and-beyond-accelerating-the-future-of-ai-and-hpc.html
+https://github.com/ROCm/rocprof-trace-decoder/releases/tag/0.1.6
+https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/docs-7.2.1/how-to/using-thread-trace.html
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/hybrid_fast_control_long0_uuid
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/hybrid_fast_control_long0_uuid/ui_output_agent_8250_dispatch_65
+Manifest /home/stwinata/nod/tlx_work/tmp/pr4683/att/hybrid_fast_control_long0_uuid/att_manifest.json
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_fast_control_long0
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_fast_control_long0/ui_output_agent_22496_dispatch_28
+Manifest /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_fast_control_long0/att_manifest.json
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_wait_overlap_control_long0
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_wait_overlap_control_long0/ui_output_agent_40122_dispatch_28
+Manifest /home/stwinata/nod/tlx_work/tmp/pr4683/att/prequant_wait_overlap_control_long0/att_manifest.json

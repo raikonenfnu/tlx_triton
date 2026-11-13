@@ -1,0 +1,597 @@
+{
+  "completed": true,
+  "pci": "0000:05:00.0",
+  "baseline_hashes": {
+    "mxfp8_attention_core_gfx950": "bff4a76cb97ca346fdba5793b79ecf0eb289eba050c3f48e161197f8e1b4ee46",
+    "mxfp8_varlen_pingpong_gfx950": "8deb59532255a5ac80ccb9c3868cf56e0693b3a55c01cce7284bfcb7e85c78ec"
+  },
+  "candidate_hashes": {
+    "mxfp8_attention_core_gfx950": "bff4a76cb97ca346fdba5793b79ecf0eb289eba050c3f48e161197f8e1b4ee46",
+    "mxfp8_varlen_pingpong_gfx950": "d01ab3e0c14f452ea5b366342b702bbd106df20a2690bbae39c20b535ed7aceb"
+  },
+  "baseline": "PR4683 plus prepared-Q API and LSE fix; no wait overlap, cost schedule or metadata/fill optimization",
+  "protocol": {
+    "warmups": 15,
+    "samples": 100,
+    "rounds": 3,
+    "seed": 7,
+    "flush_MiB": 256,
+    "BM": 128,
+    "num_ctas": 512,
+    "fast_exp": "false for short, true for long on every runner",
+    "pairwise": true,
+    "operand_preparation_and_schedule_excluded": true
+  },
+  "results": [
+    {
+      "case": "control_long_0",
+      "family": "long",
+      "shape": {
+        "name": "control_long_0",
+        "family": "long",
+        "total_q": 24688,
+        "total_kv": 3135104,
+        "max_q": 192,
+        "max_kv": 32738,
+        "trace_calls": 3
+      },
+      "kv_bytes": 3779297280,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3134984970092773,
+              "mad_ms": 0.0158805251121521,
+              "p10_ms": 1.2602289795875548,
+              "p90_ms": 1.3343230962753296,
+              "mean_ms": 1.3085559419790904,
+              "stdev_ms": 0.04675564445772367,
+              "cv_percent": 3.5730718846463185,
+              "minimum_ms": 1.2305959463119507,
+              "maximum_ms": 1.8468140363693237,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.3152990341186523,
+              1.312538504600525,
+              1.3135785460472107
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8315439820289612,
+              "mad_ms": 0.009560495615005493,
+              "p10_ms": 0.81351597905159,
+              "p90_ms": 0.8534290254116058,
+              "mean_ms": 0.8336073178052902,
+              "stdev_ms": 0.019593322135066354,
+              "cv_percent": 2.350425879975644,
+              "minimum_ms": 0.7965030074119568,
+              "maximum_ms": 1.0094690322875977,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8358044922351837,
+              0.8293439745903015,
+              0.8308644890785217
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_long_1",
+      "family": "long",
+      "shape": {
+        "name": "control_long_1",
+        "family": "long",
+        "total_q": 27248,
+        "total_kv": 3142170,
+        "max_q": 160,
+        "max_kv": 21144,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4121001984,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3838210105895996,
+              "mad_ms": 0.015799999237060547,
+              "p10_ms": 1.3398599863052367,
+              "p90_ms": 1.4060939311981202,
+              "mean_ms": 1.378650184472402,
+              "stdev_ms": 0.026537065747939487,
+              "cv_percent": 1.9248585353140182,
+              "minimum_ms": 1.2985589504241943,
+              "maximum_ms": 1.5434050559997559,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.3943614959716797,
+              1.3793010115623474,
+              1.381220519542694
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8260844945907593,
+              "mad_ms": 0.01128000020980835,
+              "p10_ms": 0.8088839948177338,
+              "p90_ms": 0.845760977268219,
+              "mean_ms": 0.8270188464721044,
+              "stdev_ms": 0.014853878634864653,
+              "cv_percent": 1.7960749864683618,
+              "minimum_ms": 0.7973830103874207,
+              "maximum_ms": 0.8816660046577454,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.836344987154007,
+              0.8192239999771118,
+              0.8178039789199829
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_long_2",
+      "family": "long",
+      "shape": {
+        "name": "control_long_2",
+        "family": "long",
+        "total_q": 29232,
+        "total_kv": 3161784,
+        "max_q": 240,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4028547072,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.470903992652893,
+              "mad_ms": 0.05942201614379883,
+              "p10_ms": 1.389316976070404,
+              "p90_ms": 1.5223649859428408,
+              "mean_ms": 1.4541256189346314,
+              "stdev_ms": 0.058832231669820365,
+              "cv_percent": 4.045883718968099,
+              "minimum_ms": 1.3462400436401367,
+              "maximum_ms": 1.7613719701766968,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.4999849796295166,
+              1.456442952156067,
+              1.4604029655456543
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8261649906635284,
+              "mad_ms": 0.014980971813201904,
+              "p10_ms": 0.8049791157245636,
+              "p90_ms": 0.9026269972324372,
+              "mean_ms": 0.8393313765525818,
+              "stdev_ms": 0.036433233849670885,
+              "cv_percent": 4.340744891405646,
+              "minimum_ms": 0.7938640117645264,
+              "maximum_ms": 0.9365879893302917,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8265639841556549,
+              0.823264479637146,
+              0.8241044878959656
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_long_3",
+      "family": "long",
+      "shape": {
+        "name": "control_long_3",
+        "family": "long",
+        "total_q": 31856,
+        "total_kv": 3146362,
+        "max_q": 224,
+        "max_kv": 18851,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4195614720,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.460142970085144,
+              "mad_ms": 0.038221538066864014,
+              "p10_ms": 1.3995178580284118,
+              "p90_ms": 1.4946600437164306,
+              "mean_ms": 1.447571120262146,
+              "stdev_ms": 0.04125625202407134,
+              "cv_percent": 2.8500328202596426,
+              "minimum_ms": 1.3615599870681763,
+              "maximum_ms": 1.6479289531707764,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.4708629846572876,
+              1.460142970085144,
+              1.4375424981117249
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8410450220108032,
+              "mad_ms": 0.010740488767623901,
+              "p10_ms": 0.8221400737762451,
+              "p90_ms": 0.8733579993247986,
+              "mean_ms": 0.8451223593950271,
+              "stdev_ms": 0.02268186408161052,
+              "cv_percent": 2.6838556369337003,
+              "minimum_ms": 0.8097040057182312,
+              "maximum_ms": 0.9435880184173584,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8462450206279755,
+              0.8385845124721527,
+              0.8380649983882904
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "control_long_4",
+      "family": "long",
+      "shape": {
+        "name": "control_long_4",
+        "family": "long",
+        "total_q": 32736,
+        "total_kv": 3139507,
+        "max_q": 240,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4179935232,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3208594918251038,
+              "mad_ms": 0.01780003309249878,
+              "p10_ms": 1.2710530281066894,
+              "p90_ms": 1.345847976207733,
+              "mean_ms": 1.3165365974108378,
+              "stdev_ms": 0.05364236299357253,
+              "cv_percent": 4.074506025815621,
+              "minimum_ms": 1.159674048423767,
+              "maximum_ms": 2.0581610202789307,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.3317794799804688,
+              1.3180394768714905,
+              1.318319022655487
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8541055023670197,
+              "mad_ms": 0.01516050100326538,
+              "p10_ms": 0.8313810110092164,
+              "p90_ms": 0.8848030209541321,
+              "mean_ms": 0.8617741364240646,
+              "stdev_ms": 0.06895598268578308,
+              "cv_percent": 8.00163056319098,
+              "minimum_ms": 0.8215439915657043,
+              "maximum_ms": 1.6680690050125122,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.861405998468399,
+              0.8464854955673218,
+              0.8471049964427948
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_long_0",
+      "family": "long",
+      "shape": {
+        "name": "candidate_long_0",
+        "family": "long",
+        "total_q": 26672,
+        "total_kv": 3117994,
+        "max_q": 224,
+        "max_kv": 29926,
+        "trace_calls": 3
+      },
+      "kv_bytes": 3813089280,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.4736440181732178,
+              "mad_ms": 0.028320491313934326,
+              "p10_ms": 1.4219260215759277,
+              "p90_ms": 1.5115970373153687,
+              "mean_ms": 1.471111208597819,
+              "stdev_ms": 0.03630095107840962,
+              "cv_percent": 2.467587145434753,
+              "minimum_ms": 1.3864409923553467,
+              "maximum_ms": 1.6487690210342407,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.4857640266418457,
+              1.4689235091209412,
+              1.4720635414123535
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8119440078735352,
+              "mad_ms": 0.009000003337860107,
+              "p10_ms": 0.7975750803947449,
+              "p90_ms": 0.8339929878711702,
+              "mean_ms": 0.8131951395670572,
+              "stdev_ms": 0.014100807628056555,
+              "cv_percent": 1.734000480569004,
+              "minimum_ms": 0.7863029837608337,
+              "maximum_ms": 0.8670650124549866,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8253639936447144,
+              0.8050239980220795,
+              0.8059239983558655
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_long_1",
+      "family": "long",
+      "shape": {
+        "name": "candidate_long_1",
+        "family": "long",
+        "total_q": 27200,
+        "total_kv": 3164011,
+        "max_q": 224,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4000161792,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3002989888191223,
+              "mad_ms": 0.014400959014892578,
+              "p10_ms": 1.2630699634552003,
+              "p90_ms": 1.3200470328330993,
+              "mean_ms": 1.295177439848582,
+              "stdev_ms": 0.02369211406244229,
+              "cv_percent": 1.8292562342046443,
+              "minimum_ms": 1.2313560247421265,
+              "maximum_ms": 1.440282940864563,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.309358537197113,
+              1.2967779636383057,
+              1.2952579855918884
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8253640234470367,
+              "mad_ms": 0.010840505361557007,
+              "p10_ms": 0.8079639971256256,
+              "p90_ms": 0.8464489996433259,
+              "mean_ms": 0.8267845205465952,
+              "stdev_ms": 0.01614641423120069,
+              "cv_percent": 1.9529168519659919,
+              "minimum_ms": 0.7968639731407166,
+              "maximum_ms": 0.9272680282592773,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.834505021572113,
+              0.8217639923095703,
+              0.8178645074367523
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_long_2",
+      "family": "long",
+      "shape": {
+        "name": "candidate_long_2",
+        "family": "long",
+        "total_q": 30576,
+        "total_kv": 3164659,
+        "max_q": 240,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4090994688,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.362820029258728,
+              "mad_ms": 0.014920055866241455,
+              "p10_ms": 1.324947988986969,
+              "p90_ms": 1.3849689602851867,
+              "mean_ms": 1.3582444393634796,
+              "stdev_ms": 0.024033537249792913,
+              "cv_percent": 1.769455964867109,
+              "minimum_ms": 1.300199031829834,
+              "maximum_ms": 1.5065250396728516,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.3776209950447083,
+              1.3606605529785156,
+              1.3563205003738403
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8350250124931335,
+              "mad_ms": 0.012040525674819946,
+              "p10_ms": 0.8160880982875824,
+              "p90_ms": 0.8612579226493836,
+              "mean_ms": 0.8379033728440602,
+              "stdev_ms": 0.019631531559358976,
+              "cv_percent": 2.3429350203860015,
+              "minimum_ms": 0.8021039962768555,
+              "maximum_ms": 0.9152269959449768,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8403044939041138,
+              0.8294844925403595,
+              0.8313649892807007
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_long_3",
+      "family": "long",
+      "shape": {
+        "name": "candidate_long_3",
+        "family": "long",
+        "total_q": 30928,
+        "total_kv": 3180031,
+        "max_q": 224,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4149657600,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3592399954795837,
+              "mad_ms": 0.012960970401763916,
+              "p10_ms": 1.318303072452545,
+              "p90_ms": 1.3781649589538574,
+              "mean_ms": 1.3535178565979005,
+              "stdev_ms": 0.023859485146873433,
+              "cv_percent": 1.7627757942436624,
+              "minimum_ms": 1.2683180570602417,
+              "maximum_ms": 1.481924057006836,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.368960976600647,
+              1.35589998960495,
+              1.3554199934005737
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8474654853343964,
+              "mad_ms": 0.012540489435195923,
+              "p10_ms": 0.8265000939369203,
+              "p90_ms": 0.8714420020580292,
+              "mean_ms": 0.8486438379685084,
+              "stdev_ms": 0.01867935042086911,
+              "cv_percent": 2.201082431186199,
+              "minimum_ms": 0.8149049878120422,
+              "maximum_ms": 0.9500290155410767,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.856704980134964,
+              0.8390650153160095,
+              0.8400849997997284
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "candidate_long_4",
+      "family": "long",
+      "shape": {
+        "name": "candidate_long_4",
+        "family": "long",
+        "total_q": 32784,
+        "total_kv": 3156939,
+        "max_q": 240,
+        "max_kv": 16354,
+        "trace_calls": 3
+      },
+      "kv_bytes": 4199129088,
+      "all_output_lse_bitwise_equal": true,
+      "pairs": {
+        "optimization": {
+          "prepared_baseline": {
+            "timing": {
+              "median_ms": 1.3276994824409485,
+              "mad_ms": 0.019780993461608887,
+              "p10_ms": 1.280146038532257,
+              "p90_ms": 1.3546240210533143,
+              "mean_ms": 1.3217301801840464,
+              "stdev_ms": 0.029398387105724746,
+              "cv_percent": 2.2242351386446453,
+              "minimum_ms": 1.2413970232009888,
+              "maximum_ms": 1.4559630155563354,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              1.338919997215271,
+              1.3209600448608398,
+              1.3214590549468994
+            ]
+          },
+          "after_opt": {
+            "timing": {
+              "median_ms": 0.8633459806442261,
+              "mad_ms": 0.01600050926208496,
+              "p10_ms": 0.8400210082530976,
+              "p90_ms": 0.8983230233192444,
+              "mean_ms": 0.8665282469987869,
+              "stdev_ms": 0.021819175611611865,
+              "cv_percent": 2.517999348224641,
+              "minimum_ms": 0.829704999923706,
+              "maximum_ms": 0.9752690196037292,
+              "samples": 300
+            },
+            "round_medians_ms": [
+              0.8707860112190247,
+              0.8574450016021729,
+              0.8595460057258606
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

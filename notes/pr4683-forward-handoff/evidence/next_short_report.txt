@@ -1,0 +1,127 @@
+Validated short-attention entry-point improvement
+2026-11-13 UTC
+
+Outcome: short prepared scheduled calls improve 2.03% on GPU 0 and 1.92% on GPU 1.
+Long calls improve about 0.3%. No matrix arithmetic or quantization recipe was changed.
+The current shape-matched read-reference fraction is 87.26% geometric mean, versus 85.68% before.
+This is an empirical reference ratio, not a proven physical hardware-utilization percentage.
+Against the older 4-GiB streaming-read calibration, current short throughput is 53.24%.
+Preparation and schedule construction are excluded from all these timings.
+
+Implementation
+1. For scheduled workloads averaging fewer than 4096 KV tokens per sequence, carry decoded
+   item metadata and K/V pointers into the next persistent iteration instead of reloading them.
+   Async copies, waits, buffer alternation, stage boundaries and output ownership remain.
+   Long workloads retain the original loop form. Non-scheduled callers retain the original path.
+2. ForwardWorkSchedule records needs_empty_fill from known CPU query/KV lengths.
+   If no query-bearing sequence has empty KV, omit the separate _fill_empty launch.
+   Unknown/no schedule and empty-KV cases retain that launch. Its conservative field default is True.
+   No GPU offsets are read back to compute the flag. The existing schedule/offset consistency contract applies.
+3. Add a nonempty regression profile to exercise the skipped-fill path with real output rows.
+
+Paired performance
+Fixed PR shapes, shared inputs, balanced persistent grid512, BM128, 256-MiB cache flush.
+100 samples x 3 rounds, 15 warmups, direct alternating before/after comparisons on two GPUs.
+GPU 0 UUID GPU-49b26f9df75a3f63; GPU 1 UUID GPU-0274a6afb9b94834.
+GPU clocks not locked. Small gains should be interpreted at this measured scale.
+  GPU 0 short: geometric-mean speedup 1.020277x; range 1.006019..1.033353x.
+  GPU 0 long: geometric-mean speedup 1.003259x; range 1.001909..1.004115x.
+  GPU 1 short: geometric-mean speedup 1.019200x; range 1.004223..1.029345x.
+  GPU 1 long: geometric-mean speedup 1.003029x; range 1.001672..1.004606x.
+
+A preliminary three-runner timing with AITER suggested a long regression. It did not reproduce
+in either direct A/B run. Runtime long-kernel instructions and launch metadata are identical
+apart from the compilation hash. The alternating/reversed multi-runner protocol gives middle
+and endpoint runners different cache/order histories, so the pairwise results are primary.
+The preliminary timing files remain saved for transparency.
+
+Read-reference comparison
+Paired attention/read-only tests use matching calibrated read bytes and an untimed GPU queue
+prefix before the same cache flush; 50 samples x 3 rounds. The prefix prevents host submission
+gaps from being mistaken for device execution. The previous queue-prefix control changed
+latencies by less than 0.4%. Read bytes retain the earlier local 2x FetchSize calibration.
+The reference writes only a checksum while attention also writes output and LSE.
+case | attention_us | reference_us | reference_pct
+control_short_0 | 132.504 | 114.903 | 86.717%
+control_short_1 | 141.584 | 124.364 | 87.838%
+control_short_2 | 129.584 | 111.723 | 86.217%
+control_short_3 | 143.224 | 128.564 | 89.764%
+control_short_4 | 128.463 | 112.764 | 87.779%
+candidate_short_0 | 133.164 | 115.483 | 86.722%
+candidate_short_1 | 129.084 | 111.643 | 86.489%
+candidate_short_2 | 128.364 | 112.523 | 87.660%
+candidate_short_3 | 128.904 | 111.984 | 86.874%
+candidate_short_4 | 129.504 | 112.183 | 86.625%
+
+Correctness and synchronization
+47 pytest regressions pass using -s --tb=short and installed-compiler importlib mode.
+Coverage includes BF16/prepared Q, scheduled/unscheduled, BM64/128/256, both exponent modes,
+empty queries, empty KV, all-nonempty irregular lengths, independent Q scales, and invalid schedules.
+All 60 production shape/seed checks match the previous kernel bit for bit in output and LSE.
+Original AITER gates remain output relative L2<0.08 and LSE maximum absolute error<0.10.
+All 30 long checks pass. Three previously known short LSE failures remain unchanged:
+  Seed 7: ['control_short_0', 'candidate_short_3']
+  Seed 11: []
+  Seed 23: ['candidate_short_2']
+
+ATT validation
+rocprofv3 /opt/rocm-7.2.1/bin/rocprofv3 with official external decoder0.1.6.
+Decoder /home/stwinata/nod/tlx_work/tmp/pr4683/att_tools/decoder/opt/rocm/lib/librocprof-trace-decoder.so
+Collection/validation/packaging via .agents/skills/amd-att-trace/scripts/att_trace.py.
+Kernel regex _mxfp8_varlen_kernel, matching dispatch4 after3warmups, targetCU0, SE mask0x1, SIMD0xF.
+Before and after captures use GPU0 UUID above. Every viewer bundle passes automatic validation.
+Old control trace: 5 attention dispatches and 5 separate empty-fill dispatches.
+Both new short traces: 5 attention dispatches and zero empty-fill dispatches.
+Sampled scalar global-load hits decrease from416 to368 in the representative trace.
+That is an instruction count on sampled waves, not a whole-GPU runtime fraction.
+Full trace roots, decoded UI, archives and checksums are appended below.
+
+Rejected directions
+Two Q-payload prefetch placements preserve bits but provide no consistent useful gain.
+Quadratic/cubic exponent corrections reduce approximation error but add instruction/register
+cost and slow the short kernel. They are not in the accepted implementation.
+No accuracy gate was relaxed and the existing approximate fast-exp policy was not expanded.
+Geometric-mean experimental speedups:
+  next_q_prefetch_gpu0: {'next_q_prefetch_early': 1.0018472423571068, 'next_q_prefetch_late': 0.9907023954327836}
+  next_exp_short_gpu1: {'next_exp_quad': 0.7844599720867131, 'next_exp_cubic': 0.5758089325677759}
+  next_fast_corrected_gpu0: {'next_fast_original': 1.0157775275162626, 'next_fast_quad': 0.5911092461862247, 'next_fast_cubic': 0.4815537467612022}
+
+Scope and next steps
+The improvement applies to the prepared scheduled path. No schedule still uses conservative filling.
+Schedule creation and operand preparation must be amortized by the caller.
+For more throughput, batching independent short calls remains a separately validated 1.32x option,
+with increased call latency. It is not a fixed-shape kernel speedup.
+Larger fixed-shape gains now call for deeper operand-buffer/occupancy redesign rather than the
+prefetch and polynomial changes tested here. Those larger changes were not implemented or claimed.
+
+Artifacts
+Worktree /home/stwinata/nod/tlx_work/tmp/pr4683_source; branch opt/pr4683-prequantized-forward.
+Incremental patch /home/stwinata/nod/tlx_work/tmp/pr4683/next_short_entrypoint.patch
+Incremental SHA256 124b5ebb9fa8b8dd6698c493fab2c18efc7fb2b9023f89000867c34fbc18c493
+Combined patch from PR head /home/stwinata/nod/tlx_work/tmp/pr4683/pr4683_all_optimizations.patch
+Combined SHA256 e776a80ca28dde04d95a7d17bd349a50652d56202fbfbca4979e3a606c964864
+Raw summary next_short_results.json; pytest next_short_final_pytest.log.
+Runtime long ASM asm/next_integrated_runtime/control_long_0/.
+Only tutorial Python and the existing GPU test file changed; no native rebuild was needed.
+
+Reproduce
+source /home/stwinata/nod/tlx_work/tmp/pr4683/env.sh
+python /home/stwinata/nod/tlx_work/tmp/pr4683/bench_next_integrated.py --all --samples 100 --rounds 3 --warmups 15 --json /tmp/next_short_pairwise.json
+python /home/stwinata/nod/tlx_work/tmp/pr4683/compare_next_short_matched.py
+Use installed triton preimport, then pytest --import-mode=importlib -s --tb=short
+/home/stwinata/nod/tlx_work/tmp/pr4683_source/python/test/unit/language/test_tlx_amd_gfx950.py -k mxfp8_prequantized
+
+
+Validated ATT archives
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_control1
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_control1/ui_output_agent_29665_dispatch_33
+Matching dispatch4 / global 33
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_control1.tar.gz
+SHA256 d61006b4d75713fe2ce41bd58fbe659fe2ac451b6a6a8c8bd79f8604b34279c0
+
+Trace root /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_candidate4
+Decoded UI /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_candidate4/ui_output_agent_64316_dispatch_33
+Matching dispatch4 / global 33
+Archive /home/stwinata/nod/tlx_work/tmp/pr4683/att/next_short_integrated_candidate4.tar.gz
+SHA256 4c6cac6996ecbdd09f8e8f43c1c5382e417b51c86dad23c47c35ae7fea891a8f
